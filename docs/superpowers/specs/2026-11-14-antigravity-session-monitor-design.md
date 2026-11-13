@@ -80,8 +80,7 @@ Common request metadata: `{ metadata: { ideName: "antigravity", extensionName: "
      - `Tag 4` (`usage`, verified against `~/.gemini/bin/agy` descriptor): `Tag 2` = `input_tokens` (fresh), `Tag 3` = `output_tokens` (total output), `Tag 5` = `cache_read_tokens`, `Tag 9` = `thinking_output_tokens`, `Tag 10` = `response_output_tokens`.
      - `Tag 9` (`chatStartMetadata`): `Tag 2` = `startStepIndex` (`0xffffffffffffffff` = unset/uncompacted; positive step index once compacted), `Tag 10` = `contextWindowMetadata` (`Tag 1` = `rowContext`, `Tag 4` = `rowLimit`).
    - **`trajectory_metadata_blob (id='main', data)`**: used **only** as fallback workspace/title metadata if a live `.db` file appears in `conversations/` before being indexed in `conversation_summaries.db`.
-   - **`parent_references (idx, data)`**: used only as fallback if `parent_conversation_id` is absent.
-   - `steps` table is **not** queried in v1 (avoids full-table BLOB scans).
+   - `parent_references` (cross-conversation links, empty on verified child subagents) and `steps` are **not** queried in v1 (subagent nesting comes from `conversation_summaries.parent_conversation_id` and `nesting_depth`, avoiding full-table BLOB scans).
 3. **VS Code Workspace `state.vscdb`**:
    - Resolved cleanly via `path.join(path.dirname(context.storageUri.fsPath), 'state.vscdb')` (works identically across Linux, Windows, macOS, Remote-SSH, and WSL when a workspace is open).
    - Reads `ItemTable['google.google-antigravity']` JSON -> `lastConversationId` as an active-session affinity signal.
