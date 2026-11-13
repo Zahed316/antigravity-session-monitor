@@ -1,0 +1,12 @@
+.git/**
+.superpowers/**
+.gitignore
+.vscodeignore
+.DS_Store
+docs/**
+src/**
+test/**
+node_modules/**
+tsconfig.json
+esbuild.config.mjs
+*.vsix

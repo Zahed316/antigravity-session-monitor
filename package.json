@@ -1,0 +1,133 @@
+{
+  "name": "antigravity-session-monitor",
+  "displayName": "Antigravity Session Monitor",
+  "description": "Read-only monitor for Antigravity session context windows, subagent rollup telemetry, and 5h/weekly quota pools.",
+  "publisher": "Zahed-r",
+  "version": "0.1.0",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.99.0"
+  },
+  "categories": [
+    "Visualization",
+    "Other"
+  ],
+  "extensionKind": [
+    "workspace"
+  ],
+  "main": "./dist/extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "scripts": {
+    "check": "tsc --noEmit",
+    "build": "node esbuild.config.mjs",
+    "test": "node --test test/*.test.ts",
+    "package": "vsce package"
+  },
+  "contributes": {
+    "viewsContainers": {
+      "panel": [
+        {
+          "id": "antigravity-monitor",
+          "title": "Antigravity Monitor",
+          "icon": "$(pulse)"
+        }
+      ]
+    },
+    "views": {
+      "antigravity-monitor": [
+        {
+          "type": "webview",
+          "id": "antigravityMonitor.panel",
+          "name": "Antigravity Monitor"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "antigravityMonitor.openQuickPick",
+        "title": "Select or Pin Session",
+        "category": "Antigravity Monitor"
+      },
+      {
+        "command": "antigravityMonitor.openPanel",
+        "title": "Open Bottom Panel",
+        "category": "Antigravity Monitor"
+      },
+      {
+        "command": "antigravityMonitor.pinSession",
+        "title": "Pin Session to Status Bar",
+        "category": "Antigravity Monitor"
+      },
+      {
+        "command": "antigravityMonitor.unpinSession",
+        "title": "Unpin Session (Auto-Track)",
+        "category": "Antigravity Monitor"
+      },
+      {
+        "command": "antigravityMonitor.toggleScope",
+        "title": "Toggle Workspace Scope",
+        "category": "Antigravity Monitor"
+      },
+      {
+        "command": "antigravityMonitor.refresh",
+        "title": "Refresh Telemetry",
+        "category": "Antigravity Monitor",
+        "icon": "$(refresh)"
+      }
+    ],
+    "configuration": {
+      "title": "Antigravity Session Monitor",
+      "properties": {
+        "antigravityMonitor.refreshIntervalMs": {
+          "type": "number",
+          "default": 10000,
+          "minimum": 1000,
+          "description": "Telemetry and quota refresh interval in milliseconds while VS Code is focused."
+        },
+        "antigravityMonitor.unfocusedRefreshIntervalMs": {
+          "type": "number",
+          "default": 30000,
+          "minimum": 2000,
+          "description": "Telemetry and quota refresh interval in milliseconds while VS Code is unfocused."
+        },
+        "antigravityMonitor.contextWarningPct": {
+          "type": "number",
+          "default": 75,
+          "minimum": 1,
+          "maximum": 100,
+          "description": "Context window usage percentage threshold for warning Status Bar highlight."
+        },
+        "antigravityMonitor.contextCriticalPct": {
+          "type": "number",
+          "default": 90,
+          "minimum": 1,
+          "maximum": 100,
+          "description": "Context window usage percentage threshold for critical Status Bar highlight."
+        },
+        "antigravityMonitor.defaultScope": {
+          "type": "string",
+          "enum": [
+            "current",
+            "all"
+          ],
+          "default": "current",
+          "description": "Default session scope in QuickPick and the Bottom Panel."
+        },
+        "antigravityMonitor.dataRootOverride": {
+          "type": "string",
+          "default": "",
+          "description": "Optional override directory for Antigravity local data (defaults to ~/.gemini/antigravity)."
+        }
+      }
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/vscode": "~1.99.0",
+    "@vscode/vsce": "^4.1.1",
+    "esbuild": "^0.28.2",
+    "typescript": "^5.9.3"
+  }
+}
