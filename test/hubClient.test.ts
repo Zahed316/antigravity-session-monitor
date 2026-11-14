@@ -10,6 +10,7 @@ import {
   HubClient,
   normalizeQuotaFromSummary,
   normalizeQuotaFromUserStatus,
+  extractModelCatalogFromUserStatus,
 } from '../src/rpc/hubClient.ts';
 import type { HubEndpoint } from '../src/rpc/hubDiscovery.ts';
 import { DEFAULT_CONTEXT_LIMIT } from '../src/types.ts';
@@ -63,7 +64,7 @@ test('HubClient calls Connect-RPC with required headers, auto-falls back to HTTP
                   bucketId: 'gemini-5h',
                   window: '5h',
                   remainingFraction: 0.8,
-                  resetTime: '2026-11-14T10:00:00Z',
+                  resetTime: new Date(Date.now() + 3_600_000).toISOString(),
                 },
               ],
             },
@@ -453,4 +454,277 @@ test('fetchGeneratorMetadata caches by (cascadeId, stepCount) and maps CallUsage
   } finally {
     await new Promise((r) => server.close(r));
   }
+});
+
+test('normalizeQuotaFromSummary unwraps response.groups and separates argon, gemini, and nonGoogle pools', () => {
+  const nowMs = Date.parse('2026-11-14T10:00:00Z');
+  const raw = {
+    response: {
+      groups: [
+        {
+          displayName: 'Gemini Models',
+          buckets: [
+            {
+              bucketId: 'gemini-5h',
+              window: '5h',
+              remainingFraction: 0.88,
+              resetTime: '2026-11-14T14:00:00Z',
+            },
+            {
+              bucketId: 'gemini-weekly',
+              window: 'weekly',
+              remainingFraction: 0.91,
+              resetTime: '2026-11-20T00:00:00Z',
+            },
+          ],
+        },
+        {
+          displayName: 'Gemini 4 Argon',
+          buckets: [
+            {
+              bucketId: 'argon-weekly',
+              window: 'weekly',
+              remainingFraction: 0.74,
+              resetTime: '2026-11-21T00:00:00Z',
+            },
+          ],
+        },
+        {
+          displayName: 'Claude and GPT models',
+          buckets: [
+            {
+              bucketId: 'claude-5h',
+              window: '5h',
+              remainingFraction: 0.55,
+              resetTime: '2026-11-14T13:00:00Z',
+            },
+            {
+              bucketId: 'claude-weekly',
+              window: 'weekly',
+              remainingFraction: 0.82,
+              resetTime: '2026-11-19T00:00:00Z',
+            },
+          ],
+        },
+      ],
+    },
+  };
+
+  const snap = normalizeQuotaFromSummary(raw, nowMs);
+  assert.equal(snap.status, 'online');
+  assert.equal(snap.pools.gemini.fiveHour?.remainingPct, 88);
+  assert.equal(snap.pools.gemini.weekly?.remainingPct, 91);
+  assert.equal(snap.pools.argon.weekly?.remainingPct, 74);
+  assert.equal(snap.pools.argon.fiveHour, null);
+  assert.equal(snap.pools.nonGoogle.fiveHour?.remainingPct, 55);
+  assert.equal(snap.pools.nonGoogle.weekly?.remainingPct, 82);
+});
+
+test('normalizeQuotaFromUserStatus classifies >6h reset windows as weekly and separates argon pool', () => {
+  const nowMs = Date.parse('2026-11-14T10:00:00Z');
+  const raw = {
+    userStatus: {
+      cascadeModelConfigData: {
+        clientModelConfigs: [
+          {
+            label: 'Gemini 3.8 Flash',
+            quotaInfo: {
+              remainingFraction: 0.9,
+              resetTime: '2026-11-14T14:00:00Z', // +4h -> 5h window
+            },
+          },
+          {
+            label: 'Gemini 4 Argon (Low)',
+            quotaInfo: {
+              remainingFraction: 0.74,
+              resetTime: '2026-11-18T10:00:00Z', // +96h (>6h) -> weekly window
+            },
+          },
+          {
+            label: 'Claude Opus 4.6 (Thinking)',
+            quotaInfo: {
+              remainingFraction: 0.65,
+              resetTime: '2026-11-19T10:00:00Z', // >6h -> weekly window
+            },
+          },
+        ],
+      },
+    },
+  };
+
+  const snap = normalizeQuotaFromUserStatus(raw, nowMs);
+  assert.equal(snap.status, 'online');
+  assert.equal(snap.pools.gemini.fiveHour?.remainingPct, 90);
+  assert.equal(snap.pools.argon.weekly?.remainingPct, 74);
+  assert.equal(snap.pools.nonGoogle.weekly?.remainingPct, 65);
+});
+
+test('extractModelCatalogFromUserStatus extracts modelEnum, nested modelId.id, label, and pool', () => {
+  const raw = {
+    userStatus: {
+      cascadeModelConfigData: {
+        clientModelConfigs: [
+          {
+            label: 'Gemini 4 Argon (Low)',
+            modelOrAlias: { model: 'MODEL_PLACEHOLDER_M419' },
+            modelId: { id: 'gemini-4-argon-low' },
+          },
+          {
+            label: 'Claude Opus 4.6 (Thinking)',
+            modelOrAlias: { model: 'MODEL_PLACEHOLDER_M525' },
+            modelId: { id: 'claude-opus-4-6-thinking' },
+          },
+          {
+            label: 'Gemini 3.8 Flash',
+            modelOrAlias: { model: 'MODEL_PLACEHOLDER_M400' },
+          },
+        ],
+      },
+    },
+  };
+
+  const entries = extractModelCatalogFromUserStatus(raw);
+  assert.equal(entries.length, 3);
+  assert.deepEqual(entries[0], {
+    label: 'Gemini 4 Argon (Low)',
+    rawId: 'MODEL_PLACEHOLDER_M419',
+    modelId: 'gemini-4-argon-low',
+    poolKey: 'argon',
+  });
+  assert.equal(entries[1].poolKey, 'nonGoogle');
+  assert.equal(entries[1].modelId, 'claude-opus-4-6-thinking');
+  assert.equal(entries[2].poolKey, 'gemini');
+});
+
+
+test('Review Focus 1B: HTTP 400 never serves cached quota - fresh offline between good polls', async () => {
+  // Starts in "bad" mode (400 for both RPCs), flips to good (200 summary), then back to bad.
+  let bad = true;
+  const server = http.createServer((req, res) => {
+    if (bad) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'bad request' }));
+      return;
+    }
+    if (req.url === '/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(
+        JSON.stringify({
+          groups: [
+            {
+              displayName: 'Gemini',
+              buckets: [
+                {
+                  bucketId: 'gemini-5h',
+                  window: '5h',
+                  remainingFraction: 0.8,
+                  resetTime: new Date(Date.now() + 3_600_000).toISOString(),
+                },
+              ],
+            },
+          ],
+        }),
+      );
+    } else {
+      res.writeHead(404);
+      res.end();
+    }
+  });
+
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address() as { port: number };
+  const endpoint: HubEndpoint = {
+    host: '127.0.0.1',
+    port: address.port,
+    csrfToken: 'test-csrf-token-xyz',
+    source: 'process',
+  };
+
+  try {
+    const client = new HubClient();
+
+    // 400 phase: quota must be a fresh offline snapshot, not stale/cached data
+    const bad1 = await client.fetchQuota(endpoint);
+    assert.equal(bad1.status, 'offline');
+    assert.equal(bad1.source, 'none');
+    assert.equal(bad1.pools.gemini.fiveHour, null);
+
+    // Good phase: valid 200 poll returns online data
+    bad = false;
+    const good = await client.fetchQuota(endpoint);
+    assert.equal(good.status, 'online');
+    assert.equal(good.pools.gemini.fiveHour?.remainingPct, 80);
+
+    // 400 again: must go back to fresh offline, never reuse the good snapshot
+    bad = true;
+    const bad2 = await client.fetchQuota(endpoint);
+    assert.equal(bad2.status, 'offline');
+    assert.equal(bad2.pools.gemini.fiveHour, null, 'No cached quota served after HTTP 400');
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test('Review Focus 1B: mergeQuotaItem tie-breaker keeps the later resetTime on equal remaining fraction', () => {
+  const nowMs = Date.parse('2026-11-14T10:00:00Z');
+
+  // Two equal-fraction 5h buckets: the later reset (15:00) is the true bottleneck and must win
+  const raw = {
+    response: {
+      groups: [
+        {
+          displayName: 'Gemini',
+          buckets: [
+            {
+              bucketId: 'gemini-5h-a',
+              window: '5h',
+              remainingFraction: 0.5,
+              resetTime: '2026-11-14T13:00:00Z',
+            },
+          ],
+        },
+        {
+          displayName: 'Gemini',
+          buckets: [
+            {
+              bucketId: 'gemini-5h-b',
+              window: '5h',
+              remainingFraction: 0.5,
+              resetTime: '2026-11-14T15:00:00Z',
+            },
+          ],
+        },
+      ],
+    },
+  };
+
+  const snap = normalizeQuotaFromSummary(raw, nowMs);
+  assert.equal(snap.pools.gemini.fiveHour?.resetTime, '2026-11-14T15:00:00Z');
+  assert.equal(snap.pools.gemini.fiveHour?.remainingPct, 50);
+
+  // Candidate without resetTime never displaces an existing window on a tie
+  const rawNoReset = {
+    response: {
+      groups: [
+        {
+          displayName: 'Gemini',
+          buckets: [
+            {
+              bucketId: 'gemini-5h-a',
+              window: '5h',
+              remainingFraction: 0.5,
+              resetTime: '2026-11-14T13:00:00Z',
+            },
+            {
+              bucketId: 'gemini-5h-b',
+              window: '5h',
+              remainingFraction: 0.5,
+            },
+          ],
+        },
+      ],
+    },
+  };
+  const snap2 = normalizeQuotaFromSummary(rawNoReset, nowMs);
+  assert.equal(snap2.pools.gemini.fiveHour?.resetTime, '2026-11-14T13:00:00Z');
 });

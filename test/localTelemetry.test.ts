@@ -5,7 +5,12 @@ import os from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { createSqliteClient, type SqliteClient } from '../src/data/sqliteClient.ts';
-import { LocalTelemetryReader } from '../src/data/localTelemetry.ts';
+import {
+  LocalTelemetryReader,
+  FULL_SWEEP_INTERVAL_MS,
+  RECENT_ACTIVITY_WINDOW_MS,
+  type ReadAllOptions,
+} from '../src/data/localTelemetry.ts';
 
 const encoder = new TextEncoder();
 
@@ -932,4 +937,257 @@ test('handles concurrent reads, empty/corrupt DB files, and CLI fallback parity 
     }
   });
 });
+
+test('cold historical DBs are skipped on fast ticks when not dirty/active, and re-scanned on forceRescan or after 60s sweep window; dirty DBs are synced immediately', async () => {
+  await withTempDir(async (dir) => {
+    const agRoot = path.join(dir, 'antigravity');
+    const convDir = path.join(agRoot, 'conversations');
+    await fs.mkdir(convDir, { recursive: true });
+
+    const coldId = '11111111-aaaa-4aaa-8aaa-111111111111';
+    const recentId = '22222222-bbbb-4bbb-8bbb-222222222222';
+    const coldDirtyId = '33333333-cccc-4ccc-8ccc-333333333333';
+
+    const sumDb = createConversationSummariesDb(path.join(agRoot, 'conversation_summaries.db'));
+    const insertSummary = sumDb.prepare(`
+      INSERT INTO conversation_summaries (
+        conversation_id, title, preview, step_count, last_modified_time,
+        workspace_uris, status, agent_name, parent_conversation_id,
+        nesting_depth, not_fully_idle, killed, last_user_input_time, raw_summary
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+
+    insertSummary.run(
+      coldId,
+      'Cold Session',
+      '',
+      1,
+      '2026-11-13 20:00:00+00:00',
+      '["file:///repo/test"]',
+      'CASCADE_RUN_STATUS_IDLE',
+      '',
+      '',
+      0,
+      0,
+      0,
+      '2026-11-13 20:00:00+00:00',
+      new Uint8Array(0),
+    );
+    insertSummary.run(
+      recentId,
+      'Recent Session',
+      '',
+      1,
+      new Date().toISOString(),
+      '["file:///repo/test"]',
+      'CASCADE_RUN_STATUS_IDLE',
+      '',
+      '',
+      0,
+      0,
+      0,
+      new Date().toISOString(),
+      new Uint8Array(0),
+    );
+    insertSummary.run(
+      coldDirtyId,
+      'Cold Dirty Session',
+      '',
+      1,
+      '2026-11-13 19:00:00+00:00',
+      '["file:///repo/test"]',
+      'CASCADE_RUN_STATUS_IDLE',
+      '',
+      '',
+      0,
+      0,
+      0,
+      '2026-11-13 19:00:00+00:00',
+      new Uint8Array(0),
+    );
+    sumDb.close();
+
+    const coldDbPath = path.join(convDir, `${coldId}.db`);
+    const coldDb = createConversationDb(coldDbPath);
+    coldDb
+      .prepare('INSERT INTO gen_metadata (idx, data, size) VALUES (?, ?, ?)')
+      .run(
+        0,
+        buildGenBlob({ model: 'gemini-2.5-pro', stepIndices: [1], fresh: 100, cacheRead: 0, output: 10 }),
+        32,
+      );
+    coldDb.close();
+    const twoHoursAgo = new Date(Date.now() - 2 * 3600 * 1000);
+    await fs.utimes(coldDbPath, twoHoursAgo, twoHoursAgo);
+
+    const recentDbPath = path.join(convDir, `${recentId}.db`);
+    const recentDb = createConversationDb(recentDbPath);
+    recentDb
+      .prepare('INSERT INTO gen_metadata (idx, data, size) VALUES (?, ?, ?)')
+      .run(
+        0,
+        buildGenBlob({ model: 'gemini-2.5-pro', stepIndices: [1], fresh: 200, cacheRead: 0, output: 20 }),
+        32,
+      );
+    recentDb.close();
+    const twoMinutesAgo = new Date(Date.now() - 2 * 60 * 1000);
+    await fs.utimes(recentDbPath, twoMinutesAgo, twoMinutesAgo);
+
+    const coldDirtyDbPath = path.join(convDir, `${coldDirtyId}.db`);
+    const coldDirtyDb = createConversationDb(coldDirtyDbPath);
+    coldDirtyDb
+      .prepare('INSERT INTO gen_metadata (idx, data, size) VALUES (?, ?, ?)')
+      .run(
+        0,
+        buildGenBlob({ model: 'gemini-2.5-pro', stepIndices: [1], fresh: 300, cacheRead: 0, output: 30 }),
+        32,
+      );
+    coldDirtyDb.close();
+    const threeHoursAgo = new Date(Date.now() - 3 * 3600 * 1000);
+    await fs.utimes(coldDirtyDbPath, threeHoursAgo, threeHoursAgo);
+
+    const statPaths: string[] = [];
+    const origStat = fs.stat;
+    fs.stat = async (p: any, ...args: any[]) => {
+      statPaths.push(path.resolve(String(p)));
+      return (origStat as any)(p, ...args);
+    };
+
+    const sqlite = await createSqliteClient();
+    try {
+      const reader = new LocalTelemetryReader(sqlite, { antigravityRoot: agRoot });
+
+      // 1. Initial read: full sweep runs, stats all DBs
+      const snap1 = await reader.read();
+      assert.equal(snap1.callsById.get(coldId)?.length, 1);
+      assert.equal(snap1.callsById.get(recentId)?.length, 1);
+      assert.equal(snap1.callsById.get(coldDirtyId)?.length, 1);
+      assert.ok(statPaths.includes(path.resolve(coldDbPath)));
+      assert.ok(statPaths.includes(path.resolve(recentDbPath)));
+      assert.ok(statPaths.includes(path.resolve(coldDirtyDbPath)));
+
+      // 2. Fast tick: cold DBs are skipped on stat; recent DB is statted
+      statPaths.length = 0;
+      const snap2 = await reader.readAll();
+      assert.equal(statPaths.includes(path.resolve(coldDbPath)), false);
+      assert.equal(statPaths.includes(path.resolve(coldDirtyDbPath)), false);
+      assert.equal(statPaths.includes(path.resolve(recentDbPath)), true);
+      assert.equal(snap2.callsById.get(coldId)?.length, 1);
+      assert.equal(snap2.callsById.get(recentId)?.length, 1);
+      assert.equal(snap2.callsById.get(coldDirtyId)?.length, 1);
+
+      // 3. Dirty-aware read: append row to coldDirtyId and pass dirtyConversationIds
+      const dirtyWriter = new DatabaseSync(coldDirtyDbPath);
+      dirtyWriter
+        .prepare('INSERT INTO gen_metadata (idx, data, size) VALUES (?, ?, ?)')
+        .run(
+          1,
+          buildGenBlob({ model: 'gemini-2.5-pro', stepIndices: [2], fresh: 999, cacheRead: 0, output: 99 }),
+          32,
+        );
+      dirtyWriter.close();
+      await fs.utimes(coldDirtyDbPath, threeHoursAgo, threeHoursAgo);
+      try {
+        await fs.utimes(`${coldDirtyDbPath}-wal`, threeHoursAgo, threeHoursAgo);
+      } catch {}
+
+      statPaths.length = 0;
+      const snapDirty = await reader.readAll({ dirtyConversationIds: new Set([coldDirtyId]) });
+      assert.equal(statPaths.includes(path.resolve(coldDirtyDbPath)), true);
+      assert.equal(statPaths.includes(path.resolve(coldDbPath)), false);
+      assert.equal(snapDirty.callsById.get(coldDirtyId)?.length, 2);
+      assert.equal(snapDirty.callsById.get(coldDirtyId)?.[1].fresh, 999);
+
+      // 4. Active conversation: active cold DB is statted even when not dirty
+      statPaths.length = 0;
+      const snapActive = await reader.readAll({ activeConversationIds: new Set([coldId]) });
+      assert.equal(statPaths.includes(path.resolve(coldDbPath)), true);
+      assert.equal(statPaths.includes(path.resolve(coldDirtyDbPath)), false);
+
+      // 5. Sweep window expiration: after 60s, all DBs are re-scanned
+      statPaths.length = 0;
+      const snapSweep = await reader.readAll({ nowMs: Date.now() + 65_000 });
+      assert.equal(statPaths.includes(path.resolve(coldDbPath)), true);
+      assert.equal(statPaths.includes(path.resolve(coldDirtyDbPath)), true);
+      assert.equal(statPaths.includes(path.resolve(recentDbPath)), true);
+
+      // 6. forceRescan: all DBs are re-scanned on force
+      statPaths.length = 0;
+      const snapForce = await reader.readAll(true);
+      assert.equal(statPaths.includes(path.resolve(coldDbPath)), true);
+      assert.equal(statPaths.includes(path.resolve(coldDirtyDbPath)), true);
+      assert.equal(statPaths.includes(path.resolve(recentDbPath)), true);
+    } finally {
+      fs.stat = origStat;
+      sqlite.dispose();
+    }
+  });
+});
+
+test('conversations/ directory readdir is skipped when dir mtime has not changed within the sweep window', async () => {
+  await withTempDir(async (dir) => {
+    const agRoot = path.join(dir, 'antigravity');
+    const convDir = path.join(agRoot, 'conversations');
+    await fs.mkdir(convDir, { recursive: true });
+
+    const c1 = createConversationDb(path.join(convDir, 'c1.db'));
+    c1.close();
+
+    const origReaddir = fs.readdir;
+    const readdirCalls: string[] = [];
+    fs.readdir = async (p: any, ...args: any[]) => {
+      readdirCalls.push(path.resolve(String(p)));
+      return (origReaddir as any)(p, ...args);
+    };
+
+    const sqlite = await createSqliteClient();
+    try {
+      const reader = new LocalTelemetryReader(sqlite, { antigravityRoot: agRoot });
+
+      // 1. Initial read: readdir called
+      await reader.read();
+      assert.equal(readdirCalls.filter((p) => p === path.resolve(convDir)).length, 1);
+
+      // 2. Fast tick: readdir skipped because dir mtime did not change
+      readdirCalls.length = 0;
+      await reader.read();
+      assert.equal(readdirCalls.filter((p) => p === path.resolve(convDir)).length, 0);
+
+      // 3. Fast tick with readAll({}): readdir skipped
+      readdirCalls.length = 0;
+      await reader.readAll({});
+      assert.equal(readdirCalls.filter((p) => p === path.resolve(convDir)).length, 0);
+
+      // 4. Adding a file to convDir updates dir mtime -> readdir runs
+      const c2 = createConversationDb(path.join(convDir, 'c2.db'));
+      c2.close();
+      const futureTime = new Date(Date.now() + 5000);
+      await fs.utimes(convDir, futureTime, futureTime);
+
+      readdirCalls.length = 0;
+      const snapNew = await reader.read();
+      assert.equal(readdirCalls.filter((p) => p === path.resolve(convDir)).length, 1);
+      assert.ok(snapNew.callsById.has('c2'));
+
+      // 5. Fast tick with unchanged dir: readdir skipped again
+      readdirCalls.length = 0;
+      await reader.read();
+      assert.equal(readdirCalls.filter((p) => p === path.resolve(convDir)).length, 0);
+
+      // 6. After 60s sweep window: readdir runs
+      readdirCalls.length = 0;
+      await reader.read({ nowMs: Date.now() + 70_000 });
+      assert.equal(readdirCalls.filter((p) => p === path.resolve(convDir)).length, 1);
+
+      // 7. forceRescan = true: readdir runs
+      readdirCalls.length = 0;
+      await reader.readAll(true);
+      assert.equal(readdirCalls.filter((p) => p === path.resolve(convDir)).length, 1);
+    } finally {
+      fs.readdir = origReaddir;
+      sqlite.dispose();
+    }
+  });
+});
+
 

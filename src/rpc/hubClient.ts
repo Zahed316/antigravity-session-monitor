@@ -3,6 +3,7 @@ import https from 'node:https';
 import {
   DEFAULT_CONTEXT_LIMIT,
   type CallUsagePoint,
+  type ModelCatalogEntry,
   type PoolKey,
   type QuotaPool,
   type QuotaSnapshot,
@@ -11,6 +12,7 @@ import {
   type RpcTrajectorySummary,
   type TokenBreakdownGroup,
 } from '../types.ts';
+import { inferModelPool } from '../core/modelResolver.ts';
 import type { HubEndpoint } from './hubDiscovery.ts';
 
 const DEFAULT_TIMEOUT_MS = 4000;
@@ -41,8 +43,9 @@ function buildOfflineQuota(nowMs: number, error?: string): QuotaSnapshot {
     status: 'offline',
     source: 'none',
     pools: {
-      gemini: buildEmptyPool('gemini', 'Gemini'),
-      nonGoogle: buildEmptyPool('nonGoogle', 'Non-Google'),
+      gemini: buildEmptyPool('gemini', 'Gemini Models'),
+      argon: buildEmptyPool('argon', 'Gemini 4 Argon'),
+      nonGoogle: buildEmptyPool('nonGoogle', 'Claude & GPT'),
     },
     fetchedAt: nowMs,
     error,
@@ -131,7 +134,7 @@ function mergeQuotaItem(pool: QuotaPool, item: ParsedQuotaItem): void {
   } else if (candidateWindow.remainingFraction === existing.remainingFraction) {
     if (
       candidateWindow.resetTime &&
-      (!existing.resetTime || candidateWindow.resetTime < existing.resetTime)
+      (!existing.resetTime || candidateWindow.resetTime > existing.resetTime)
     ) {
       pool[targetProp] = candidateWindow;
     }
@@ -139,12 +142,48 @@ function mergeQuotaItem(pool: QuotaPool, item: ParsedQuotaItem): void {
 }
 
 /**
+ * Parses HTTP Retry-After header value into milliseconds.
+ * Supports delta-seconds or HTTP-date format.
+ */
+export function parseRetryAfterMs(headerVal?: string, nowMs = Date.now()): number | undefined {
+  if (!headerVal) {
+    return undefined;
+  }
+  const trimmed = headerVal.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+  const asSeconds = Number(trimmed);
+  if (!Number.isNaN(asSeconds) && asSeconds >= 0) {
+    return Math.round(asSeconds * 1000);
+  }
+  const dateMs = Date.parse(trimmed);
+  if (!Number.isNaN(dateMs)) {
+    return Math.max(0, dateMs - nowMs);
+  }
+  return undefined;
+}
+
+/**
+ * Computes full jitter exponential backoff in milliseconds.
+ */
+export function computeBackoffWithJitterMs(
+  attempt: number,
+  baseMs = 2000,
+  maxMs = 60000,
+  randomFn = Math.random,
+): number {
+  return randomFn() * Math.min(maxMs, baseMs * 2 ** attempt);
+}
+
+/**
  * Normalizes Connect-RPC `RetrieveUserQuotaSummary` response into a QuotaSnapshot.
  */
 export function normalizeQuotaFromSummary(raw: unknown, nowMs = Date.now()): QuotaSnapshot {
   const pools: Record<PoolKey, QuotaPool> = {
-    gemini: buildEmptyPool('gemini', 'Gemini'),
-    nonGoogle: buildEmptyPool('nonGoogle', 'Non-Google'),
+    gemini: buildEmptyPool('gemini', 'Gemini Models'),
+    argon: buildEmptyPool('argon', 'Gemini 4 Argon'),
+    nonGoogle: buildEmptyPool('nonGoogle', 'Claude & GPT'),
   };
 
   if (!raw || typeof raw !== 'object') {
@@ -152,11 +191,15 @@ export function normalizeQuotaFromSummary(raw: unknown, nowMs = Date.now()): Quo
   }
 
   const root = raw as Record<string, unknown>;
+  const resObj = (root.response ?? {}) as Record<string, unknown>;
+  const summaryObj = (root.userQuotaSummary ?? resObj.userQuotaSummary ?? {}) as Record<string, unknown>;
   const groups = Array.isArray(root.groups)
     ? root.groups
-    : Array.isArray((root.userQuotaSummary as Record<string, unknown>)?.groups)
-      ? ((root.userQuotaSummary as Record<string, unknown>).groups as unknown[])
-      : [];
+    : Array.isArray(resObj.groups)
+      ? resObj.groups
+      : Array.isArray(summaryObj.groups)
+        ? summaryObj.groups
+        : [];
 
   for (const grp of groups) {
     if (!grp || typeof grp !== 'object') {
@@ -164,7 +207,6 @@ export function normalizeQuotaFromSummary(raw: unknown, nowMs = Date.now()): Quo
     }
     const g = grp as Record<string, unknown>;
     const groupName = String(g.displayName ?? g.name ?? '');
-    const isGeminiGroup = /gemini/i.test(groupName);
 
     const buckets = Array.isArray(g.buckets) ? g.buckets : [];
     for (const b of buckets) {
@@ -178,7 +220,15 @@ export function normalizeQuotaFromSummary(raw: unknown, nowMs = Date.now()): Quo
       const isWeekly = /week/i.test(windowStr) || /weekly/i.test(bucketId ?? '');
       const windowKey: '5h' | 'weekly' = isWeekly ? 'weekly' : '5h';
 
-      const poolKey: PoolKey = isGeminiGroup || /gemini/i.test(bucketId ?? '') ? 'gemini' : 'nonGoogle';
+      const target = `${groupName} ${bucketId ?? ''}`;
+      let poolKey: PoolKey;
+      if (/argon/i.test(target)) {
+        poolKey = 'argon';
+      } else if (/gemini/i.test(target)) {
+        poolKey = 'gemini';
+      } else {
+        poolKey = 'nonGoogle';
+      }
 
       const evaluated = evaluateQuotaValues(bucket.remainingFraction, bucket.resetTime, nowMs);
       if (!evaluated) {
@@ -211,8 +261,9 @@ export function normalizeQuotaFromSummary(raw: unknown, nowMs = Date.now()): Quo
  */
 export function normalizeQuotaFromUserStatus(raw: unknown, nowMs = Date.now()): QuotaSnapshot {
   const pools: Record<PoolKey, QuotaPool> = {
-    gemini: buildEmptyPool('gemini', 'Gemini'),
-    nonGoogle: buildEmptyPool('nonGoogle', 'Non-Google'),
+    gemini: buildEmptyPool('gemini', 'Gemini Models'),
+    argon: buildEmptyPool('argon', 'Gemini 4 Argon'),
+    nonGoogle: buildEmptyPool('nonGoogle', 'Claude & GPT'),
   };
 
   if (!raw || typeof raw !== 'object') {
@@ -236,11 +287,21 @@ export function normalizeQuotaFromUserStatus(raw: unknown, nowMs = Date.now()): 
     const modelOrAlias = (cfg.modelOrAlias ?? {}) as Record<string, unknown>;
     const name = `${cfg.label ?? ''} ${modelOrAlias.model ?? ''}`.trim();
 
-    const poolKey: PoolKey = /gemini/i.test(name) ? 'gemini' : 'nonGoogle';
+    let poolKey: PoolKey;
+    if (/argon/i.test(name)) {
+      poolKey = 'argon';
+    } else if (/gemini/i.test(name)) {
+      poolKey = 'gemini';
+    } else {
+      poolKey = 'nonGoogle';
+    }
 
     const quotaInfo = (cfg.quotaInfo ?? {}) as Record<string, unknown>;
+    const resetTimeStr = typeof quotaInfo.resetTime === 'string' ? quotaInfo.resetTime.trim() : '';
+    const resetMs = resetTimeStr ? Date.parse(resetTimeStr) : NaN;
+    const isFarFuture = !Number.isNaN(resetMs) && resetMs - nowMs > 6 * 3600_000;
     const isWeekly =
-      /week/i.test(String(quotaInfo.window ?? '')) || /weekly/i.test(name);
+      /week/i.test(String(quotaInfo.window ?? '')) || /weekly/i.test(name) || isFarFuture;
     const windowKey: '5h' | 'weekly' = isWeekly ? 'weekly' : '5h';
 
     const evaluated = evaluateQuotaValues(quotaInfo.remainingFraction, quotaInfo.resetTime, nowMs);
@@ -268,24 +329,109 @@ export function normalizeQuotaFromUserStatus(raw: unknown, nowMs = Date.now()): 
 }
 
 /**
+ * Extracts ModelCatalogEntry[] from GetUserStatus response payload.
+ */
+export function extractModelCatalogFromUserStatus(raw: unknown): ModelCatalogEntry[] {
+  if (!raw || typeof raw !== 'object') {
+    return [];
+  }
+
+  const root = raw as Record<string, unknown>;
+  const status = (root.userStatus ?? root) as Record<string, unknown>;
+  const cascadeData = (status.cascadeModelConfigData ?? status) as Record<string, unknown>;
+  const configs = Array.isArray(cascadeData.clientModelConfigs)
+    ? cascadeData.clientModelConfigs
+    : Array.isArray(root.clientModelConfigs)
+      ? root.clientModelConfigs
+      : [];
+
+  const catalog: ModelCatalogEntry[] = [];
+  for (const c of configs) {
+    if (!c || typeof c !== 'object') {
+      continue;
+    }
+    const cfg = c as Record<string, unknown>;
+    const modelOrAlias = (cfg.modelOrAlias ?? {}) as Record<string, unknown>;
+    const cfgModelIdObj =
+      cfg.modelId && typeof cfg.modelId === 'object' ? (cfg.modelId as Record<string, unknown>) : null;
+    const slugId =
+      typeof cfg.modelId === 'string'
+        ? cfg.modelId.trim()
+        : typeof cfgModelIdObj?.id === 'string'
+          ? cfgModelIdObj.id.trim()
+          : '';
+    const aliasModel = typeof modelOrAlias.model === 'string' ? modelOrAlias.model.trim() : '';
+    const rawId =
+      (typeof cfg.rawId === 'string' ? cfg.rawId.trim() : '') ||
+      aliasModel ||
+      (typeof cfg.model === 'string' ? cfg.model.trim() : '') ||
+      slugId;
+    const modelId = slugId || aliasModel || rawId;
+    const label = String(cfg.label ?? cfg.displayName ?? cfg.name ?? modelId ?? rawId).trim();
+
+    if (!rawId && !modelId && !label) {
+      continue;
+    }
+
+    const effectiveModelId = modelId || rawId;
+    const effectiveRawId = rawId || modelId;
+    const effectiveLabel = label || effectiveModelId;
+
+    const poolKey = inferModelPool(`${effectiveLabel} ${effectiveModelId} ${effectiveRawId}`);
+
+    catalog.push({
+      rawId: effectiveRawId,
+      modelId: effectiveModelId,
+      label: effectiveLabel,
+      poolKey,
+    });
+  }
+
+  return catalog;
+}
+
+/**
  * Connect-RPC client for interacting with `agy --hub` language server endpoints.
  */
 export class HubClient {
   private readonly timeoutMs: number;
   private readonly protocolCache = new Map<string, 'http:' | 'https:'>();
   private readonly generatorMetadataCache = new Map<string, CallUsagePoint[]>();
+  private readonly modelCatalogCache = new Map<string, { timestamp: number; data: ModelCatalogEntry[] }>();
 
-  constructor(options: { timeoutMs?: number } = {}) {
-    this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  public consecutiveFailures = 0;
+  public cooldownUntilMs = 0;
+  public randomFn: () => number;
+
+  constructor(
+    optionsOrTimeout: { timeoutMs?: number; randomFn?: () => number } | number = {},
+    randomFn?: () => number,
+  ) {
+    if (typeof optionsOrTimeout === 'number') {
+      this.timeoutMs = optionsOrTimeout;
+      this.randomFn = randomFn ?? Math.random;
+    } else {
+      this.timeoutMs = optionsOrTimeout.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+      this.randomFn = optionsOrTimeout.randomFn ?? randomFn ?? Math.random;
+    }
   }
 
   getCachedProtocol(endpoint: HubEndpoint): 'http:' | 'https:' | undefined {
     return this.protocolCache.get(`${endpoint.host}:${endpoint.port}`);
   }
 
+  clearProtocolCache(hostKey?: string): void {
+    if (hostKey) {
+      this.protocolCache.delete(hostKey);
+    } else {
+      this.protocolCache.clear();
+    }
+  }
+
   clearCaches(): void {
     this.protocolCache.clear();
     this.generatorMetadataCache.clear();
+    this.modelCatalogCache.clear();
   }
 
   private executeRequest(
@@ -293,7 +439,7 @@ export class HubClient {
     endpoint: HubEndpoint,
     methodPath: string,
     body: string,
-  ): Promise<{ statusCode: number; data: unknown }> {
+  ): Promise<{ statusCode: number; data: unknown; retryAfterMs?: number }> {
     return new Promise((resolve, reject) => {
       const isHttps = protocol === 'https:';
       const clientModule = isHttps ? https : http;
@@ -331,7 +477,10 @@ export class HubClient {
                 parsed = text;
               }
             }
-            resolve({ statusCode: res.statusCode ?? 0, data: parsed });
+            const retryHeader = res.headers['retry-after'];
+            const headerVal = Array.isArray(retryHeader) ? retryHeader[0] : retryHeader;
+            const retryAfterMs = parseRetryAfterMs(headerVal);
+            resolve({ statusCode: res.statusCode ?? 0, data: parsed, retryAfterMs });
           });
         },
       );
@@ -353,7 +502,7 @@ export class HubClient {
     endpoint: HubEndpoint,
     methodPath: string,
     payload: unknown,
-  ): Promise<{ statusCode: number; data: any; protocol: 'http:' | 'https:' } | null> {
+  ): Promise<{ statusCode: number; data: any; protocol: 'http:' | 'https:'; retryAfterMs?: number } | null> {
     const body = JSON.stringify(payload);
     const hostKey = `${endpoint.host}:${endpoint.port}`;
     const cached = this.protocolCache.get(hostKey);
@@ -366,14 +515,22 @@ export class HubClient {
     for (const proto of protocolsToTry) {
       try {
         const res = await this.executeRequest(proto, endpoint, methodPath, body);
-        this.protocolCache.set(hostKey, proto);
+        if (proto === 'http:' && res.statusCode === 400) {
+          continue;
+        }
+        if (res.statusCode === 401) {
+          this.clearProtocolCache(hostKey);
+        } else {
+          this.protocolCache.set(hostKey, proto);
+        }
         return { ...res, protocol: proto };
       } catch (err: any) {
         lastError = err;
         const code = err?.code ?? '';
         // If port is closed / refused or host unreachable, stop immediately
         if (code === 'ECONNREFUSED' || code === 'EHOSTUNREACH' || code === 'ENETUNREACH') {
-          return null;
+          this.clearProtocolCache(hostKey);
+          throw err;
         }
         // If SSL or protocol error occurred on HTTP, next iteration will try HTTPS
       }
@@ -383,24 +540,80 @@ export class HubClient {
   }
 
   /**
-   * Fetches quota summary from RetrieveUserQuotaSummary, falling back to GetUserStatus.
-   * Returns an offline QuotaSnapshot without throwing on ECONNREFUSED or network failure.
+   * Fetches quota summary with metadata, incorporating circuit-breaking and rate-limiting.
    */
-  async fetchQuota(endpoint: HubEndpoint, nowMs = Date.now()): Promise<QuotaSnapshot> {
+  async fetchQuotaWithMeta(
+    endpoint: HubEndpoint,
+    nowMs = Date.now(),
+  ): Promise<{
+    quota: QuotaSnapshot;
+    endpointFailed: boolean;
+    rateLimited: boolean;
+    cooldownUntilMs: number;
+  }> {
+    if (nowMs < this.cooldownUntilMs) {
+      return {
+        quota: {
+          ...buildOfflineQuota(nowMs),
+          cooldownUntilMs: this.cooldownUntilMs,
+          rateLimited: true,
+        },
+        endpointFailed: false,
+        rateLimited: true,
+        cooldownUntilMs: this.cooldownUntilMs,
+      };
+    }
+
+    const hostKey = `${endpoint.host}:${endpoint.port}`;
+
     try {
       const summaryRes = await this.postRpc(endpoint, 'RetrieveUserQuotaSummary', {
         metadata: { ideName: 'antigravity', extensionName: 'antigravity', locale: 'en' },
       });
 
+      if (summaryRes?.statusCode === 429) {
+        this.consecutiveFailures++;
+        const duration = Math.max(summaryRes.retryAfterMs ?? 0, 60_000);
+        this.cooldownUntilMs = nowMs + duration;
+        return {
+          quota: {
+            ...buildOfflineQuota(nowMs),
+            cooldownUntilMs: this.cooldownUntilMs,
+            rateLimited: true,
+          },
+          endpointFailed: false,
+          rateLimited: true,
+          cooldownUntilMs: this.cooldownUntilMs,
+        };
+      }
+
+      if (summaryRes?.statusCode === 401) {
+        this.clearProtocolCache(hostKey);
+        this.consecutiveFailures++;
+        if (this.consecutiveFailures >= 3) {
+          this.cooldownUntilMs = nowMs + 60_000;
+        }
+        return {
+          quota: buildOfflineQuota(nowMs),
+          endpointFailed: true,
+          rateLimited: false,
+          cooldownUntilMs: this.cooldownUntilMs,
+        };
+      }
+
       if (summaryRes && summaryRes.statusCode === 200 && summaryRes.data) {
         const snapshot = normalizeQuotaFromSummary(summaryRes.data, nowMs);
-        const hasAnyWindow =
-          snapshot.pools.gemini.fiveHour !== null ||
-          snapshot.pools.gemini.weekly !== null ||
-          snapshot.pools.nonGoogle.fiveHour !== null ||
-          snapshot.pools.nonGoogle.weekly !== null;
+        const hasAnyWindow = Object.values(snapshot.pools).some(
+          (p) => p.fiveHour !== null || p.weekly !== null,
+        );
         if (hasAnyWindow) {
-          return snapshot;
+          this.consecutiveFailures = 0;
+          return {
+            quota: snapshot,
+            endpointFailed: false,
+            rateLimited: false,
+            cooldownUntilMs: 0,
+          };
         }
       }
 
@@ -409,13 +622,109 @@ export class HubClient {
         metadata: { ideName: 'antigravity', extensionName: 'antigravity', locale: 'en' },
       });
 
-      if (statusRes && statusRes.statusCode === 200 && statusRes.data) {
-        return normalizeQuotaFromUserStatus(statusRes.data, nowMs);
+      if (statusRes?.statusCode === 429) {
+        this.consecutiveFailures++;
+        const duration = Math.max(statusRes.retryAfterMs ?? 0, 60_000);
+        this.cooldownUntilMs = nowMs + duration;
+        return {
+          quota: {
+            ...buildOfflineQuota(nowMs),
+            cooldownUntilMs: this.cooldownUntilMs,
+            rateLimited: true,
+          },
+          endpointFailed: false,
+          rateLimited: true,
+          cooldownUntilMs: this.cooldownUntilMs,
+        };
       }
 
-      return buildOfflineQuota(nowMs);
+      if (statusRes?.statusCode === 401) {
+        this.clearProtocolCache(hostKey);
+        this.consecutiveFailures++;
+        if (this.consecutiveFailures >= 3) {
+          this.cooldownUntilMs = nowMs + 60_000;
+        }
+        return {
+          quota: buildOfflineQuota(nowMs),
+          endpointFailed: true,
+          rateLimited: false,
+          cooldownUntilMs: this.cooldownUntilMs,
+        };
+      }
+
+      if (statusRes && statusRes.statusCode === 200 && statusRes.data) {
+        this.consecutiveFailures = 0;
+        return {
+          quota: normalizeQuotaFromUserStatus(statusRes.data, nowMs),
+          endpointFailed: false,
+          rateLimited: false,
+          cooldownUntilMs: 0,
+        };
+      }
+
+      this.consecutiveFailures++;
+      if (this.consecutiveFailures >= 3) {
+        this.cooldownUntilMs = nowMs + 60_000;
+      }
+      return {
+        quota: buildOfflineQuota(nowMs),
+        endpointFailed: false,
+        rateLimited: false,
+        cooldownUntilMs: this.cooldownUntilMs,
+      };
+    } catch (err: any) {
+      const code = err?.code ?? '';
+      const isEndpointError =
+        code === 'ECONNREFUSED' || code === 'EHOSTUNREACH' || code === 'ENETUNREACH';
+      if (isEndpointError) {
+        this.clearProtocolCache(hostKey);
+      }
+      this.consecutiveFailures++;
+      if (this.consecutiveFailures >= 3) {
+        this.cooldownUntilMs = nowMs + 60_000;
+      }
+      return {
+        quota: buildOfflineQuota(nowMs),
+        endpointFailed: isEndpointError,
+        rateLimited: false,
+        cooldownUntilMs: this.cooldownUntilMs,
+      };
+    }
+  }
+
+  /**
+   * Fetches quota summary from RetrieveUserQuotaSummary, falling back to GetUserStatus.
+   * Returns an offline QuotaSnapshot without throwing on ECONNREFUSED or network failure.
+   */
+  async fetchQuota(endpoint: HubEndpoint, nowMs = Date.now()): Promise<QuotaSnapshot> {
+    const meta = await this.fetchQuotaWithMeta(endpoint, nowMs);
+    return meta.quota;
+  }
+
+  /**
+   * Fetches the model catalog from GetUserStatus with a 60-second cache per endpoint.
+   */
+  async fetchModelCatalog(endpoint: HubEndpoint, nowMs = Date.now()): Promise<ModelCatalogEntry[]> {
+    const hostKey = `${endpoint.host}:${endpoint.port}`;
+    const cached = this.modelCatalogCache.get(hostKey);
+    if (cached && nowMs - cached.timestamp < 60_000) {
+      return cached.data;
+    }
+
+    try {
+      const res = await this.postRpc(endpoint, 'GetUserStatus', {
+        metadata: { ideName: 'antigravity', extensionName: 'antigravity', locale: 'en' },
+      });
+
+      if (res && res.statusCode === 200 && res.data) {
+        const catalog = extractModelCatalogFromUserStatus(res.data);
+        this.modelCatalogCache.set(hostKey, { timestamp: nowMs, data: catalog });
+        return catalog;
+      }
+
+      return cached ? cached.data : [];
     } catch {
-      return buildOfflineQuota(nowMs);
+      return cached ? cached.data : [];
     }
   }
 
@@ -552,6 +861,7 @@ export class HubClient {
           idx: i,
           stepIndices: Array.isArray(call.stepIndices) ? call.stepIndices.map(Number) : [],
           model: chatModel.model ?? usage.model ?? 'unknown',
+          rawModel: chatModel.model ?? usage.model ?? undefined,
           fresh,
           cacheRead,
           output,

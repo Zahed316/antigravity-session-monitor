@@ -43,11 +43,24 @@ const STATE_VSCDB_SQL =
 
 const utf8Decoder = new TextDecoder('utf-8', { fatal: false });
 
+export const FULL_SWEEP_INTERVAL_MS = 60_000;
+export const RECENT_ACTIVITY_WINDOW_MS = 10 * 60_000;
+
+export interface ReadAllOptions {
+  forceRescan?: boolean;
+  dirtyConversationIds?: ReadonlySet<string>;
+  activeConversationIds?: ReadonlySet<string>;
+  nowMs?: number;
+}
+
+export type ReadOptions = boolean | ReadAllOptions;
+
 export interface LocalTelemetryReaderOptions {
   antigravityRoot: string;
   cacheFilePath?: string;
   workspaceStateDbPath?: string;
   cacheDebounceMs?: number;
+  fullSweepIntervalMs?: number;
 }
 
 export interface LocalSnapshot {
@@ -397,6 +410,31 @@ function buildUncatalogedSummary(
   };
 }
 
+function buildUncatalogedSummaryFromCache(
+  conversationId: string,
+  entry: DbCacheEntry,
+): RawConversationSummary {
+  const lastModifiedTime = Math.max(entry.dbMtimeMs, entry.walMtimeMs);
+  const meta = entry.uncatalogedMeta ?? { workspaceUris: [] };
+  return {
+    conversationId,
+    title: meta.title ?? '',
+    preview: '',
+    stepCount: 0,
+    lastModifiedTime,
+    lastUserInputTime: null,
+    workspaceUris: [...meta.workspaceUris],
+    status: '',
+    parentConversationId: '',
+    nestingDepth: 0,
+    agentName: '',
+    subagentRole: '',
+    killed: false,
+    notFullyIdle: false,
+    isUncataloged: true,
+  };
+}
+
 function canReuseCachedEntry(
   cached: DbCacheEntry | undefined,
   dbStat: FileStatInfo,
@@ -434,6 +472,7 @@ export class LocalTelemetryReader {
   private readonly cacheFilePath: string | undefined;
   private readonly workspaceStateDbPath: string | undefined;
   private readonly cacheDebounceMs: number;
+  private readonly fullSweepIntervalMs: number;
 
   private readonly entries = new Map<string, DbCacheEntry>();
   private cacheLoaded = false;
@@ -445,6 +484,10 @@ export class LocalTelemetryReader {
   private tmpWriteSeq = 0;
   private readLock: Promise<void> = Promise.resolve();
 
+  private lastConversationsDirMtimeMs = -1;
+  private cachedDbList: Array<{ conversationId: string; dbPath: string }> = [];
+  private lastFullSweepMs = 0;
+
   constructor(sqlite: SqliteClient, options: LocalTelemetryReaderOptions) {
     this.sqlite = sqlite;
     this.antigravityRoot = path.resolve(options.antigravityRoot);
@@ -453,6 +496,7 @@ export class LocalTelemetryReader {
       ? path.resolve(options.workspaceStateDbPath)
       : undefined;
     this.cacheDebounceMs = Math.max(0, options.cacheDebounceMs ?? DEFAULT_CACHE_DEBOUNCE_MS);
+    this.fullSweepIntervalMs = options.fullSweepIntervalMs ?? FULL_SWEEP_INTERVAL_MS;
   }
 
   clearMemoryCache(): void {
@@ -460,19 +504,27 @@ export class LocalTelemetryReader {
     this.cacheLoaded = false;
     this.dirty = false;
     this.persistGeneration++;
+    this.lastConversationsDirMtimeMs = -1;
+    this.cachedDbList = [];
+    this.lastFullSweepMs = 0;
     if (this.persistTimer !== null) {
       clearTimeout(this.persistTimer);
       this.persistTimer = null;
     }
   }
 
-  async read(forceRescan = false): Promise<LocalSnapshot> {
-    const run = this.readLock.then(() => this.performRead(forceRescan));
+  async read(options?: boolean | ReadAllOptions): Promise<LocalSnapshot> {
+    const opts = typeof options === 'boolean' ? { forceRescan: options } : (options ?? {});
+    const run = this.readLock.then(() => this.performRead(opts));
     this.readLock = run.then(
       () => undefined,
       () => undefined,
     );
     return await run;
+  }
+
+  async readAll(options?: boolean | ReadAllOptions): Promise<LocalSnapshot> {
+    return this.read(options);
   }
 
   async flushCache(): Promise<void> {
@@ -498,16 +550,28 @@ export class LocalTelemetryReader {
     }
   }
 
-  private async performRead(forceRescan: boolean): Promise<LocalSnapshot> {
+  private async performRead(options: ReadAllOptions): Promise<LocalSnapshot> {
+    const forceRescan = options.forceRescan ?? false;
+    const nowMs = options.nowMs ?? Date.now();
+
     if (forceRescan) {
       this.cacheLoaded = true;
     } else if (!this.cacheLoaded) {
       await this.loadCacheFromDisk();
     }
 
+    const isFullSweep =
+      forceRescan ||
+      this.lastFullSweepMs === 0 ||
+      nowMs - this.lastFullSweepMs >= this.fullSweepIntervalMs;
+
+    if (isFullSweep) {
+      this.lastFullSweepMs = nowMs;
+    }
+
     const [catalogedSummaries, convFiles, lastConversationId] = await Promise.all([
       this.readCatalogedSummaries(),
-      this.listConversationDbs(),
+      this.listConversationDbs(isFullSweep),
       this.readLastConversationId(),
     ]);
 
@@ -519,11 +583,42 @@ export class LocalTelemetryReader {
     for (const file of convFiles) {
       discoveredIds.add(file.conversationId);
       const isCataloged = catalogedIds.has(file.conversationId);
+      const existing = this.entries.get(file.conversationId);
+
+      let shouldStat = isFullSweep;
+      if (!shouldStat) {
+        if (!existing) {
+          shouldStat = true;
+        } else if (options.dirtyConversationIds?.has(file.conversationId)) {
+          shouldStat = true;
+        } else if (options.activeConversationIds?.has(file.conversationId)) {
+          shouldStat = true;
+        } else if (
+          nowMs - Math.max(existing.dbMtimeMs, existing.walMtimeMs) < RECENT_ACTIVITY_WINDOW_MS
+        ) {
+          shouldStat = true;
+        } else if (!isCataloged && existing.uncatalogedMeta === undefined) {
+          shouldStat = true;
+        }
+      }
+
+      if (!shouldStat && existing) {
+        callsById.set(file.conversationId, [...existing.calls]);
+        if (!isCataloged) {
+          uncatalogedSummaries.push(
+            buildUncatalogedSummaryFromCache(file.conversationId, existing),
+          );
+        }
+        continue;
+      }
+
+      const isDirty = Boolean(options.dirtyConversationIds?.has(file.conversationId));
       const synced = await this.syncConversationDb(
         file.conversationId,
         file.dbPath,
         isCataloged,
         forceRescan,
+        isDirty,
       );
 
       if (!synced) {
@@ -548,6 +643,16 @@ export class LocalTelemetryReader {
 
     if (forceRescan && this.cacheFilePath) {
       this.markDirty();
+    }
+
+    try {
+      const convDir = path.join(this.antigravityRoot, 'conversations');
+      const st = await fs.stat(convDir);
+      if (st.isDirectory()) {
+        this.lastConversationsDirMtimeMs = st.mtimeMs;
+      }
+    } catch {
+      // ignore
     }
 
     await this.schedulePersist();
@@ -702,31 +807,58 @@ export class LocalTelemetryReader {
     return summaries;
   }
 
-  private async listConversationDbs(): Promise<Array<{ conversationId: string; dbPath: string }>> {
+  private async listConversationDbs(
+    isFullSweep: boolean,
+  ): Promise<Array<{ conversationId: string; dbPath: string }>> {
     const convDir = path.join(this.antigravityRoot, 'conversations');
-    let dirEntries;
+    let dirMtimeMs: number;
     try {
-      dirEntries = await fs.readdir(convDir, { withFileTypes: true });
+      const st = await fs.stat(convDir);
+      if (!st.isDirectory()) {
+        this.cachedDbList = [];
+        this.lastConversationsDirMtimeMs = -1;
+        return [];
+      }
+      dirMtimeMs = st.mtimeMs;
     } catch {
+      this.cachedDbList = [];
+      this.lastConversationsDirMtimeMs = -1;
       return [];
     }
 
-    const out: Array<{ conversationId: string; dbPath: string }> = [];
-    for (const entry of dirEntries) {
-      if (!(entry.isFile() || entry.isSymbolicLink()) || !entry.name.endsWith('.db')) {
-        continue;
+    const dirMtimeChanged = dirMtimeMs !== this.lastConversationsDirMtimeMs;
+
+    if (isFullSweep || dirMtimeChanged || this.lastConversationsDirMtimeMs === -1) {
+      let dirEntries;
+      try {
+        dirEntries = await fs.readdir(convDir, { withFileTypes: true });
+      } catch {
+        this.cachedDbList = [];
+        this.lastConversationsDirMtimeMs = -1;
+        return [];
       }
-      const conversationId = entry.name.slice(0, -3);
-      if (conversationId.length === 0) {
-        continue;
+
+      const out: Array<{ conversationId: string; dbPath: string }> = [];
+      for (const entry of dirEntries) {
+        if (!(entry.isFile() || entry.isSymbolicLink()) || !entry.name.endsWith('.db')) {
+          continue;
+        }
+        const conversationId = entry.name.slice(0, -3);
+        if (conversationId.length === 0) {
+          continue;
+        }
+        out.push({
+          conversationId,
+          dbPath: path.join(convDir, entry.name),
+        });
       }
-      out.push({
-        conversationId,
-        dbPath: path.join(convDir, entry.name),
-      });
+      out.sort((a, b) => a.conversationId.localeCompare(b.conversationId));
+      this.cachedDbList = out;
+      this.lastConversationsDirMtimeMs = dirMtimeMs;
+      return out;
     }
-    out.sort((a, b) => a.conversationId.localeCompare(b.conversationId));
-    return out;
+
+    return this.cachedDbList;
   }
 
   private async syncConversationDb(
@@ -734,6 +866,7 @@ export class LocalTelemetryReader {
     dbPath: string,
     isCataloged: boolean,
     forceRescan: boolean,
+    isDirty = false,
   ): Promise<{ entry: DbCacheEntry; dbStat: FileStatInfo; walStat: FileStatInfo | null } | null> {
     const dbStat = await safeStatFile(dbPath);
     if (!dbStat) {
@@ -748,7 +881,7 @@ export class LocalTelemetryReader {
     const existing = this.entries.get(conversationId);
     const reusable = canReuseCachedEntry(existing, dbStat, walStat, forceRescan);
 
-    if (reusable && existing.signature === signature) {
+    if (!isDirty && reusable && existing.signature === signature) {
       if (!isCataloged && existing.uncatalogedMeta === undefined) {
         existing.uncatalogedMeta = await this.readUncatalogedMeta(dbPath);
         this.markDirty();
