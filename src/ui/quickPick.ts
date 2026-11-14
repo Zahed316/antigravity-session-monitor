@@ -27,9 +27,9 @@ export interface QuickPickCallbacks {
 }
 
 export interface QuickPickInstanceLike<T extends QuickPickEntry = QuickPickEntry> {
-  title: string;
-  placeholder: string;
-  items: T[];
+  title: string | undefined;
+  placeholder: string | undefined;
+  items: readonly T[];
   selectedItems: readonly T[];
   onDidAccept(listener: () => void): { dispose(): void };
   onDidTriggerItemButton(listener: (e: { button: QuickPickButtonLike; item: T }) => void): { dispose(): void };
@@ -43,6 +43,17 @@ export interface QuickPickVscodeLike {
   window: {
     createQuickPick<T extends QuickPickEntry>(): QuickPickInstanceLike<T>;
   };
+  ThemeIcon?: new (id: string) => unknown;
+}
+
+export type VscodeQuickPickApi = QuickPickVscodeLike;
+
+function hasDescendant(node: SessionNode, targetId: string): boolean {
+  if (node.id === targetId) return true;
+  for (const child of node.children) {
+    if (hasDescendant(child, targetId)) return true;
+  }
+  return false;
 }
 
 export function buildQuickPickItems(state: MonitorState): QuickPickEntry[] {
@@ -70,9 +81,9 @@ export function buildQuickPickItems(state: MonitorState): QuickPickEntry[] {
   // 3. Filter root sessions based on scope
   let roots = isCurrent ? state.roots.filter((r) => r.matchesWorkspace) : [...state.roots];
 
-  // If a pinned session exists, ensure it is included even if scope would filter it
+  // If a pinned session exists, ensure its root ancestor is included even if scope would filter it
   if (state.pinnedSessionId !== null && !state.pinMissing) {
-    const pinnedRoot = state.roots.find((r) => r.id === state.pinnedSessionId);
+    const pinnedRoot = state.roots.find((r) => hasDescendant(r, state.pinnedSessionId!));
     if (pinnedRoot && !roots.some((r) => r.id === pinnedRoot.id)) {
       roots.unshift(pinnedRoot);
     }
@@ -144,8 +155,14 @@ export function buildQuickPickItems(state: MonitorState): QuickPickEntry[] {
     addNodeRecursive(root, 0);
   }
 
-  if (state.unattachedSubagents && state.unattachedSubagents.length > 0) {
-    for (const orphan of state.unattachedSubagents) {
+  const unattached = isCurrent
+    ? state.unattachedSubagents.filter(
+        (u) => u.matchesWorkspace || u.id === state.pinnedSessionId || u.workspaceUris.length === 0,
+      )
+    : state.unattachedSubagents;
+
+  if (unattached && unattached.length > 0) {
+    for (const orphan of unattached) {
       addNodeRecursive(orphan, 1);
     }
   }
@@ -161,7 +178,31 @@ export async function showSessionQuickPick(
   const qp = vscodeApi.window.createQuickPick<QuickPickEntry>();
   qp.title = 'Antigravity Session Monitor';
   qp.placeholder = 'Select a session to inspect, or pin to Status Bar';
-  qp.items = buildQuickPickItems(state);
+
+  const rawItems = buildQuickPickItems(state);
+  if (vscodeApi.ThemeIcon) {
+    const ThemeIconCtor = vscodeApi.ThemeIcon;
+    qp.items = rawItems.map((item) => {
+      if (!item.buttons || item.buttons.length === 0) {
+        return item;
+      }
+      return {
+        ...item,
+        buttons: item.buttons.map((btn) => ({
+          ...btn,
+          iconPath:
+            btn.iconPath &&
+            typeof btn.iconPath === 'object' &&
+            'id' in btn.iconPath &&
+            typeof (btn.iconPath as any).id === 'string'
+              ? new ThemeIconCtor((btn.iconPath as any).id)
+              : btn.iconPath,
+        })),
+      };
+    });
+  } else {
+    qp.items = rawItems;
+  }
 
   const disposables: Array<{ dispose(): void }> = [];
 

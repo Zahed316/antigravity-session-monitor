@@ -1,6 +1,6 @@
 import type * as vscode from 'vscode';
 import type { MonitorState } from '../types.ts';
-import { renderBottomPanelHtml } from './bottomPanelHtml.ts';
+import { renderBottomPanelBodyHtml, renderBottomPanelHtml } from './bottomPanelHtml.ts';
 
 export interface WebviewLike {
   html: string;
@@ -88,7 +88,11 @@ export class BottomPanelController {
     if (!this.initialized) {
       this.renderFullHtml();
     } else {
-      this.view.webview.postMessage({ type: 'updateState', state });
+      this.view.webview.postMessage({
+        type: 'updateState',
+        state,
+        bodyHtml: renderBottomPanelBodyHtml(state),
+      });
     }
   }
 
@@ -100,7 +104,11 @@ export class BottomPanelController {
     if (!this.initialized) {
       this.renderFullHtml();
     } else {
-      this.view.webview.postMessage({ type: 'updateState', state: this.latestState });
+      this.view.webview.postMessage({
+        type: 'updateState',
+        state: this.latestState,
+        bodyHtml: renderBottomPanelBodyHtml(this.latestState),
+      });
     }
   }
 

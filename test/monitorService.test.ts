@@ -106,6 +106,14 @@ describe('MonitorService Orchestrator', () => {
         stepCount: 15,
       }),
       createMockSummary({
+        conversationId: 's-killed-running',
+        title: 'Killed Running Session',
+        status: 'CASCADE_RUN_STATUS_RUNNING',
+        killed: true,
+        lastModifiedTime: 4020,
+        stepCount: 8,
+      }),
+      createMockSummary({
         conversationId: 'subagent-running',
         parentConversationId: 's-running',
         nestingDepth: 1,
@@ -113,6 +121,16 @@ describe('MonitorService Orchestrator', () => {
         status: 'CASCADE_RUN_STATUS_RUNNING',
         lastModifiedTime: 4100,
         stepCount: 4,
+      }),
+      createMockSummary({
+        conversationId: 'subagent-killed-running',
+        parentConversationId: 's-running',
+        nestingDepth: 1,
+        title: 'Killed Running Subagent',
+        status: 'CASCADE_RUN_STATUS_RUNNING',
+        killed: true,
+        lastModifiedTime: 4050,
+        stepCount: 2,
       }),
       createMockSummary({
         conversationId: 'subagent-idle',
@@ -226,10 +244,12 @@ describe('MonitorService Orchestrator', () => {
     assert.ok(polledIds.has('s-running'), 'running workspace session polled');
     assert.ok(polledIds.has('subagent-running'), 'running subagent polled');
 
-    // NEVER poll idle historical sessions
+    // NEVER poll idle historical sessions or killed sessions
     assert.ok(!polledIds.has('s-historical'), 'historical idle session NOT polled');
     assert.ok(!polledIds.has('s-other'), 'other workspace idle session NOT polled');
     assert.ok(!polledIds.has('subagent-idle'), 'idle subagent NOT polled');
+    assert.ok(!polledIds.has('s-killed-running'), 'killed workspace session NOT polled');
+    assert.ok(!polledIds.has('subagent-killed-running'), 'killed subagent NOT polled');
 
     service.dispose();
   });
@@ -413,5 +433,52 @@ describe('MonitorService Orchestrator', () => {
     service.dispose();
     assert.strictEqual(timerCleared, true, 'Polling timer cleared on dispose');
     assert.strictEqual(watchClosed, true, 'Watchers closed on dispose');
+  });
+
+  it('4. selectForPanel triggers refreshNow immediately when service is started', async () => {
+    let refreshCount = 0;
+    const mockLocalReader: any = {
+      read: async () => {
+        refreshCount++;
+        return {
+          summaries: [createMockSummary({ conversationId: 'sess-1' })],
+          callsById: new Map(),
+          lastConversationId: null,
+        };
+      },
+      flushCache: async () => {},
+      clearMemoryCache: () => {},
+    };
+
+    const mockHubClient: any = {
+      fetchQuota: async () => createMockQuota('offline'),
+      fetchTrajectories: async () => new Map(),
+      fetchGeneratorMetadata: async () => [],
+    };
+
+    const service = new MonitorService({
+      localReader: mockLocalReader,
+      hubClient: mockHubClient,
+      discoverEndpoints: async () => [],
+      workspacePaths: ['/workspace/project'],
+      config: { ...DEFAULT_CONFIG },
+    });
+
+    await service.start();
+    assert.strictEqual(refreshCount, 1, 'Initial refresh on start');
+
+    // Calling selectForPanel with non-null ID triggers refreshNow
+    service.selectForPanel('sess-1');
+
+    // Allow event loop tick for inFlight refreshNow to start/complete
+    await new Promise((r) => setTimeout(r, 15));
+    assert.strictEqual(refreshCount, 2, 'selectForPanel triggered immediate refresh');
+
+    // Calling selectForPanel(null) does NOT trigger refreshNow
+    service.selectForPanel(null);
+    await new Promise((r) => setTimeout(r, 15));
+    assert.strictEqual(refreshCount, 2, 'selectForPanel(null) did not trigger refresh');
+
+    service.dispose();
   });
 });

@@ -24,6 +24,7 @@ import {
   type QuickPickVscodeLike,
 } from '../src/ui/quickPick.ts';
 import {
+  renderBottomPanelBodyHtml,
   renderBottomPanelHtml,
   escapeHtml,
 } from '../src/ui/bottomPanelHtml.ts';
@@ -546,6 +547,116 @@ test('showSessionQuickPick wires onDidTriggerItemButton and onDidAccept without 
   assert.equal(unpinned, true);
 });
 
+test('showSessionQuickPick wraps button iconPath with new vscodeApi.ThemeIcon when ThemeIcon constructor is provided', async () => {
+  const mockQp = {
+    title: '',
+    placeholder: '',
+    items: [] as QuickPickEntry[],
+    selectedItems: [] as QuickPickEntry[],
+    onDidAccept() { return { dispose() {} }; },
+    onDidTriggerItemButton() { return { dispose() {} }; },
+    onDidHide() { return { dispose() {} }; },
+    show() {},
+    hide() {},
+    dispose() {},
+  };
+
+  class MockThemeIcon {
+    id: string;
+    constructor(id: string) {
+      this.id = id;
+    }
+  }
+
+  const mockVscode: QuickPickVscodeLike = {
+    window: {
+      createQuickPick: () => mockQp as any,
+    },
+    ThemeIcon: MockThemeIcon,
+  };
+
+  const state = createState();
+  await showSessionQuickPick(mockVscode, state, {
+    onInspect: () => {},
+    onPin: () => {},
+    onUnpin: () => {},
+    onToggleScope: () => {},
+  });
+
+  const sessionItem = mockQp.items.find((it) => it.action === 'session' && it.buttons && it.buttons.length > 0);
+  assert.ok(sessionItem && sessionItem.buttons);
+  assert.ok(sessionItem.buttons[0].iconPath instanceof MockThemeIcon);
+  assert.strictEqual((sessionItem.buttons[0].iconPath as MockThemeIcon).id, 'pin');
+  assert.ok(sessionItem.buttons[1].iconPath instanceof MockThemeIcon);
+  assert.strictEqual((sessionItem.buttons[1].iconPath as MockThemeIcon).id, 'layout-panel');
+});
+
+test('Minor #2: scope current filters unattachedSubagents and includes pinned subagent root', () => {
+  // 1. Root in other workspace with a child subagent that is pinned
+  const childSubagent = createNode({
+    id: 'pinned-child-subagent',
+    title: 'Pinned Child in other workspace',
+    matchesWorkspace: false,
+    workspaceUris: ['file:///workspace/other'],
+  });
+  const otherRoot = createNode({
+    id: 'other-root',
+    title: 'Other Workspace Root',
+    matchesWorkspace: false,
+    workspaceUris: ['file:///workspace/other'],
+    children: [childSubagent],
+  });
+
+  // 2. Unattached subagents
+  const unattachedWorkspace = createNode({
+    id: 'unattached-ws',
+    title: 'Unattached in WS',
+    matchesWorkspace: true,
+    workspaceUris: ['file:///workspace/current'],
+  });
+  const unattachedNoUris = createNode({
+    id: 'unattached-nouris',
+    title: 'Unattached no URIs',
+    matchesWorkspace: false,
+    workspaceUris: [],
+  });
+  const unattachedOther = createNode({
+    id: 'unattached-other',
+    title: 'Unattached other WS',
+    matchesWorkspace: false,
+    workspaceUris: ['file:///workspace/other'],
+  });
+  const unattachedPinned = createNode({
+    id: 'unattached-pinned',
+    title: 'Unattached Pinned',
+    matchesWorkspace: false,
+    workspaceUris: ['file:///workspace/other'],
+  });
+
+  const state = createState({
+    roots: [otherRoot],
+    unattachedSubagents: [unattachedWorkspace, unattachedNoUris, unattachedOther, unattachedPinned],
+    pinnedSessionId: 'pinned-child-subagent',
+    scope: 'current',
+  });
+
+  // Test buildQuickPickItems
+  const qpItems = buildQuickPickItems(state);
+  const qpIds = qpItems.map((it) => it.sessionId).filter(Boolean);
+  assert.ok(qpIds.includes('other-root'), 'Root ancestor of pinned child subagent is included in current scope');
+  assert.ok(qpIds.includes('pinned-child-subagent'), 'Pinned child subagent is included');
+  assert.ok(qpIds.includes('unattached-ws'), 'Workspace unattached included');
+  assert.ok(qpIds.includes('unattached-nouris'), 'Zero-URI unattached included');
+  assert.ok(!qpIds.includes('unattached-other'), 'Non-matching unattached excluded');
+
+  // Test renderBottomPanelBodyHtml
+  const bodyHtml = renderBottomPanelBodyHtml(state);
+  assert.ok(bodyHtml.includes('Other Workspace Root'), 'Body HTML includes root of pinned subagent');
+  assert.ok(bodyHtml.includes('Unattached in WS'), 'Body HTML includes matching unattached');
+  assert.ok(bodyHtml.includes('Unattached no URIs'), 'Body HTML includes zero-URI unattached');
+  assert.ok(!bodyHtml.includes('Unattached other WS'), 'Body HTML excludes other unattached');
+});
+
 // ============================================================================
 // 3. Bottom Panel HTML & SVG Tests
 // ============================================================================
@@ -606,6 +717,13 @@ test('renderBottomPanelHtml: strict CSP, XSS safety, quota strip, tree, detail c
   assert.match(html, /stroke-dasharray/);
   assert.match(html, /Compaction/);
   assert.match(html, /14/);
+
+  // 6. renderBottomPanelBodyHtml and DOM root wrapper
+  const bodyHtml = renderBottomPanelBodyHtml(state);
+  assert.ok(!bodyHtml.includes('<!DOCTYPE html>'));
+  assert.ok(html.includes(`<div id="panel-root">\n    ${bodyHtml}\n  </div>`));
+  assert.match(html, /root\.innerHTML\s*=\s*message\.bodyHtml/);
+  assert.match(html, /document\.getElementById\('panel-root'\)/);
 });
 
 // ============================================================================
@@ -675,6 +793,16 @@ test('BottomPanelController: gates setHtml and postMessage on view.visible, rend
   // Subsequent update while visible posts message
   ctrl.update(state);
   assert.equal(postedMessages.length, 1, 'Message posted on subsequent update');
+  assert.equal(postedMessages[0].type, 'updateState');
+  assert.equal(typeof postedMessages[0].bodyHtml, 'string');
+  assert.ok(postedMessages[0].bodyHtml.includes('Scope: Current Workspace'));
+
+  // Subsequent update with changed state reflects updated bodyHtml
+  const stateAll = createState({ scope: 'all' });
+  ctrl.update(stateAll);
+  assert.equal(postedMessages.length, 2, 'Second message posted on subsequent update');
+  assert.equal(postedMessages[1].type, 'updateState');
+  assert.ok(postedMessages[1].bodyHtml.includes('Scope: All Workspaces'));
 
   // Inbound message dispatches to callback
   messageListener!({ type: 'selectSession', sessionId: 'target-123' });

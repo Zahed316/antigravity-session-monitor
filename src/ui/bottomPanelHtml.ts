@@ -130,7 +130,15 @@ function renderSvgChart(calls: CallUsagePoint[]): string {
   `;
 }
 
-export function renderBottomPanelHtml(state: MonitorState, nonce: string, cspSource: string): string {
+function hasDescendant(node: SessionNode, targetId: string): boolean {
+  if (node.id === targetId) return true;
+  for (const child of node.children) {
+    if (hasDescendant(child, targetId)) return true;
+  }
+  return false;
+}
+
+export function renderBottomPanelBodyHtml(state: MonitorState): string {
   // Resolve selected session
   let selected = state.selectedSession;
   if (!selected && state.selectedSessionId) {
@@ -145,7 +153,13 @@ export function renderBottomPanelHtml(state: MonitorState, nonce: string, cspSou
 
   // Filter roots according to scope
   const isCurrentScope = state.scope === 'current';
-  const roots = isCurrentScope ? state.roots.filter((r) => r.matchesWorkspace) : state.roots;
+  let roots = isCurrentScope ? state.roots.filter((r) => r.matchesWorkspace) : [...state.roots];
+  if (isCurrentScope && state.pinnedSessionId !== null && !state.pinMissing) {
+    const pinnedRoot = state.roots.find((r) => hasDescendant(r, state.pinnedSessionId!));
+    if (pinnedRoot && !roots.some((r) => r.id === pinnedRoot.id)) {
+      roots.unshift(pinnedRoot);
+    }
+  }
 
   function renderTreeNodes(nodes: SessionNode[], depth = 0): string {
     return nodes
@@ -190,9 +204,15 @@ export function renderBottomPanelHtml(state: MonitorState, nonce: string, cspSou
   }
 
   const treeHtml = renderTreeNodes(roots);
+  const unattached = isCurrentScope
+    ? state.unattachedSubagents.filter(
+        (u) => u.matchesWorkspace || u.id === state.pinnedSessionId || u.workspaceUris.length === 0,
+      )
+    : state.unattachedSubagents;
+
   const unattachedHtml =
-    state.unattachedSubagents.length > 0
-      ? `<div class="unattached-section"><div class="section-title">Unattached Subagents</div>${renderTreeNodes(state.unattachedSubagents, 1)}</div>`
+    unattached.length > 0
+      ? `<div class="unattached-section"><div class="section-title">Unattached Subagents</div>${renderTreeNodes(unattached, 1)}</div>`
       : '';
 
   // Detail card for selected session
@@ -334,6 +354,34 @@ export function renderBottomPanelHtml(state: MonitorState, nonce: string, cspSou
       </div>
     `
     : '';
+
+  return `
+  <div class="top-controls">
+    <div class="scope-toggle">
+      <button class="btn-sm" data-action="toggleScope">
+        ${isCurrentScope ? 'Scope: Current Workspace' : 'Scope: All Workspaces'}
+      </button>
+    </div>
+  </div>
+
+  ${pinMissingBanner}
+  ${quotaStripHtml}
+
+  <div class="main-layout">
+    <div class="tree-pane">
+      <div class="tree-header">Sessions (${roots.length})</div>
+      ${treeHtml}
+      ${unattachedHtml}
+    </div>
+    <div class="detail-pane">
+      ${detailHtml}
+    </div>
+  </div>
+`;
+}
+
+export function renderBottomPanelHtml(state: MonitorState, nonce: string, cspSource: string): string {
+  const bodyHtml = renderBottomPanelBodyHtml(state);
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -579,26 +627,8 @@ export function renderBottomPanelHtml(state: MonitorState, nonce: string, cspSou
   </style>
 </head>
 <body>
-  <div class="top-controls">
-    <div class="scope-toggle">
-      <button class="btn-sm" data-action="toggleScope">
-        ${isCurrentScope ? 'Scope: Current Workspace' : 'Scope: All Workspaces'}
-      </button>
-    </div>
-  </div>
-
-  ${pinMissingBanner}
-  ${quotaStripHtml}
-
-  <div class="main-layout">
-    <div class="tree-pane">
-      <div class="tree-header">Sessions (${roots.length})</div>
-      ${treeHtml}
-      ${unattachedHtml}
-    </div>
-    <div class="detail-pane">
-      ${detailHtml}
-    </div>
+  <div id="panel-root">
+    ${bodyHtml}
   </div>
 
   <script nonce="${nonce}">
@@ -626,7 +656,16 @@ export function renderBottomPanelHtml(state: MonitorState, nonce: string, cspSou
     window.addEventListener('message', (event) => {
       const message = event.data;
       if (message && message.type === 'updateState') {
-        // State update notification
+        const root = document.getElementById('panel-root');
+        if (root && typeof message.bodyHtml === 'string') {
+          const treeEl = root.querySelector('.tree-list') || root.querySelector('.tree-pane');
+          const prevScroll = treeEl ? treeEl.scrollTop : 0;
+          root.innerHTML = message.bodyHtml;
+          const newTreeEl = root.querySelector('.tree-list') || root.querySelector('.tree-pane');
+          if (newTreeEl) {
+            newTreeEl.scrollTop = prevScroll;
+          }
+        }
       }
     });
   </script>

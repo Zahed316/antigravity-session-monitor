@@ -201,7 +201,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       if (!monitorService) {
         return;
       }
-      await showSessionQuickPick(vscode as any, monitorService.getState(), {
+      await showSessionQuickPick(
+        {
+          window: vscode.window,
+          ThemeIcon: vscode.ThemeIcon,
+        },
+        monitorService.getState(),
+        {
         onInspect: (sessionId) => {
           monitorService?.selectForPanel(sessionId);
           void vscode.commands.executeCommand('antigravityMonitor.panel.focus');

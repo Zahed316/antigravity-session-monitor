@@ -122,6 +122,7 @@ export class MonitorService {
   private state: MonitorState;
   private isWindowFocused = true;
   private disposed = false;
+  private started = false;
 
   private pollingTimer: any = null;
   private watchDebounceTimer: any = null;
@@ -170,6 +171,7 @@ export class MonitorService {
     if (this.disposed) {
       return;
     }
+    this.started = true;
     this.initWatchers();
     this.resetPollingTimer();
     await this.refreshNow();
@@ -207,6 +209,9 @@ export class MonitorService {
   public selectForPanel(id: string | null): void {
     this.selectedSessionId = id;
     this.updateSelectionState();
+    if (id !== null && this.started) {
+      void this.refreshNow();
+    }
   }
 
   public async pinSession(id: string): Promise<void> {
@@ -409,10 +414,11 @@ export class MonitorService {
           targetIds.add(node.id);
           for (const child of node.children) {
             const childRunning =
-              child.rolledUp.isRunning ||
-              child.own.isRunning ||
-              child.status === 'CASCADE_RUN_STATUS_RUNNING' ||
-              child.notFullyIdle;
+              !child.killed &&
+              (child.rolledUp.isRunning ||
+                child.own.isRunning ||
+                child.status === 'CASCADE_RUN_STATUS_RUNNING' ||
+                child.notFullyIdle);
             if (childRunning) {
               addWithRunningDescendants(child);
             }
@@ -434,6 +440,7 @@ export class MonitorService {
         for (const node of initialTree.byId.values()) {
           const isRunningWorkspace =
             node.matchesWorkspace &&
+            !node.killed &&
             (node.rolledUp.isRunning ||
               node.own.isRunning ||
               node.status === 'CASCADE_RUN_STATUS_RUNNING' ||
@@ -576,6 +583,7 @@ export class MonitorService {
       return;
     }
     this.disposed = true;
+    this.started = false;
 
     if (this.pollingTimer !== null) {
       this.timerFactory.clearInterval(this.pollingTimer);

@@ -22,7 +22,7 @@
   "scripts": {
     "check": "tsc --noEmit",
     "build": "node esbuild.config.mjs",
-    "test": "node --test test/*.test.ts",
+    "test": "node --no-warnings=MODULE_TYPELESS_PACKAGE_JSON --test test/*.test.ts",
     "package": "vsce package --allow-missing-repository"
   },
   "contributes": {
