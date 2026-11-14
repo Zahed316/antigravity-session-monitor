@@ -1,7 +1,8 @@
 {
   "name": "antigravity-session-monitor",
-  "displayName": "Antigravity Session Monitor",
-  "description": "Read-only monitor for Antigravity session context windows, subagent rollup telemetry, and 5h/weekly quota pools.",
+  "displayName": "GravityWatch for Antigravity",
+  "description": "GravityWatch — read-only live status bar and bottom panel for Antigravity session context windows, subagent token rollups, and 5h/weekly quota pools.",
+  "icon": "logo.png",
   "publisher": "Zahed-r",
   "version": "0.1.0",
   "license": "MIT",
@@ -12,6 +13,42 @@
     "Visualization",
     "Other"
   ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Zahed316/antigravity-session-monitor.git"
+  },
+  "keywords": [
+    "antigravity",
+    "gravitywatch",
+    "quota",
+    "context window",
+    "tokens",
+    "subagent",
+    "telemetry",
+    "gemini"
+  ],
+  "galleryBanner": {
+    "color": "#0A0E20",
+    "theme": "dark"
+  },
+  "badges": [
+    {
+      "url": "https://img.shields.io/visual-studio-marketplace/v/Zahed-r.antigravity-session-monitor",
+      "href": "https://marketplace.visualstudio.com/items?itemName=Zahed-r.antigravity-session-monitor",
+      "description": "Marketplace version"
+    },
+    {
+      "url": "https://img.shields.io/visual-studio-marketplace/i/Zahed-r.antigravity-session-monitor",
+      "href": "https://marketplace.visualstudio.com/items?itemName=Zahed-r.antigravity-session-monitor",
+      "description": "Install count"
+    },
+    {
+      "url": "https://img.shields.io/visual-studio-marketplace/l/Zahed-r.antigravity-session-monitor",
+      "href": "https://github.com/Zahed316/antigravity-session-monitor/blob/main/LICENSE",
+      "description": "License"
+    }
+  ],
+  "qna": "marketplace",
   "extensionKind": [
     "workspace"
   ],
