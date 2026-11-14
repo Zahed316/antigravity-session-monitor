@@ -1,0 +1,605 @@
+import http from 'node:http';
+import https from 'node:https';
+import {
+  DEFAULT_CONTEXT_LIMIT,
+  type CallUsagePoint,
+  type PoolKey,
+  type QuotaPool,
+  type QuotaSnapshot,
+  type QuotaWindow,
+  type RpcGeneratorCall,
+  type RpcTrajectorySummary,
+  type TokenBreakdownGroup,
+} from '../types.ts';
+import type { HubEndpoint } from './hubDiscovery.ts';
+
+const DEFAULT_TIMEOUT_MS = 4000;
+
+function isLoopbackOrWsl(host: string): boolean {
+  return (
+    host === '127.0.0.1' ||
+    host === 'localhost' ||
+    host === '::1' ||
+    host.startsWith('127.') ||
+    host.startsWith('172.') ||
+    host.startsWith('192.168.') ||
+    host.startsWith('10.')
+  );
+}
+
+function buildEmptyPool(key: PoolKey, displayName: string): QuotaPool {
+  return {
+    key,
+    displayName,
+    fiveHour: null,
+    weekly: null,
+  };
+}
+
+function buildOfflineQuota(nowMs: number, error?: string): QuotaSnapshot {
+  return {
+    status: 'offline',
+    source: 'none',
+    pools: {
+      gemini: buildEmptyPool('gemini', 'Gemini'),
+      nonGoogle: buildEmptyPool('nonGoogle', 'Non-Google'),
+    },
+    fetchedAt: nowMs,
+    error,
+  };
+}
+
+interface ParsedQuotaItem {
+  poolKey: PoolKey;
+  windowKey: '5h' | 'weekly';
+  bucketId?: string;
+  remainingFraction: number;
+  remainingPct: number;
+  resetTime: string | null;
+  isReady: boolean;
+  isExhausted: boolean;
+}
+
+function evaluateQuotaValues(
+  rawFraction: unknown,
+  rawResetTime: unknown,
+  nowMs: number,
+): { fraction: number; remainingPct: number; resetTime: string | null; isReady: boolean; isExhausted: boolean } | null {
+  const hasResetTime = typeof rawResetTime === 'string' && rawResetTime.trim() !== '';
+  const resetTimeStr = hasResetTime ? (rawResetTime as string).trim() : null;
+  const hasRemaining = typeof rawFraction === 'number' && Number.isFinite(rawFraction);
+
+  // Review Focus #4: quotaInfo: {} (no resetTime and no remainingFraction) -> ignore as unlimited!
+  if (!hasResetTime && !hasRemaining) {
+    return null;
+  }
+
+  // Review Focus #4: resetTime present + remainingFraction omitted -> 0% exhausted
+  let fraction = hasRemaining ? Number(rawFraction) : 0;
+  fraction = Math.max(0, Math.min(1, fraction));
+
+  let isReady = fraction > 0;
+  let isExhausted = fraction === 0;
+
+  // Review Focus #4: resetTime <= nowMs -> clamp to 100% (Ready)
+  if (resetTimeStr !== null) {
+    const resetMs = Date.parse(resetTimeStr);
+    if (!Number.isNaN(resetMs) && resetMs <= nowMs) {
+      fraction = 1.0;
+      isReady = true;
+      isExhausted = false;
+    }
+  }
+
+  const remainingPct = Math.round(fraction * 100);
+  if (remainingPct === 0) {
+    isReady = false;
+    isExhausted = true;
+  }
+
+  return {
+    fraction,
+    remainingPct,
+    resetTime: resetTimeStr,
+    isReady,
+    isExhausted,
+  };
+}
+
+function mergeQuotaItem(pool: QuotaPool, item: ParsedQuotaItem): void {
+  const targetProp = item.windowKey === 'weekly' ? 'weekly' : 'fiveHour';
+  const existing = pool[targetProp];
+
+  const candidateWindow: QuotaWindow = {
+    window: item.windowKey,
+    bucketId: item.bucketId,
+    remainingPct: item.remainingPct,
+    remainingFraction: item.remainingFraction,
+    resetTime: item.resetTime,
+    isReady: item.isReady,
+    isExhausted: item.isExhausted,
+  };
+
+  if (!existing) {
+    pool[targetProp] = candidateWindow;
+    return;
+  }
+
+  // Take bottleneck (minimum remaining fraction)
+  if (candidateWindow.remainingFraction < existing.remainingFraction) {
+    pool[targetProp] = candidateWindow;
+  } else if (candidateWindow.remainingFraction === existing.remainingFraction) {
+    if (
+      candidateWindow.resetTime &&
+      (!existing.resetTime || candidateWindow.resetTime < existing.resetTime)
+    ) {
+      pool[targetProp] = candidateWindow;
+    }
+  }
+}
+
+/**
+ * Normalizes Connect-RPC `RetrieveUserQuotaSummary` response into a QuotaSnapshot.
+ */
+export function normalizeQuotaFromSummary(raw: unknown, nowMs = Date.now()): QuotaSnapshot {
+  const pools: Record<PoolKey, QuotaPool> = {
+    gemini: buildEmptyPool('gemini', 'Gemini'),
+    nonGoogle: buildEmptyPool('nonGoogle', 'Non-Google'),
+  };
+
+  if (!raw || typeof raw !== 'object') {
+    return { status: 'online', source: 'summary', pools, fetchedAt: nowMs };
+  }
+
+  const root = raw as Record<string, unknown>;
+  const groups = Array.isArray(root.groups)
+    ? root.groups
+    : Array.isArray((root.userQuotaSummary as Record<string, unknown>)?.groups)
+      ? ((root.userQuotaSummary as Record<string, unknown>).groups as unknown[])
+      : [];
+
+  for (const grp of groups) {
+    if (!grp || typeof grp !== 'object') {
+      continue;
+    }
+    const g = grp as Record<string, unknown>;
+    const groupName = String(g.displayName ?? g.name ?? '');
+    const isGeminiGroup = /gemini/i.test(groupName);
+
+    const buckets = Array.isArray(g.buckets) ? g.buckets : [];
+    for (const b of buckets) {
+      if (!b || typeof b !== 'object') {
+        continue;
+      }
+      const bucket = b as Record<string, unknown>;
+      const bucketId = typeof bucket.bucketId === 'string' ? bucket.bucketId : undefined;
+      const windowStr = String(bucket.window ?? '');
+
+      const isWeekly = /week/i.test(windowStr) || /weekly/i.test(bucketId ?? '');
+      const windowKey: '5h' | 'weekly' = isWeekly ? 'weekly' : '5h';
+
+      const poolKey: PoolKey = isGeminiGroup || /gemini/i.test(bucketId ?? '') ? 'gemini' : 'nonGoogle';
+
+      const evaluated = evaluateQuotaValues(bucket.remainingFraction, bucket.resetTime, nowMs);
+      if (!evaluated) {
+        continue; // Unlimited bucket ignored
+      }
+
+      mergeQuotaItem(pools[poolKey], {
+        poolKey,
+        windowKey,
+        bucketId,
+        remainingFraction: evaluated.fraction,
+        remainingPct: evaluated.remainingPct,
+        resetTime: evaluated.resetTime,
+        isReady: evaluated.isReady,
+        isExhausted: evaluated.isExhausted,
+      });
+    }
+  }
+
+  return {
+    status: 'online',
+    source: 'summary',
+    pools,
+    fetchedAt: nowMs,
+  };
+}
+
+/**
+ * Normalizes Connect-RPC `GetUserStatus` fallback response into a QuotaSnapshot.
+ */
+export function normalizeQuotaFromUserStatus(raw: unknown, nowMs = Date.now()): QuotaSnapshot {
+  const pools: Record<PoolKey, QuotaPool> = {
+    gemini: buildEmptyPool('gemini', 'Gemini'),
+    nonGoogle: buildEmptyPool('nonGoogle', 'Non-Google'),
+  };
+
+  if (!raw || typeof raw !== 'object') {
+    return { status: 'online', source: 'userStatus', pools, fetchedAt: nowMs };
+  }
+
+  const root = raw as Record<string, unknown>;
+  const status = (root.userStatus ?? root) as Record<string, unknown>;
+  const cascadeData = (status.cascadeModelConfigData ?? status) as Record<string, unknown>;
+  const configs = Array.isArray(cascadeData.clientModelConfigs)
+    ? cascadeData.clientModelConfigs
+    : Array.isArray(root.clientModelConfigs)
+      ? root.clientModelConfigs
+      : [];
+
+  for (const c of configs) {
+    if (!c || typeof c !== 'object') {
+      continue;
+    }
+    const cfg = c as Record<string, unknown>;
+    const modelOrAlias = (cfg.modelOrAlias ?? {}) as Record<string, unknown>;
+    const name = `${cfg.label ?? ''} ${modelOrAlias.model ?? ''}`.trim();
+
+    const poolKey: PoolKey = /gemini/i.test(name) ? 'gemini' : 'nonGoogle';
+
+    const quotaInfo = (cfg.quotaInfo ?? {}) as Record<string, unknown>;
+    const isWeekly =
+      /week/i.test(String(quotaInfo.window ?? '')) || /weekly/i.test(name);
+    const windowKey: '5h' | 'weekly' = isWeekly ? 'weekly' : '5h';
+
+    const evaluated = evaluateQuotaValues(quotaInfo.remainingFraction, quotaInfo.resetTime, nowMs);
+    if (!evaluated) {
+      continue; // Unlimited model (e.g. Gemini 4 Carbon {}) ignored
+    }
+
+    mergeQuotaItem(pools[poolKey], {
+      poolKey,
+      windowKey,
+      remainingFraction: evaluated.fraction,
+      remainingPct: evaluated.remainingPct,
+      resetTime: evaluated.resetTime,
+      isReady: evaluated.isReady,
+      isExhausted: evaluated.isExhausted,
+    });
+  }
+
+  return {
+    status: 'online',
+    source: 'userStatus',
+    pools,
+    fetchedAt: nowMs,
+  };
+}
+
+/**
+ * Connect-RPC client for interacting with `agy --hub` language server endpoints.
+ */
+export class HubClient {
+  private readonly timeoutMs: number;
+  private readonly protocolCache = new Map<string, 'http:' | 'https:'>();
+  private readonly generatorMetadataCache = new Map<string, CallUsagePoint[]>();
+
+  constructor(options: { timeoutMs?: number } = {}) {
+    this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  }
+
+  getCachedProtocol(endpoint: HubEndpoint): 'http:' | 'https:' | undefined {
+    return this.protocolCache.get(`${endpoint.host}:${endpoint.port}`);
+  }
+
+  clearCaches(): void {
+    this.protocolCache.clear();
+    this.generatorMetadataCache.clear();
+  }
+
+  private executeRequest(
+    protocol: 'http:' | 'https:',
+    endpoint: HubEndpoint,
+    methodPath: string,
+    body: string,
+  ): Promise<{ statusCode: number; data: unknown }> {
+    return new Promise((resolve, reject) => {
+      const isHttps = protocol === 'https:';
+      const clientModule = isHttps ? https : http;
+
+      const req = clientModule.request(
+        {
+          protocol,
+          hostname: endpoint.host,
+          port: endpoint.port,
+          path: `/exa.language_server_pb.LanguageServerService/${methodPath}`,
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Connect-Protocol-Version': '1',
+            'x-codeium-csrf-token': endpoint.csrfToken,
+            'Content-Length': Buffer.byteLength(body),
+          },
+          timeout: this.timeoutMs,
+          agent: isHttps
+            ? new https.Agent({ rejectUnauthorized: !isLoopbackOrWsl(endpoint.host) })
+            : undefined,
+        },
+        (res) => {
+          const chunks: Buffer[] = [];
+          res.on('data', (chunk) => {
+            chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+          });
+          res.on('end', () => {
+            const text = Buffer.concat(chunks).toString('utf8');
+            let parsed: unknown = null;
+            if (text.trim().length > 0) {
+              try {
+                parsed = JSON.parse(text);
+              } catch {
+                parsed = text;
+              }
+            }
+            resolve({ statusCode: res.statusCode ?? 0, data: parsed });
+          });
+        },
+      );
+
+      req.on('timeout', () => {
+        req.destroy(new Error(`Connect-RPC request timed out after ${this.timeoutMs}ms`));
+      });
+
+      req.on('error', (err) => {
+        reject(err);
+      });
+
+      req.write(body);
+      req.end();
+    });
+  }
+
+  private async postRpc(
+    endpoint: HubEndpoint,
+    methodPath: string,
+    payload: unknown,
+  ): Promise<{ statusCode: number; data: any; protocol: 'http:' | 'https:' } | null> {
+    const body = JSON.stringify(payload);
+    const hostKey = `${endpoint.host}:${endpoint.port}`;
+    const cached = this.protocolCache.get(hostKey);
+
+    const protocolsToTry: Array<'http:' | 'https:'> = cached
+      ? [cached, cached === 'http:' ? 'https:' : 'http:']
+      : ['http:', 'https:'];
+
+    let lastError: unknown = null;
+    for (const proto of protocolsToTry) {
+      try {
+        const res = await this.executeRequest(proto, endpoint, methodPath, body);
+        this.protocolCache.set(hostKey, proto);
+        return { ...res, protocol: proto };
+      } catch (err: any) {
+        lastError = err;
+        const code = err?.code ?? '';
+        // If port is closed / refused or host unreachable, stop immediately
+        if (code === 'ECONNREFUSED' || code === 'EHOSTUNREACH' || code === 'ENETUNREACH') {
+          return null;
+        }
+        // If SSL or protocol error occurred on HTTP, next iteration will try HTTPS
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * Fetches quota summary from RetrieveUserQuotaSummary, falling back to GetUserStatus.
+   * Returns an offline QuotaSnapshot without throwing on ECONNREFUSED or network failure.
+   */
+  async fetchQuota(endpoint: HubEndpoint, nowMs = Date.now()): Promise<QuotaSnapshot> {
+    try {
+      const summaryRes = await this.postRpc(endpoint, 'RetrieveUserQuotaSummary', {
+        metadata: { ideName: 'antigravity', extensionName: 'antigravity', locale: 'en' },
+      });
+
+      if (summaryRes && summaryRes.statusCode === 200 && summaryRes.data) {
+        const snapshot = normalizeQuotaFromSummary(summaryRes.data, nowMs);
+        const hasAnyWindow =
+          snapshot.pools.gemini.fiveHour !== null ||
+          snapshot.pools.gemini.weekly !== null ||
+          snapshot.pools.nonGoogle.fiveHour !== null ||
+          snapshot.pools.nonGoogle.weekly !== null;
+        if (hasAnyWindow) {
+          return snapshot;
+        }
+      }
+
+      // Fallback to GetUserStatus
+      const statusRes = await this.postRpc(endpoint, 'GetUserStatus', {
+        metadata: { ideName: 'antigravity', extensionName: 'antigravity', locale: 'en' },
+      });
+
+      if (statusRes && statusRes.statusCode === 200 && statusRes.data) {
+        return normalizeQuotaFromUserStatus(statusRes.data, nowMs);
+      }
+
+      return buildOfflineQuota(nowMs);
+    } catch {
+      return buildOfflineQuota(nowMs);
+    }
+  }
+
+  /**
+   * Fetches trajectories from GetAllCascadeTrajectories.
+   * Supports a single HubEndpoint or an array of candidates (falling through if candidate #1 returns empty {}).
+   * Returns null if offline, an empty Map if online with zero trajectories, or populated Map.
+   */
+  async fetchTrajectories(
+    endpoint: HubEndpoint | HubEndpoint[],
+  ): Promise<Map<string, RpcTrajectorySummary> | null> {
+    const candidates = Array.isArray(endpoint) ? endpoint : [endpoint];
+    if (candidates.length === 0) {
+      return null;
+    }
+
+    let emptyMapResult: Map<string, RpcTrajectorySummary> | null = null;
+
+    for (const cand of candidates) {
+      try {
+        const res = await this.postRpc(cand, 'GetAllCascadeTrajectories', {
+          metadata: { ideName: 'antigravity', extensionName: 'antigravity', locale: 'en' },
+        });
+
+        if (res && res.statusCode === 200) {
+          const map = new Map<string, RpcTrajectorySummary>();
+          const rawSummaries = res.data?.trajectorySummaries;
+          if (rawSummaries && typeof rawSummaries === 'object') {
+            for (const [id, val] of Object.entries(rawSummaries)) {
+              if (val && typeof val === 'object') {
+                const summary = val as RpcTrajectorySummary;
+                if (!summary.cascadeId) {
+                  summary.cascadeId = id;
+                }
+                map.set(id, summary);
+              }
+            }
+          }
+
+          if (map.size > 0) {
+            return map;
+          }
+          if (emptyMapResult === null) {
+            emptyMapResult = map;
+          }
+        }
+      } catch {
+        // Safe fallthrough
+      }
+    }
+
+    return emptyMapResult;
+  }
+
+  /**
+   * Fetches and maps generator metadata for a given cascadeId.
+   * Caches responses by (cascadeId, stepCount) to make zero duplicate HTTP requests when unchanged.
+   */
+  async fetchGeneratorMetadata(
+    endpoint: HubEndpoint,
+    cascadeId: string,
+    stepCount: number,
+  ): Promise<CallUsagePoint[] | null> {
+    if (!cascadeId || stepCount <= 0) {
+      return [];
+    }
+
+    const cacheKey = `${cascadeId}:${stepCount}`;
+    const cached = this.generatorMetadataCache.get(cacheKey);
+    if (cached) {
+      return cached;
+    }
+
+    try {
+      const res = await this.postRpc(endpoint, 'GetCascadeTrajectoryGeneratorMetadata', {
+        metadata: { ideName: 'antigravity', extensionName: 'antigravity', locale: 'en' },
+        cascadeId,
+      });
+
+      if (!res || res.statusCode !== 200 || !res.data) {
+        return null;
+      }
+
+      const rawList = res.data.generatorMetadata;
+      if (!Array.isArray(rawList)) {
+        return [];
+      }
+
+      const points: CallUsagePoint[] = [];
+      for (let i = 0; i < rawList.length; i++) {
+        const call = rawList[i] as RpcGeneratorCall;
+        const chatModel = call?.chatModel ?? {};
+        const usage = chatModel?.usage ?? {};
+        const chatStart = chatModel?.chatStartMetadata ?? {};
+        const ctxMeta = chatStart?.contextWindowMetadata ?? {};
+
+        const fresh = Number(usage.inputTokens ?? 0);
+        const cacheRead = Number(usage.cacheReadTokens ?? 0);
+        const thinking = Number(usage.thinkingOutputTokens ?? 0);
+        const response = Number(usage.responseOutputTokens ?? 0);
+        const output =
+          Number(usage.outputTokens ?? 0) > 0 ? Number(usage.outputTokens) : thinking + response;
+
+        const estimatedTokensUsed = Number(ctxMeta.estimatedTokensUsed ?? 0);
+        const effectiveContext = Math.max(estimatedTokensUsed, fresh + cacheRead);
+
+        const maxContextTokens = Number(ctxMeta.maxContextTokens ?? 0);
+        const contextLimit = maxContextTokens > 0 ? maxContextTokens : DEFAULT_CONTEXT_LIMIT;
+
+        const rawStart = chatStart.startStepIndex;
+        const numStart = rawStart !== undefined && rawStart !== null ? Number(rawStart) : null;
+        const startStepIndex =
+          numStart !== null && Number.isInteger(numStart) && numStart >= 0 && numStart < 1_000_000_000
+            ? numStart
+            : null;
+
+        let tokenBreakdownGroups: TokenBreakdownGroup[] | undefined;
+        if (Array.isArray(ctxMeta.tokenBreakdown)) {
+          tokenBreakdownGroups = ctxMeta.tokenBreakdown.map((item) => {
+            const name = String(item.name ?? item.label ?? item.category ?? '');
+            const tokens = Number(item.tokens ?? item.tokenCount ?? 0);
+            const pct = effectiveContext > 0 ? Math.round((tokens / effectiveContext) * 100) : 0;
+            return { name, tokens, pct };
+          });
+        } else if (ctxMeta.tokenBreakdown && typeof ctxMeta.tokenBreakdown === 'object') {
+          tokenBreakdownGroups = Object.entries(ctxMeta.tokenBreakdown).map(([name, val]) => {
+            const tokens = Number(val ?? 0);
+            const pct = effectiveContext > 0 ? Math.round((tokens / effectiveContext) * 100) : 0;
+            return { name, tokens, pct };
+          });
+        }
+
+        points.push({
+          idx: i,
+          stepIndices: Array.isArray(call.stepIndices) ? call.stepIndices.map(Number) : [],
+          model: chatModel.model ?? usage.model ?? 'unknown',
+          fresh,
+          cacheRead,
+          output,
+          thinking,
+          response,
+          effectiveContext,
+          contextLimit,
+          startStepIndex,
+          isCompacted: false,
+          compactedFromStep: null,
+          tokenBreakdownGroups,
+          apiProvider: usage.apiProvider ?? undefined,
+          source: 'rpc',
+        });
+      }
+
+      // Exact compaction detection pass
+      for (let i = 1; i < points.length; i++) {
+        const prev = points[i - 1];
+        const curr = points[i];
+
+        if (
+          curr.startStepIndex !== null &&
+          curr.startStepIndex > 0 &&
+          curr.startStepIndex !== prev.startStepIndex
+        ) {
+          curr.isCompacted = true;
+          curr.compactedFromStep = curr.startStepIndex;
+        } else if (
+          prev.startStepIndex === null &&
+          curr.startStepIndex === null &&
+          prev.effectiveContext > 0 &&
+          curr.effectiveContext < prev.effectiveContext - 10_000
+        ) {
+          const next1 = points[i + 1]?.effectiveContext ?? 0;
+          const next2 = points[i + 2]?.effectiveContext ?? 0;
+          const threshold = prev.effectiveContext * 0.85;
+          if (next1 < threshold && next2 < threshold) {
+            curr.isCompacted = true;
+            curr.compactedFromStep = null;
+          }
+        }
+      }
+
+      this.generatorMetadataCache.set(cacheKey, points);
+      return points;
+    } catch {
+      return null;
+    }
+  }
+}
