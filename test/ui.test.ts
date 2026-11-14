@@ -135,6 +135,19 @@ function createQuota(partial: Partial<QuotaSnapshot> = {}): QuotaSnapshot {
           isExhausted: false,
         },
       },
+      argon: {
+        key: 'argon',
+        displayName: 'Gemini 4 Argon',
+        fiveHour: null,
+        weekly: {
+          window: 'weekly',
+          remainingPct: 74,
+          remainingFraction: 0.74,
+          resetTime: new Date(Date.now() + 500_000_000).toISOString(),
+          isReady: false,
+          isExhausted: false,
+        },
+      },
       nonGoogle: {
         key: 'nonGoogle',
         displayName: 'Non-Google Models',
@@ -182,6 +195,8 @@ function createState(partial: Partial<MonitorState> = {}): MonitorState {
     isRefreshing: partial.isRefreshing ?? false,
     lastError: partial.lastError ?? null,
     warnings: partial.warnings ?? [],
+    modelCatalog: partial.modelCatalog,
+    modelEstimates: partial.modelEstimates,
   };
 }
 
@@ -217,24 +232,26 @@ test('buildStatusBarViewModel: active workspace session formatting, icons, and t
 
   const vm = buildStatusBarViewModel(state, config);
 
-  // Status bar context text contains spin icon, pin icon, truncated title, used/max (pct%), and cache volume pct
-  assert.match(vm.contextText, /\$\(pin\)/);
-  assert.match(vm.contextText, /\$\(sync~spin\)/);
-  assert.match(vm.contextText, /120k\/256k \(47%\)/);
-  assert.match(vm.contextText, /C:65%/);
-  assert.equal(vm.contextColor, 'normal');
+  // Consolidated single status bar item contains pin, spin icon, context %, and 3 quota pools
+  assert.match(vm.text, /\$\(pin\)/);
+  assert.match(vm.text, /\$\(sync~spin\)/);
+  assert.match(vm.text, /47%/);
+  assert.match(vm.text, /G 85%/);
+  assert.match(vm.text, /A 74%/);
+  assert.match(vm.text, /C 40%/);
+  assert.equal(vm.color, 'normal');
 
   // Warning threshold test (>= 75%)
   active.contextUsed = 195_000;
   active.contextPct = 76;
   const vmWarn = buildStatusBarViewModel(state, config);
-  assert.equal(vmWarn.contextColor, 'warning');
+  assert.equal(vmWarn.color, 'warning');
 
   // Error/critical threshold test (>= 90%)
   active.contextUsed = 240_000;
   active.contextPct = 94;
   const vmCrit = buildStatusBarViewModel(state, config);
-  assert.equal(vmCrit.contextColor, 'error');
+  assert.equal(vmCrit.color, 'error');
 });
 
 test('buildStatusBarViewModel: Review Focus #5 missing pin shows $(pin) Missing — Click to unpin', () => {
@@ -244,54 +261,57 @@ test('buildStatusBarViewModel: Review Focus #5 missing pin shows $(pin) Missing 
     pinMissing: true,
   });
   const vm = buildStatusBarViewModel(state, DEFAULT_CONFIG);
-  assert.equal(vm.contextText, '$(pin) Missing — Click to unpin');
-  assert.equal(vm.contextColor, 'warning');
+  assert.equal(vm.text, '$(pin) Missing — Click to unpin');
+  assert.equal(vm.color, 'warning');
 });
 
-test('buildStatusBarViewModel: empty workspace returns $(pulse) No workspace session', () => {
+test('buildStatusBarViewModel: empty workspace returns $(pulse) No session + quota summary', () => {
   const state = createState({
     activeSession: null,
     pinnedSessionId: null,
     pinMissing: false,
   });
   const vm = buildStatusBarViewModel(state, DEFAULT_CONFIG);
-  assert.equal(vm.contextText, '$(pulse) No workspace session');
-  assert.equal(vm.contextColor, 'normal');
+  assert.match(vm.text, /^\$\(pulse\) No session · /);
+  assert.match(vm.text, /G 85%/);
+  assert.equal(vm.color, 'normal');
 });
 
 test('buildStatusBarViewModel: quota text and warning/error thresholds', () => {
   const state = createState();
 
-  // Online with normal pools (Gemini 85%, Non-Google 40%)
+  // Online with normal pools (Gemini 85%, Argon 74%, Non-Google 40%)
   const vmOnline = buildStatusBarViewModel(state, DEFAULT_CONFIG);
-  assert.match(vmOnline.quotaText, /G 85% · C 40%/);
-  assert.equal(vmOnline.quotaColor, 'normal');
+  assert.match(vmOnline.text, /G 85% · A 74% · C 40%/);
+  assert.equal(vmOnline.color, 'normal');
 
   // Quota offline
   state.quota.status = 'offline';
   const vmOffline = buildStatusBarViewModel(state, DEFAULT_CONFIG);
-  assert.equal(vmOffline.quotaText, 'Quota offline');
-  assert.equal(vmOffline.quotaColor, 'normal');
+  assert.match(vmOffline.text, /Quota offline/);
+  assert.equal(vmOffline.color, 'normal');
 
   // Quota warning when min pool <= 20%
   state.quota.status = 'online';
   state.quota.pools.gemini.fiveHour!.remainingPct = 18;
   const vmWarn = buildStatusBarViewModel(state, DEFAULT_CONFIG);
-  assert.equal(vmWarn.quotaColor, 'warning');
+  assert.equal(vmWarn.color, 'warning');
 
   // Quota error when min pool <= 0%
   state.quota.pools.gemini.fiveHour!.remainingPct = 0;
   state.quota.pools.gemini.fiveHour!.isExhausted = true;
   const vmCrit = buildStatusBarViewModel(state, DEFAULT_CONFIG);
-  assert.equal(vmCrit.quotaColor, 'error');
+  assert.equal(vmCrit.color, 'error');
 });
 
-test('buildStatusBarViewModel: tooltip Markdown includes Parent + N subagents breakdown and quota countdowns', () => {
+test('buildStatusBarViewModel: minimal tooltip includes model, subagent model summary, and quota pools without escaping backticks', () => {
   const child = createNode({
     id: 'subagent-1',
     title: 'Research subagent <script>alert(1)</script>',
     isSubagent: true,
     parentId: 'root-1',
+    model: 'Gemini 3.8 Flash',
+    rawModel: 'MODEL_PLACEHOLDER_M400',
     agentName: 'researcher',
     subagentRole: 'Code Researcher',
     own: createMetrics({ fresh: 5_000, cacheRead: 15_000, output: 800, thinking: 500, response: 300, calls: 3 }),
@@ -299,6 +319,8 @@ test('buildStatusBarViewModel: tooltip Markdown includes Parent + N subagents br
   const parent = createNode({
     id: 'root-1',
     title: 'Parent Session & "Untrusted" <Tags>',
+    model: 'Claude Opus 4.6 (Thinking)',
+    rawModel: 'claude-opus-4-6-thinking',
     children: [child],
     subagentCount: 1,
     runningSubagentCount: 1,
@@ -308,6 +330,23 @@ test('buildStatusBarViewModel: tooltip Markdown includes Parent + N subagents br
 
   const state = createState({
     activeSession: parent,
+    modelEstimates: [
+      {
+        modelLabel: 'Claude Opus 4.6 (Thinking)',
+        poolKey: 'nonGoogle',
+        fiveHour: {
+          status: 'calibrated',
+          estimatedTotalTokens: 250_000,
+          estimatedBilledTokens: 90_000,
+          tokensPerPctTotal: 5_000,
+          tokensPerPctBilled: 1_800,
+          windowUsedTotal: 31_000,
+          windowUsedBilled: 11_000,
+          sampleCount: 3,
+        },
+        weekly: null,
+      },
+    ],
     quota: createQuota({
       pools: {
         gemini: {
@@ -322,6 +361,19 @@ test('buildStatusBarViewModel: tooltip Markdown includes Parent + N subagents br
             isExhausted: false,
           },
           weekly: null,
+        },
+        argon: {
+          key: 'argon',
+          displayName: 'Gemini 4 Argon',
+          fiveHour: null,
+          weekly: {
+            window: 'weekly',
+            remainingPct: 74,
+            remainingFraction: 0.74,
+            resetTime: new Date(Date.now() + 500_000_000).toISOString(),
+            isReady: false,
+            isExhausted: false,
+          },
         },
         nonGoogle: {
           key: 'nonGoogle',
@@ -342,19 +394,19 @@ test('buildStatusBarViewModel: tooltip Markdown includes Parent + N subagents br
 
   const vm = buildStatusBarViewModel(state, DEFAULT_CONFIG);
 
-  // Escaping untrusted strings
+  // Escaping untrusted strings & zero underscore-backslash escaping inside backticks
   assert.ok(!vm.tooltipMarkdown.includes('<Tags>'), 'Untrusted tags should be escaped');
-  assert.match(vm.tooltipMarkdown, /Parent \+ 1 subagent/);
-  assert.match(vm.tooltipMarkdown, /Fresh/);
-  assert.match(vm.tooltipMarkdown, /Cache Read/);
-  assert.match(vm.tooltipMarkdown, /Output/);
-  assert.match(vm.tooltipMarkdown, /Thinking/);
-  assert.match(vm.tooltipMarkdown, /Response/);
-  assert.match(vm.tooltipMarkdown, /compactions/i);
+  assert.ok(!vm.tooltipMarkdown.includes('\\_'), 'Must not backslash-escape underscores in model names');
+  assert.match(vm.tooltipMarkdown, /\*\*Session:\*\*/);
+  assert.match(vm.tooltipMarkdown, /\*\*Model:\*\* Claude Opus 4\.6 \(Thinking\)/);
+  assert.match(vm.tooltipMarkdown, /\*\*Subagents:\*\* 1 \(1 running\) — 1× Gemini 3\.8 Flash/);
+  assert.match(vm.tooltipMarkdown, /\*\*Est\. Left:\*\*/);
+  assert.match(vm.tooltipMarkdown, /\| Pool \| 5-Hour \| Weekly \|/);
   assert.match(vm.tooltipMarkdown, /Ready/);
+  assert.match(vm.tooltipMarkdown, /\*Click for sessions & overview\*/);
 });
 
-test('createStatusBarController wires context and quota items with ThemeColor and MarkdownString', () => {
+test('createStatusBarController wires single consolidated item with ThemeColor and MarkdownString', () => {
   let createdCount = 0;
   const items: any[] = [];
 
@@ -396,10 +448,9 @@ test('createStatusBarController wires context and quota items with ThemeColor an
     ThemeColor: MockThemeColor as any,
   };
 
-  const ctrl = createStatusBarController(mockVscode, 'cmd.clickContext', 'cmd.clickQuota');
-  assert.equal(createdCount, 2);
-  assert.equal(items[0].command, 'cmd.clickContext');
-  assert.equal(items[1].command, 'cmd.clickQuota');
+  const ctrl = createStatusBarController(mockVscode, 'cmd.click');
+  assert.equal(createdCount, 1);
+  assert.equal(items[0].command, 'cmd.click');
 
   const state = createState({
     pinMissing: true,
@@ -413,7 +464,6 @@ test('createStatusBarController wires context and quota items with ThemeColor an
 
   ctrl.dispose();
   assert.equal(items[0].disposed, true);
-  assert.equal(items[1].disposed, true);
 });
 
 // ============================================================================
@@ -460,13 +510,17 @@ test('buildQuickPickItems: includes Unpin entry, Scope toggle, and recursive ind
 
   const items = buildQuickPickItems(state);
 
-  // First item is Unpin
-  assert.equal(items[0].action, 'unpin');
-  assert.match(items[0].label, /Unpin/);
+  // First item is Open Monitor Panel
+  assert.equal(items[0].action, 'openPanel');
+  assert.match(items[0].label, /Open Monitor Panel/);
 
-  // Second item is Scope toggle
-  assert.equal(items[1].action, 'toggleScope');
-  assert.match(items[1].label, /Current Workspace/);
+  // Second item is Unpin
+  assert.equal(items[1].action, 'unpin');
+  assert.match(items[1].label, /Unpin/);
+
+  // Third item is Scope toggle
+  assert.equal(items[2].action, 'toggleScope');
+  assert.match(items[2].label, /Current Workspace/);
 
   // Find root item and child items
   const rootItem = items.find(it => it.sessionId === 'root-1');
@@ -677,11 +731,26 @@ test('renderBottomPanelHtml: strict CSP, XSS safety, quota strip, tree, detail c
     ],
   });
 
+  const childSession = createNode({
+    id: 'xss-child',
+    isSubagent: true,
+    parentId: 'xss-session',
+    title: 'Subagent Research',
+    model: 'Gemini 3.8 Flash',
+    rawModel: 'MODEL_PLACEHOLDER_M400',
+    subagentRole: 'Researcher',
+    own: createMetrics({ calls: 2, fresh: 2_000, cacheRead: 8_000, output: 300 }),
+  });
+
   const session = createNode({
     id: 'xss-session',
     title: '<script>alert("xss")</script> & "Dangerous"',
+    model: 'Claude Opus 4.6 (Thinking)',
+    rawModel: 'claude-opus-4-6-thinking',
     agentName: '<img src=x onerror=alert(1)>',
     subagentRole: '<b>Hacker</b>',
+    children: [childSession],
+    subagentCount: 1,
     calls: [createCall({ idx: 0, effectiveContext: 30_000 }), compactedCall],
   });
 
@@ -690,9 +759,29 @@ test('renderBottomPanelHtml: strict CSP, XSS safety, quota strip, tree, detail c
     selectedSession: session,
     selectedSessionId: session.id,
     pinMissing: true,
+    modelEstimates: [
+      {
+        modelLabel: 'Claude Opus 4.6 (Thinking)',
+        poolKey: 'nonGoogle',
+        fiveHour: {
+          status: 'calibrated',
+          estimatedTotalTokens: 200_000,
+          estimatedBilledTokens: 80_000,
+          tokensPerPctTotal: 5_000,
+          tokensPerPctBilled: 2_000,
+          windowUsedTotal: 31_000,
+          windowUsedBilled: 11_000,
+          sampleCount: 2,
+        },
+        weekly: null,
+      },
+    ],
   });
 
-  const html = renderBottomPanelHtml(state, nonce, cspSource);
+  const html = renderBottomPanelHtml(state, nonce, cspSource, {
+    activeTab: 'overview',
+    expandedIds: ['xss-session'],
+  });
 
   // 1. Strict CSP
   assert.match(html, /<meta http-equiv="Content-Security-Policy"/);
@@ -708,20 +797,40 @@ test('renderBottomPanelHtml: strict CSP, XSS safety, quota strip, tree, detail c
   // 3. Pin Missing banner
   assert.match(html, /Pinned session is missing/);
 
-  // 4. Quota strip
+  // 4. Quota strip (3 pools: Gemini, Argon, Non-Google)
   assert.match(html, /Gemini/);
+  assert.match(html, /Argon/);
   assert.match(html, /Non-Google/);
 
-  // 5. SVG Chart with compaction marker
-  assert.match(html, /<svg/);
-  assert.match(html, /stroke-dasharray/);
-  assert.match(html, /Compaction/);
-  assert.match(html, /14/);
+  // 5. Overview shows Model Usage Forecast + expanded subagent model pill + CSP-safe bars & ctx-meter
+  assert.match(html, /Model Usage Forecast/);
+  assert.match(html, /Claude Opus 4\.6 \(Thinking\)/);
+  assert.match(html, /Gemini 3\.8 Flash/);
+  assert.match(html, /bar-fill ok p-85/);
+  assert.match(html, /bar-fill ok p-74/);
+  assert.match(html, /bar-fill ok p-40/);
+  assert.match(html, /class="ctx-meter /);
+  assert.match(html, /class="ctx-meter-fill /);
+  assert.match(html, /class="ctx-meter-text">/);
+  assert.ok(!html.includes('style="'), 'Must not emit inline style attributes blocked by strict CSP');
 
-  // 6. renderBottomPanelBodyHtml and DOM root wrapper
+  // 6. Details tab renders SVG Chart with compaction marker & subagents table & breakdown open state
+  const detailsHtml = renderBottomPanelHtml(state, nonce, cspSource, {
+    activeTab: 'details',
+    expandedIds: ['xss-session'],
+    breakdownOpen: true,
+  });
+  assert.match(detailsHtml, /<svg/);
+  assert.match(detailsHtml, /stroke-dasharray/);
+  assert.match(detailsHtml, /Compaction/);
+  assert.match(detailsHtml, /14/);
+  assert.match(detailsHtml, /Gemini 3\.8 Flash/);
+  assert.match(detailsHtml, /<details class="breakdown-details" open>/);
+
+  // 7. renderBottomPanelBodyHtml and DOM root wrapper
   const bodyHtml = renderBottomPanelBodyHtml(state);
   assert.ok(!bodyHtml.includes('<!DOCTYPE html>'));
-  assert.ok(html.includes(`<div id="panel-root">\n    ${bodyHtml}\n  </div>`));
+  assert.ok(renderBottomPanelHtml(state, nonce, cspSource).includes(`<div id="panel-root">\n    ${bodyHtml}\n  </div>`));
   assert.match(html, /root\.innerHTML\s*=\s*message\.bodyHtml/);
   assert.match(html, /document\.getElementById\('panel-root'\)/);
 });
@@ -790,19 +899,44 @@ test('BottomPanelController: gates setHtml and postMessage on view.visible, rend
   visibilityListener!();
   assert.equal(htmlSetCount, 1, 'HTML rendered immediately on visibility transition');
 
-  // Subsequent update while visible posts message
+  // No-op skip: identical state after full render posts nothing
   ctrl.update(state);
-  assert.equal(postedMessages.length, 1, 'Message posted on subsequent update');
-  assert.equal(postedMessages[0].type, 'updateState');
-  assert.equal(typeof postedMessages[0].bodyHtml, 'string');
-  assert.ok(postedMessages[0].bodyHtml.includes('Scope: Current Workspace'));
+  assert.equal(postedMessages.length, 0, 'Identical state after full render is skipped (no-op)');
 
   // Subsequent update with changed state reflects updated bodyHtml
   const stateAll = createState({ scope: 'all' });
   ctrl.update(stateAll);
-  assert.equal(postedMessages.length, 2, 'Second message posted on subsequent update');
-  assert.equal(postedMessages[1].type, 'updateState');
-  assert.ok(postedMessages[1].bodyHtml.includes('Scope: All Workspaces'));
+  assert.equal(postedMessages.length, 1, 'Changed state posts targeted updateState');
+  assert.equal(postedMessages[0].type, 'updateState');
+  assert.ok(postedMessages[0].bodyHtml.includes('Scope: All Workspaces'));
+  assert.equal(postedMessages[0].state, undefined, 'Targeted update: unused state payload is not posted');
+
+  // Inbound switchTab updates activeTab and posts details HTML
+  messageListener!({ type: 'switchTab', tab: 'details' });
+  assert.equal(ctrl.getUiState().activeTab, 'details');
+  assert.equal(postedMessages.length, 2);
+  assert.ok(postedMessages[1].bodyHtml.includes('<svg'));
+
+  // Inbound toggleBreakdown persists breakdownOpen across subsequent updates
+  messageListener!({ type: 'toggleBreakdown', open: true });
+  assert.equal(ctrl.getUiState().breakdownOpen, true);
+  assert.equal(postedMessages.length, 3);
+  assert.ok(postedMessages[2].bodyHtml.includes('<details class="breakdown-details" open>'));
+
+  // No-op skip: re-update with same state + UI state renders identical body -> no post
+  ctrl.update(stateAll);
+  assert.equal(postedMessages.length, 3, 'Unchanged rendered body skips postMessage');
+
+  // UI state persists into later renders: toggling breakdown closed posts without open
+  messageListener!({ type: 'toggleBreakdown', open: false });
+  assert.equal(postedMessages.length, 4);
+  assert.ok(!postedMessages[3].bodyHtml.includes('<details class="breakdown-details" open>'));
+
+  // Inbound toggleExpand toggles expandedIds Set
+  messageListener!({ type: 'toggleExpand', sessionId: 'root-1' });
+  assert.deepEqual(Array.from(ctrl.getUiState().expandedIds ?? []), ['root-1']);
+  messageListener!({ type: 'toggleExpand', sessionId: 'root-1' });
+  assert.deepEqual(Array.from(ctrl.getUiState().expandedIds ?? []), []);
 
   // Inbound message dispatches to callback
   messageListener!({ type: 'selectSession', sessionId: 'target-123' });

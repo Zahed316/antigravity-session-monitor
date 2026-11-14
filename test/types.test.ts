@@ -26,6 +26,9 @@ test('default constants match spec constraints', () => {
   assert.equal(DEFAULT_CONFIG.defaultScope, 'current');
   assert.equal(DEFAULT_CONFIG.refreshIntervalMs, 10_000);
   assert.equal(DEFAULT_CONFIG.unfocusedRefreshIntervalMs, 30_000);
+  assert.equal(DEFAULT_CONFIG.quotaRefreshIntervalMs, 30_000);
+  assert.equal(DEFAULT_CONFIG.quotaUnfocusedMultiplier, 2);
+  assert.equal(DEFAULT_CONFIG.autoFollowActiveSession, true);
   assert.equal(DEFAULT_CONFIG.contextWarningPct, 75);
   assert.equal(DEFAULT_CONFIG.contextCriticalPct, 90);
   assert.equal(DEFAULT_CONFIG.dataRootOverride, '');
@@ -53,6 +56,13 @@ test('domain types compose cleanly for quota, telemetry, RPC, and state', () => 
     weekly: null,
   };
 
+  const argonPool: QuotaPool = {
+    key: 'argon',
+    displayName: 'Gemini 4 Argon',
+    fiveHour: null,
+    weekly: null,
+  };
+
   const nonGooglePool: QuotaPool = {
     key: 'nonGoogle',
     displayName: 'Claude / 3P',
@@ -65,9 +75,12 @@ test('domain types compose cleanly for quota, telemetry, RPC, and state', () => 
     source: 'summary',
     pools: {
       gemini: geminiPool,
+      argon: argonPool,
       nonGoogle: nonGooglePool,
     },
     fetchedAt: 1763088000000,
+    cooldownUntilMs: 1763088060000,
+    rateLimited: false,
   };
 
   const breakdown: TokenBreakdownGroup[] = [
@@ -227,4 +240,6 @@ test('domain types compose cleanly for quota, telemetry, RPC, and state', () => 
   assert.equal(rpcCall.chatModel?.usage?.inputTokens, 10_000);
   assert.equal(state.activeSession?.contextLimit, 256_000);
   assert.equal(state.quota.pools.gemini.fiveHour?.remainingPct, 80);
+  assert.equal(state.quota.cooldownUntilMs, 1763088060000);
+  assert.equal(state.quota.rateLimited, false);
 });
