@@ -1,5 +1,6 @@
-import { DEFAULT_CONTEXT_LIMIT, type CallUsagePoint, type RawConversationSummary, type RpcTrajectorySummary, type SessionMetrics, type SessionNode } from '../types.ts';
+import { DEFAULT_CONTEXT_LIMIT, type CallUsagePoint, type ModelCatalogEntry, type RawConversationSummary, type RpcTrajectorySummary, type SessionMetrics, type SessionNode } from '../types.ts';
 import { annotateCompactions } from './compaction.ts';
+import { resolveModelName } from './modelResolver.ts';
 import { isWorkspaceMatch } from './sessionResolver.ts';
 
 const CORTEX_SIDE_QUESTION = 'CORTEX_TRAJECTORY_TYPE_SIDE_QUESTION';
@@ -129,12 +130,13 @@ export function buildSessionTree(params: {
   rpcSummaries?: Map<string, RpcTrajectorySummary> | null;
   rpcCalls?: Map<string, CallUsagePoint[]>;
   workspacePaths: string[];
+  modelCatalog?: Map<string, ModelCatalogEntry> | ModelCatalogEntry[];
 }): {
   roots: SessionNode[];
   unattachedSubagents: SessionNode[];
   byId: Map<string, SessionNode>;
 } {
-  const { summaries, localCalls, rpcSummaries, rpcCalls, workspacePaths } = params;
+  const { summaries, localCalls, rpcSummaries, rpcCalls, workspacePaths, modelCatalog } = params;
 
   const intermediateMap = new Map<string, SessionIntermediate>();
 
@@ -306,14 +308,21 @@ export function buildSessionTree(params: {
 
     let contextUsed = 0;
     let contextLimit = DEFAULT_CONTEXT_LIMIT;
-    let model = 'unknown';
+    let rawModel = '';
 
     if (annotatedCalls.length > 0) {
       const lastCall = annotatedCalls[annotatedCalls.length - 1];
       contextUsed = lastCall.effectiveContext;
       contextLimit = lastCall.contextLimit > 0 ? lastCall.contextLimit : DEFAULT_CONTEXT_LIMIT;
-      model = lastCall.model || 'unknown';
+      for (let i = annotatedCalls.length - 1; i >= 0; i--) {
+        const candidate = annotatedCalls[i].rawModel ?? annotatedCalls[i].model;
+        if (candidate && candidate !== 'unknown') {
+          rawModel = candidate;
+          break;
+        }
+      }
     }
+    const model = resolveModelName(rawModel || 'unknown', modelCatalog);
     const contextPct = contextLimit > 0 ? (contextUsed / contextLimit) * 100 : 0;
 
     const node: SessionNode = {
@@ -321,6 +330,7 @@ export function buildSessionTree(params: {
       title: item.title,
       preview: item.preview,
       model,
+      rawModel: rawModel || undefined,
       status: item.status,
       trajectoryType: item.trajectoryType,
       lastModifiedTime: item.lastModifiedTime,

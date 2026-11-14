@@ -5,6 +5,9 @@ export type ScopeMode = 'current' | 'all';
 export interface MonitorConfig {
   refreshIntervalMs: number;
   unfocusedRefreshIntervalMs: number;
+  quotaRefreshIntervalMs: number;
+  quotaUnfocusedMultiplier: number;
+  autoFollowActiveSession: boolean;
   contextWarningPct: number;
   contextCriticalPct: number;
   defaultScope: ScopeMode;
@@ -14,13 +17,41 @@ export interface MonitorConfig {
 export const DEFAULT_CONFIG: MonitorConfig = {
   refreshIntervalMs: 10_000,
   unfocusedRefreshIntervalMs: 30_000,
+  quotaRefreshIntervalMs: 30_000,
+  quotaUnfocusedMultiplier: 2,
+  autoFollowActiveSession: true,
   contextWarningPct: 75,
   contextCriticalPct: 90,
   defaultScope: 'current',
   dataRootOverride: '',
 };
 
-export type PoolKey = 'gemini' | 'nonGoogle';
+export type PoolKey = 'gemini' | 'argon' | 'nonGoogle';
+
+export interface ModelCatalogEntry {
+  rawId: string;
+  modelId: string;
+  label: string;
+  poolKey: PoolKey;
+}
+
+export interface WindowTokenEstimate {
+  status: 'calibrated' | 'calibrating';
+  estimatedTotalTokens: number | null;
+  estimatedBilledTokens: number | null;
+  tokensPerPctTotal: number | null;
+  tokensPerPctBilled: number | null;
+  windowUsedTotal: number;
+  windowUsedBilled: number;
+  sampleCount: number;
+}
+
+export interface ModelTokenEstimate {
+  modelLabel: string;
+  poolKey: PoolKey;
+  fiveHour: WindowTokenEstimate | null;
+  weekly: WindowTokenEstimate | null;
+}
 
 export interface QuotaWindow {
   window: '5h' | 'weekly';
@@ -44,6 +75,8 @@ export interface QuotaSnapshot {
   source: 'summary' | 'userStatus' | 'none';
   pools: Record<PoolKey, QuotaPool>;
   fetchedAt: number;
+  cooldownUntilMs?: number;
+  rateLimited?: boolean;
   error?: string;
 }
 
@@ -71,6 +104,7 @@ export interface CallUsagePoint {
   idx: number;
   stepIndices: number[];
   model: string;
+  rawModel?: string;
   fresh: number;
   cacheRead: number;
   output: number;
@@ -169,6 +203,7 @@ export interface SessionNode {
   title: string;
   preview: string;
   model: string;
+  rawModel?: string;
   status: string;
   trajectoryType: string;
   lastModifiedTime: number;
@@ -215,6 +250,8 @@ export interface MonitorState {
   lastConversationId: string | null;
   artifactHintId: string | null;
   quota: QuotaSnapshot;
+  modelCatalog?: ModelCatalogEntry[];
+  modelEstimates?: ModelTokenEstimate[];
   hubStatus: 'connected' | 'offline' | 'discovering';
   hubPort: number | null;
   hubSource: 'exports' | 'process' | 'wsl-host' | null;

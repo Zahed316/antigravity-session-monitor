@@ -24,6 +24,21 @@ function getConfiguration(): MonitorConfig {
       'unfocusedRefreshIntervalMs',
       DEFAULT_CONFIG.unfocusedRefreshIntervalMs,
     ),
+    quotaRefreshIntervalMs: Math.max(
+      5000,
+      cfg.get<number>('quotaRefreshIntervalMs', DEFAULT_CONFIG.quotaRefreshIntervalMs),
+    ),
+    quotaUnfocusedMultiplier: Math.min(
+      12,
+      Math.max(
+        0,
+        cfg.get<number>('quotaUnfocusedMultiplier', DEFAULT_CONFIG.quotaUnfocusedMultiplier),
+      ),
+    ),
+    autoFollowActiveSession: cfg.get<boolean>(
+      'autoFollowActiveSession',
+      DEFAULT_CONFIG.autoFollowActiveSession,
+    ),
     contextWarningPct: cfg.get<number>('contextWarningPct', DEFAULT_CONFIG.contextWarningPct),
     contextCriticalPct: cfg.get<number>('contextCriticalPct', DEFAULT_CONFIG.contextCriticalPct),
     defaultScope: cfg.get<ScopeMode>('defaultScope', DEFAULT_CONFIG.defaultScope),
@@ -76,6 +91,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     // Directory creation safe ignore
   }
   const cacheFilePath = path.join(context.globalStorageUri.fsPath, 'cache.json');
+  const quotaCalibrationPath = path.join(context.globalStorageUri.fsPath, 'quota-calibration.json');
 
   let workspaceStateDbPath: string | undefined;
   if (context.storageUri) {
@@ -102,11 +118,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   const workspacePaths = (vscode.workspace.workspaceFolders ?? []).map((f) => f.uri.fsPath);
 
-  // Status Bar UI
+  // Status Bar UI (single consolidated item)
   const statusBar: StatusBarController = createStatusBarController(
     vscode as any,
     'antigravityMonitor.openQuickPick',
-    'antigravityMonitor.openPanel',
   );
   context.subscriptions.push(statusBar);
 
@@ -138,6 +153,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     pinnedSessionId: initialPinnedId,
     scope: initialScope,
     antigravityRoot,
+    quotaCalibrationPath,
     sqliteBackend: sqliteClient.backend,
     onPersistPinnedId: async (id) => {
       await context.workspaceState.update('antigravityMonitor.pinnedSessionId', id);
@@ -172,6 +188,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       if (e.affectsConfiguration('antigravityMonitor')) {
         config = getConfiguration();
         monitorService?.updateConfig(config);
+        if (monitorService) {
+          statusBar.update(monitorService.getState(), config);
+        }
       }
     }),
   );
@@ -208,7 +227,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         },
         monitorService.getState(),
         {
+        onOpenPanel: () => {
+          panelProvider.controller.setTab('overview');
+          void vscode.commands.executeCommand('antigravityMonitor.panel.focus');
+        },
         onInspect: (sessionId) => {
+          panelProvider.controller.setTab('details');
           monitorService?.selectForPanel(sessionId);
           void vscode.commands.executeCommand('antigravityMonitor.panel.focus');
         },
@@ -221,6 +245,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   context.subscriptions.push(
     vscode.commands.registerCommand('antigravityMonitor.openPanel', async () => {
+      panelProvider.controller.setTab('overview');
       await vscode.commands.executeCommand('antigravityMonitor.panel.focus');
     }),
   );

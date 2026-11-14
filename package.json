@@ -92,6 +92,24 @@
           "minimum": 2000,
           "description": "Telemetry and quota refresh interval in milliseconds while VS Code is unfocused."
         },
+        "antigravityMonitor.quotaRefreshIntervalMs": {
+          "type": "number",
+          "default": 30000,
+          "minimum": 5000,
+          "description": "Interval (ms) for polling quota and model usage from the local Antigravity hub (minimum 5000ms). Decoupled from local session telemetry polling."
+        },
+        "antigravityMonitor.quotaUnfocusedMultiplier": {
+          "type": "number",
+          "default": 2,
+          "minimum": 0,
+          "maximum": 12,
+          "description": "Multiplier applied to quotaRefreshIntervalMs while VS Code is unfocused (e.g., 2 = 2x slower; 0 pauses quota polling while unfocused)."
+        },
+        "antigravityMonitor.autoFollowActiveSession": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically switch the Details tab to follow the active Antigravity conversation when switching conversations."
+        },
         "antigravityMonitor.contextWarningPct": {
           "type": "number",
           "default": 75,

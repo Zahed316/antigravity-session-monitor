@@ -6,6 +6,13 @@
     "lib": [
       "ES2023"
     ],
+    "types": [
+      "node",
+      "vscode"
+    ],
+    "typeRoots": [
+      "./node_modules/@types"
+    ],
     "strict": true,
     "erasableSyntaxOnly": true,
     "allowImportingTsExtensions": true,

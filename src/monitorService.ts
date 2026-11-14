@@ -6,11 +6,15 @@ import type { HubClient } from './rpc/hubClient.ts';
 import type { HubDiscoveryDeps, HubEndpoint } from './rpc/hubDiscovery.ts';
 import { buildSessionTree } from './core/sessionTree.ts';
 import { resolveActiveSession } from './core/sessionResolver.ts';
+import { buildModelCatalogIndex, inferModelPool } from './core/modelResolver.ts';
+import { QuotaEstimator } from './core/quotaEstimator.ts';
 import {
   DEFAULT_CONFIG,
   type CallUsagePoint,
+  type ModelCatalogEntry,
   type MonitorConfig,
   type MonitorState,
+  type PoolKey,
   type QuotaPool,
   type QuotaSnapshot,
   type ScopeMode,
@@ -18,6 +22,7 @@ import {
 } from './types.ts';
 
 const WATCH_DEBOUNCE_MS = 500;
+const MAX_IDLE_SUBAGENT_METADATA_FETCH = 25;
 
 export interface MonitorServiceDeps {
   localReader: LocalTelemetryReader;
@@ -28,6 +33,7 @@ export interface MonitorServiceDeps {
   pinnedSessionId?: string | null;
   scope?: ScopeMode;
   antigravityRoot?: string;
+  quotaCalibrationPath?: string;
   sqliteBackend?: 'node:sqlite' | 'sqlite3-cli' | 'python3' | 'unavailable';
   onPersistPinnedId?: (id: string | null) => void | Promise<void>;
   onPersistScope?: (scope: ScopeMode) => void | Promise<void>;
@@ -46,7 +52,7 @@ export interface MonitorServiceDeps {
   now?: () => number;
 }
 
-function buildEmptyQuotaPool(key: 'gemini' | 'nonGoogle', displayName: string): QuotaPool {
+function buildEmptyQuotaPool(key: PoolKey, displayName: string): QuotaPool {
   return {
     key,
     displayName,
@@ -60,8 +66,9 @@ function buildOfflineQuota(nowMs: number, error?: string): QuotaSnapshot {
     status: 'offline',
     source: 'none',
     pools: {
-      gemini: buildEmptyQuotaPool('gemini', 'Gemini'),
-      nonGoogle: buildEmptyQuotaPool('nonGoogle', 'Non-Google'),
+      gemini: buildEmptyQuotaPool('gemini', 'Gemini Models'),
+      argon: buildEmptyQuotaPool('argon', 'Gemini 4 Argon'),
+      nonGoogle: buildEmptyQuotaPool('nonGoogle', 'Claude & GPT'),
     },
     fetchedAt: nowMs,
     error,
@@ -87,6 +94,8 @@ function createInitialState(
     lastConversationId: null,
     artifactHintId: null,
     quota: buildOfflineQuota(nowMs),
+    modelCatalog: [],
+    modelEstimates: [],
     hubStatus: 'discovering',
     hubPort: null,
     hubSource: null,
@@ -133,6 +142,9 @@ export class MonitorService {
   private pendingForceRescan = false;
 
   private readonly cachedRpcCalls = new Map<string, CallUsagePoint[]>();
+  private modelCatalog: ModelCatalogEntry[] = [];
+  private modelCatalogIndex = new Map<string, ModelCatalogEntry>();
+  private readonly quotaEstimator: QuotaEstimator;
 
   constructor(deps: MonitorServiceDeps) {
     this.localReader = deps.localReader;
@@ -163,6 +175,11 @@ export class MonitorService {
     this.watchFactory = deps.watchFactory;
     this.now = deps.now ?? (() => Date.now());
 
+    this.quotaEstimator = new QuotaEstimator({
+      storagePath: deps.quotaCalibrationPath,
+      poolResolver: (label) => inferModelPool(label, this.modelCatalogIndex),
+    });
+
     this.state = createInitialState(this.scope, this.workspacePaths, this.sqliteBackend, this.now());
     this.state.pinnedSessionId = this.pinnedSessionId;
   }
@@ -172,6 +189,7 @@ export class MonitorService {
       return;
     }
     this.started = true;
+    await this.quotaEstimator.load();
     this.initWatchers();
     this.resetPollingTimer();
     await this.refreshNow();
@@ -375,6 +393,18 @@ export class MonitorService {
             ? 'connected'
             : 'offline';
 
+      if (activeEndpoint && hubStatus === 'connected' && typeof this.hubClient.fetchModelCatalog === 'function') {
+        try {
+          const catalog = await this.hubClient.fetchModelCatalog(activeEndpoint, now);
+          if (catalog.length > 0) {
+            this.modelCatalog = catalog;
+            this.modelCatalogIndex = buildModelCatalogIndex(catalog);
+          }
+        } catch {
+          // Keep previously cached catalog
+        }
+      }
+
       // 4. Step counts map for selective RPC metadata polling
       const stepCounts = new Map<string, number>();
       for (const s of localSnapshot.summaries) {
@@ -393,6 +423,7 @@ export class MonitorService {
         localCalls: localSnapshot.callsById,
         rpcCalls: this.cachedRpcCalls,
         workspacePaths: this.workspacePaths,
+        modelCatalog: this.modelCatalogIndex,
       });
 
       const { active: candidateActive } = resolveActiveSession({
@@ -405,11 +436,13 @@ export class MonitorService {
       });
 
       // 6. Selective fetchGeneratorMetadata
-      // ONLY active, pinned, selectedSessionId, and RUNNING workspace sessions (plus their active/running subagents)
+      // ONLY active, pinned, selectedSessionId, and RUNNING workspace sessions (plus their active/running subagents,
+      // and missing-model subagents of the active/pinned/selected sessions)
       if (activeEndpoint && hubStatus === 'connected') {
         const targetIds = new Set<string>();
+        let idleSubagentBudget = MAX_IDLE_SUBAGENT_METADATA_FETCH;
 
-        const addWithRunningDescendants = (node: SessionNode | undefined | null) => {
+        const addWithRunningDescendants = (node: SessionNode | undefined | null, includeMissingModelChildren = false) => {
           if (!node) return;
           targetIds.add(node.id);
           for (const child of node.children) {
@@ -420,21 +453,29 @@ export class MonitorService {
                 child.status === 'CASCADE_RUN_STATUS_RUNNING' ||
                 child.notFullyIdle);
             if (childRunning) {
-              addWithRunningDescendants(child);
+              addWithRunningDescendants(child, includeMissingModelChildren);
+            } else if (
+              includeMissingModelChildren &&
+              idleSubagentBudget > 0 &&
+              child.calls.length === 0 &&
+              (stepCounts.get(child.id) ?? 0) > 0
+            ) {
+              idleSubagentBudget--;
+              addWithRunningDescendants(child, includeMissingModelChildren);
             }
           }
         };
 
         if (candidateActive) {
-          addWithRunningDescendants(candidateActive);
+          addWithRunningDescendants(candidateActive, true);
         }
 
         if (this.pinnedSessionId) {
-          addWithRunningDescendants(initialTree.byId.get(this.pinnedSessionId));
+          addWithRunningDescendants(initialTree.byId.get(this.pinnedSessionId), true);
         }
 
         if (this.selectedSessionId) {
-          addWithRunningDescendants(initialTree.byId.get(this.selectedSessionId));
+          addWithRunningDescendants(initialTree.byId.get(this.selectedSessionId), true);
         }
 
         for (const node of initialTree.byId.values()) {
@@ -446,7 +487,7 @@ export class MonitorService {
               node.status === 'CASCADE_RUN_STATUS_RUNNING' ||
               node.notFullyIdle);
           if (isRunningWorkspace) {
-            addWithRunningDescendants(node);
+            addWithRunningDescendants(node, false);
           }
         }
 
@@ -473,6 +514,7 @@ export class MonitorService {
         localCalls: localSnapshot.callsById,
         rpcCalls: this.cachedRpcCalls,
         workspacePaths: this.workspacePaths,
+        modelCatalog: this.modelCatalogIndex,
       });
 
       const { active, pinMissing } = resolveActiveSession({
@@ -507,6 +549,12 @@ export class MonitorService {
         selectedSession.isSelected = true;
       }
 
+      const modelEstimates = this.quotaEstimator.observe({
+        quota: quotaSnapshot,
+        nodes: [...finalTree.roots, ...finalTree.unattachedSubagents],
+        nowMs: now,
+      });
+
       const readerBackend = (this.localReader as any)?.sqliteBackend;
       const backend = readerBackend ?? this.sqliteBackend;
 
@@ -523,6 +571,8 @@ export class MonitorService {
         lastConversationId: localSnapshot.lastConversationId,
         artifactHintId: this.artifactHintId,
         quota: quotaSnapshot,
+        modelCatalog: this.modelCatalog,
+        modelEstimates,
         hubStatus,
         hubPort: activeEndpoint?.port ?? null,
         hubSource: activeEndpoint?.source ?? null,
@@ -606,5 +656,6 @@ export class MonitorService {
 
     this.cachedRpcCalls.clear();
     void this.localReader.flushCache();
+    void this.quotaEstimator.flush();
   }
 }
