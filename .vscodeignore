@@ -10,3 +10,5 @@ node_modules/**
 tsconfig.json
 esbuild.config.mjs
 *.vsix
+*.map
+dist/**/*.map
