@@ -12,7 +12,7 @@ export interface QuickPickEntry {
   label: string;
   description?: string;
   detail?: string;
-  action?: 'unpin' | 'toggleScope' | 'session';
+  action?: 'openPanel' | 'unpin' | 'toggleScope' | 'session';
   sessionId?: string;
   depth?: number;
   buttons?: QuickPickButtonLike[];
@@ -20,6 +20,7 @@ export interface QuickPickEntry {
 }
 
 export interface QuickPickCallbacks {
+  onOpenPanel?: () => void;
   onInspect: (sessionId: string) => void;
   onPin: (sessionId: string) => void;
   onUnpin: () => void;
@@ -58,6 +59,14 @@ function hasDescendant(node: SessionNode, targetId: string): boolean {
 
 export function buildQuickPickItems(state: MonitorState): QuickPickEntry[] {
   const items: QuickPickEntry[] = [];
+
+  // 0. Open Monitor Panel entry
+  items.push({
+    label: '$(layout-panel) Open Monitor Panel',
+    description: 'Overview, model forecasts, subagents & context charts',
+    action: 'openPanel',
+    alwaysShow: true,
+  });
 
   // 1. Unpin action entry (top of list when pinned)
   if (state.pinnedSessionId !== null) {
@@ -109,13 +118,14 @@ export function buildQuickPickItems(state: MonitorState): QuickPickEntry[] {
     const title = node.title || node.preview || (node.isSubagent ? 'Subagent' : 'Untitled Session');
     const label = `${prefix}${iconPrefix}${title}`;
 
+    const modelStr = node.model && node.model !== 'unknown' ? node.model : 'Unknown';
     const usedStr = formatCompactTokens(node.contextUsed);
     const limitStr = formatCompactTokens(node.contextLimit);
     const pctStr = `${Math.round(node.contextPct)}%`;
     const cacheStr = `C:${Math.round(node.cacheVolumePct)}%`;
-    const subCountStr = depth === 0 && node.subagentCount > 0 ? ` · (${node.subagentCount} subagent${node.subagentCount === 1 ? '' : 's'})` : '';
+    const subCountStr = depth === 0 && node.subagentCount > 0 ? ` · ${node.subagentCount} sub` : '';
 
-    const description = `${usedStr}/${limitStr} (${pctStr}) · ${cacheStr}${subCountStr}`;
+    const description = `${modelStr} · ${usedStr}/${limitStr} (${pctStr}) · ${cacheStr}${subCountStr}`;
 
     const freshStr = formatCompactTokens(node.rolledUp.fresh);
     const cacheReadStr = formatCompactTokens(node.rolledUp.cacheRead);
@@ -229,7 +239,9 @@ export async function showSessionQuickPick(
     qp.onDidAccept(() => {
       const selected = qp.selectedItems[0];
       if (selected) {
-        if (selected.action === 'unpin') {
+        if (selected.action === 'openPanel') {
+          callbacks.onOpenPanel?.();
+        } else if (selected.action === 'unpin') {
           callbacks.onUnpin();
         } else if (selected.action === 'toggleScope') {
           callbacks.onToggleScope();

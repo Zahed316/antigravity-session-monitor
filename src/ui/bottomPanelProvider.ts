@@ -1,6 +1,5 @@
-import type * as vscode from 'vscode';
 import type { MonitorState } from '../types.ts';
-import { renderBottomPanelBodyHtml, renderBottomPanelHtml } from './bottomPanelHtml.ts';
+import { renderBottomPanelBodyHtml, renderBottomPanelHtml, type PanelUiState } from './bottomPanelHtml.ts';
 
 export interface WebviewLike {
   html: string;
@@ -40,9 +39,26 @@ export class BottomPanelController {
   private latestState: MonitorState | null = null;
   private disposables: Array<{ dispose(): void }> = [];
   private callbacks: BottomPanelCallbacks;
+  private activeTab: 'overview' | 'details' = 'overview';
+  private expandedIds = new Set<string>();
+  private breakdownOpen = false;
+  private lastPushedBodyHtml: string | null = null;
 
   constructor(callbacks: BottomPanelCallbacks) {
     this.callbacks = callbacks;
+  }
+
+  public setTab(tab: 'overview' | 'details'): void {
+    this.activeTab = tab;
+    this.pushCurrentBody();
+  }
+
+  public getUiState(): PanelUiState {
+    return {
+      activeTab: this.activeTab,
+      expandedIds: this.expandedIds,
+      breakdownOpen: this.breakdownOpen,
+    };
   }
 
   public setView(view: WebviewViewLike): void {
@@ -69,6 +85,7 @@ export class BottomPanelController {
         this.disposeViewListeners();
         this.view = null;
         this.initialized = false;
+        this.lastPushedBodyHtml = null;
       }),
     );
 
@@ -79,21 +96,31 @@ export class BottomPanelController {
 
   public update(state: MonitorState): void {
     this.latestState = state;
+    this.pushCurrentBody();
+  }
 
+  private pushCurrentBody(): void {
     // Do NOT render HTML or postMessage while hidden or if view not set
-    if (!this.view || !this.view.visible) {
+    if (!this.view || !this.view.visible || !this.latestState) {
       return;
     }
 
     if (!this.initialized) {
       this.renderFullHtml();
-    } else {
-      this.view.webview.postMessage({
-        type: 'updateState',
-        state,
-        bodyHtml: renderBottomPanelBodyHtml(state),
-      });
+      return;
     }
+
+    const bodyHtml = renderBottomPanelBodyHtml(this.latestState, this.getUiState());
+    // Skip no-op postMessage when the rendered body is unchanged
+    if (bodyHtml === this.lastPushedBodyHtml) {
+      return;
+    }
+    this.lastPushedBodyHtml = bodyHtml;
+    // Targeted update: the webview applies only bodyHtml, so the unused state payload is not posted
+    this.view.webview.postMessage({
+      type: 'updateState',
+      bodyHtml,
+    });
   }
 
   private handleVisibilityChange(): void {
@@ -101,22 +128,16 @@ export class BottomPanelController {
       return;
     }
 
-    if (!this.initialized) {
-      this.renderFullHtml();
-    } else {
-      this.view.webview.postMessage({
-        type: 'updateState',
-        state: this.latestState,
-        bodyHtml: renderBottomPanelBodyHtml(this.latestState),
-      });
-    }
+    this.pushCurrentBody();
   }
 
   private renderFullHtml(): void {
     if (!this.view || !this.latestState) return;
     const nonce = generateNonce();
     const cspSource = this.view.webview.cspSource || '';
-    this.view.webview.html = renderBottomPanelHtml(this.latestState, nonce, cspSource);
+    const uiState = this.getUiState();
+    this.view.webview.html = renderBottomPanelHtml(this.latestState, nonce, cspSource, uiState);
+    this.lastPushedBodyHtml = renderBottomPanelBodyHtml(this.latestState, uiState);
     this.initialized = true;
   }
 
@@ -124,7 +145,22 @@ export class BottomPanelController {
     if (!message || typeof message !== 'object') return;
 
     if (message.type === 'selectSession' && typeof message.sessionId === 'string') {
+      this.activeTab = 'details';
       this.callbacks.onSelectSession(message.sessionId);
+      this.pushCurrentBody();
+    } else if (message.type === 'switchTab') {
+      this.activeTab = message.tab === 'details' ? 'details' : 'overview';
+      this.pushCurrentBody();
+    } else if (message.type === 'toggleExpand' && typeof message.sessionId === 'string') {
+      if (this.expandedIds.has(message.sessionId)) {
+        this.expandedIds.delete(message.sessionId);
+      } else {
+        this.expandedIds.add(message.sessionId);
+      }
+      this.pushCurrentBody();
+    } else if (message.type === 'toggleBreakdown') {
+      this.breakdownOpen = typeof message.open === 'boolean' ? message.open : !this.breakdownOpen;
+      this.pushCurrentBody();
     } else if (message.type === 'pinSession' && typeof message.sessionId === 'string') {
       this.callbacks.onPinSession(message.sessionId);
     } else if (message.type === 'unpinSession') {
@@ -147,6 +183,7 @@ export class BottomPanelController {
     this.disposeViewListeners();
     this.view = null;
     this.initialized = false;
+    this.lastPushedBodyHtml = null;
   }
 }
 

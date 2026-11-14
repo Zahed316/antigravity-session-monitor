@@ -1,5 +1,12 @@
-import type * as vscode from 'vscode';
-import type { MonitorConfig, MonitorState, QuotaWindow, SessionNode } from '../types.ts';
+import type {
+  ModelTokenEstimate,
+  MonitorConfig,
+  MonitorState,
+  PoolKey,
+  QuotaWindow,
+  SessionNode,
+  WindowTokenEstimate,
+} from '../types.ts';
 
 export interface StatusBarItemLike {
   text: string;
@@ -16,21 +23,20 @@ export interface StatusBarVscodeLike {
     createStatusBarItem(alignment?: any, priority?: number): StatusBarItemLike;
   };
   ThemeColor: new (id: string) => { id: string };
-  MarkdownString: new (value?: string) => { value: string; isTrusted?: boolean; supportThemeIcons?: boolean; appendMarkdown?(value: string): any };
+  MarkdownString: new (
+    value?: string,
+  ) => { value: string; isTrusted?: boolean; supportThemeIcons?: boolean; appendMarkdown?(value: string): any };
   StatusBarAlignment?: { Left: number; Right: number };
 }
 
 export interface StatusBarViewModel {
-  contextText: string;
-  contextColor: 'normal' | 'warning' | 'error';
-  quotaText: string;
-  quotaColor: 'normal' | 'warning' | 'error';
+  text: string;
+  color: 'normal' | 'warning' | 'error';
   tooltipMarkdown: string;
 }
 
 export interface StatusBarController {
-  readonly contextItem: StatusBarItemLike;
-  readonly quotaItem: StatusBarItemLike;
+  readonly item: StatusBarItemLike;
   update(state: MonitorState, config: MonitorConfig): void;
   dispose(): void;
 }
@@ -79,196 +85,293 @@ export function formatResetCountdown(resetTime: string | null, isReady: boolean,
   return `Resets in ${mins}m`;
 }
 
+export function formatWindowEstimateBrief(est: WindowTokenEstimate | null | undefined): string {
+  if (!est) return '—';
+  if (est.status === 'calibrated' && est.estimatedTotalTokens !== null) {
+    const totalStr = `~${formatCompactTokens(est.estimatedTotalTokens)} tok`;
+    if (est.estimatedBilledTokens !== null) {
+      return `${totalStr} (~${formatCompactTokens(est.estimatedBilledTokens)} fresh+out)`;
+    }
+    return totalStr;
+  }
+  if (est.windowUsedTotal > 0) {
+    return `Calibrating (${formatCompactTokens(est.windowUsedTotal)} used)`;
+  }
+  return 'Calibrating…';
+}
+
+function summarizeSubagentModels(root: SessionNode): string {
+  const counts = new Map<string, number>();
+  function visit(node: SessionNode): void {
+    for (const child of node.children) {
+      const label = child.model && child.model !== 'unknown' ? child.model : 'Unknown';
+      counts.set(label, (counts.get(label) ?? 0) + 1);
+      visit(child);
+    }
+  }
+  visit(root);
+  if (counts.size === 0) return '';
+  const sorted = Array.from(counts.entries()).sort((a, b) => b[1] - a[1]);
+  const top = sorted.slice(0, 3).map(([name, cnt]) => `${cnt}× ${escapeMarkdown(name)}`);
+  if (sorted.length > 3) {
+    top.push(`+${sorted.length - 3} more`);
+  }
+  return top.join(', ');
+}
+
+function maxSeverity(
+  a: 'normal' | 'warning' | 'error',
+  b: 'normal' | 'warning' | 'error',
+): 'normal' | 'warning' | 'error' {
+  if (a === 'error' || b === 'error') return 'error';
+  if (a === 'warning' || b === 'warning') return 'warning';
+  return 'normal';
+}
+
+function buildCompactQuotaPart(state: MonitorState): {
+  text: string;
+  color: 'normal' | 'warning' | 'error';
+} {
+  if (state.quota.status !== 'online') {
+    return { text: 'Quota offline', color: 'normal' };
+  }
+
+  const gWin = state.quota.pools.gemini?.fiveHour ?? state.quota.pools.gemini?.weekly;
+  const aWin = state.quota.pools.argon?.weekly ?? state.quota.pools.argon?.fiveHour;
+  const cWin = state.quota.pools.nonGoogle?.fiveHour ?? state.quota.pools.nonGoogle?.weekly;
+
+  const segments: string[] = [];
+  const pcts: number[] = [];
+
+  if (gWin) {
+    segments.push(`G ${Math.round(gWin.remainingPct)}%`);
+    pcts.push(gWin.remainingPct);
+  } else {
+    segments.push('G --%');
+  }
+
+  if (aWin) {
+    segments.push(`A ${Math.round(aWin.remainingPct)}%`);
+    pcts.push(aWin.remainingPct);
+  }
+
+  if (cWin) {
+    segments.push(`C ${Math.round(cWin.remainingPct)}%`);
+    pcts.push(cWin.remainingPct);
+  } else {
+    segments.push('C --%');
+  }
+
+  let color: 'normal' | 'warning' | 'error' = 'normal';
+  if (pcts.length > 0) {
+    const min = Math.min(...pcts);
+    if (min <= 0) color = 'error';
+    else if (min <= 20) color = 'warning';
+  }
+
+  return { text: segments.join(' · '), color };
+}
+
 export function buildStatusBarViewModel(state: MonitorState, config: MonitorConfig): StatusBarViewModel {
-  // 1. Context Item
-  let contextText = '';
+  const quotaPart = buildCompactQuotaPart(state);
+  let text = '';
   let contextColor: 'normal' | 'warning' | 'error' = 'normal';
 
   if (state.pinMissing) {
-    contextText = '$(pin) Missing — Click to unpin';
+    text = '$(pin) Missing — Click to unpin';
     contextColor = 'warning';
   } else if (!state.activeSession) {
-    contextText = '$(pulse) No workspace session';
-    contextColor = 'normal';
+    text = `$(pulse) No session · ${quotaPart.text}`;
   } else {
     const active = state.activeSession;
     const isPinned = state.pinnedSessionId !== null && !state.pinMissing;
     const isRunning = active.rolledUp.isRunning;
 
-    const prefixParts: string[] = [];
-    if (isPinned) prefixParts.push('$(pin)');
-    if (isRunning) prefixParts.push('$(sync~spin)');
+    const icons: string[] = [];
+    if (isPinned) icons.push('$(pin)');
+    if (isRunning) icons.push('$(sync~spin)');
+    if (icons.length === 0) icons.push('$(pulse)');
 
     const rawTitle = (active.title || active.preview || 'Untitled').replace(/\s+/g, ' ').trim();
-    const truncatedTitle = rawTitle.length > 20 ? `${rawTitle.slice(0, 19)}…` : rawTitle;
+    const shortTitle = rawTitle.length > 18 ? `${rawTitle.slice(0, 17)}…` : rawTitle;
+    const ctxPct = `${Math.round(active.contextPct)}%`;
 
-    const usedStr = formatCompactTokens(active.contextUsed);
-    const limitStr = formatCompactTokens(active.contextLimit);
-    const pct = Math.round(active.contextPct);
-    const cacheStr = `C:${Math.round(active.cacheVolumePct)}%`;
-
-    const parts = [...prefixParts, truncatedTitle, `${usedStr}/${limitStr} (${pct}%)`, cacheStr];
-    contextText = parts.join(' ');
+    text = `${icons.join(' ')} ${shortTitle} ${ctxPct} · ${quotaPart.text}`;
 
     if (active.contextPct >= config.contextCriticalPct) {
       contextColor = 'error';
     } else if (active.contextPct >= config.contextWarningPct) {
       contextColor = 'warning';
-    } else {
-      contextColor = 'normal';
     }
   }
 
-  // 2. Quota Item
-  let quotaText = '';
-  let quotaColor: 'normal' | 'warning' | 'error' = 'normal';
+  const color = state.pinMissing ? 'warning' : maxSeverity(contextColor, quotaPart.color);
 
-  if (state.quota.status !== 'online') {
-    quotaText = 'Quota offline';
-    quotaColor = 'normal';
-  } else {
-    const g5h = state.quota.pools.gemini?.fiveHour;
-    const c5h = state.quota.pools.nonGoogle?.fiveHour;
-
-    const gStr = g5h ? `${Math.round(g5h.remainingPct)}%` : '--%';
-    const cStr = c5h ? `${Math.round(c5h.remainingPct)}%` : '--%';
-    quotaText = `G ${gStr} · C ${cStr}`;
-
-    const pcts: number[] = [];
-    if (g5h) pcts.push(g5h.remainingPct);
-    if (c5h) pcts.push(c5h.remainingPct);
-
-    if (pcts.length > 0) {
-      const min = Math.min(...pcts);
-      if (min <= 0) {
-        quotaColor = 'error';
-      } else if (min <= 20) {
-        quotaColor = 'warning';
-      } else {
-        quotaColor = 'normal';
-      }
-    } else {
-      quotaColor = 'normal';
-    }
-  }
-
-  // 3. Tooltip Markdown
+  // Minimal, essential-only hover tooltip
   const lines: string[] = [];
-  lines.push('### Antigravity Session Monitor');
+  lines.push('### Antigravity Monitor');
   lines.push('');
 
   if (state.pinMissing) {
-    lines.push('⚠️ **Pinned session is missing or deleted.** Click to unpin.');
+    lines.push('⚠️ **Pinned session is missing.** Click to unpin.');
+    lines.push('');
+  }
+
+  const isCooldownActive = Boolean(
+    state.quota.rateLimited ||
+      (typeof state.quota.cooldownUntilMs === 'number' && state.quota.cooldownUntilMs > Date.now()),
+  );
+  if (isCooldownActive) {
+    const untilStr = state.quota.cooldownUntilMs
+      ? new Date(state.quota.cooldownUntilMs).toLocaleTimeString()
+      : 'reset';
+    lines.push(`⚠️ **Rate-limited / Cooldown until ${untilStr}**`);
     lines.push('');
   }
 
   if (state.activeSession) {
     const active = state.activeSession;
-    const isPinned = state.pinnedSessionId !== null && !state.pinMissing;
-    const modeText = isPinned ? '$(pin) Pinned' : '$(target) Auto-Tracked';
     const runningText = active.rolledUp.isRunning ? '$(sync~spin) Running' : 'Idle';
+    const modelText = escapeMarkdown(active.model || 'Unknown');
 
     lines.push(`**Session:** ${escapeMarkdown(active.title || 'Untitled')}`);
-    lines.push(`**Model:** \`${escapeMarkdown(active.model)}\` · **Status:** ${runningText} · **Mode:** ${modeText}`);
+    lines.push(`**Model:** ${modelText} · **Status:** ${runningText}`);
+    lines.push(
+      `**Context:** ${formatCompactTokens(active.contextUsed)} / ${formatCompactTokens(active.contextLimit)} (${Math.round(active.contextPct)}%) · **Cache:** ${Math.round(active.cacheVolumePct)}%`,
+    );
+
     if (active.subagentCount > 0) {
-      const subCountText = active.subagentCount === 1 ? '1 subagent' : `${active.subagentCount} subagents`;
-      lines.push(`**Hierarchy:** Parent + ${subCountText} (${active.runningSubagentCount} running)`);
+      const modelSummary = summarizeSubagentModels(active);
+      const runStr = active.runningSubagentCount > 0 ? ` (${active.runningSubagentCount} running)` : '';
+      lines.push(`**Subagents:** ${active.subagentCount}${runStr}${modelSummary ? ` — ${modelSummary}` : ''}`);
     }
-    lines.push('');
-    lines.push('| Metric | Parent (Own) | Rolled-up (Total) |');
-    lines.push('| :--- | :--- | :--- |');
-    lines.push(`| **Context Window** | ${formatCompactTokens(active.contextUsed)} / ${formatCompactTokens(active.contextLimit)} (${Math.round(active.contextPct)}%) | — |`);
-    lines.push(`| **Fresh Tokens** | ${formatCompactTokens(active.own.fresh)} | ${formatCompactTokens(active.rolledUp.fresh)} |`);
-    lines.push(`| **Cache Read** | ${formatCompactTokens(active.own.cacheRead)} | ${formatCompactTokens(active.rolledUp.cacheRead)} |`);
-    lines.push(`| **Output Tokens** | ${formatCompactTokens(active.own.output)} (Thinking: ${formatCompactTokens(active.own.thinking)}, Response: ${formatCompactTokens(active.own.response)}) | ${formatCompactTokens(active.rolledUp.output)} (Thinking: ${formatCompactTokens(active.rolledUp.thinking)}, Response: ${formatCompactTokens(active.rolledUp.response)}) |`);
-    lines.push(`| **Cache Volume** | ${active.ownCacheVolumePct.toFixed(1)}% | ${active.cacheVolumePct.toFixed(1)}% |`);
-    lines.push(`| **Call Cache Hit** | ${active.ownCallHitPct.toFixed(1)}% | ${active.callHitPct.toFixed(1)}% |`);
-    lines.push(`| **Calls** | ${active.own.calls} | ${active.rolledUp.calls} |`);
-    lines.push(`| **Compactions** | ${active.own.compactions} | ${active.rolledUp.compactions} |`);
+
+    const activeEst: ModelTokenEstimate | undefined = state.modelEstimates?.find(
+      (e) => e.modelLabel === active.model,
+    );
+    if (activeEst) {
+      const hasCalibrated =
+        (activeEst.fiveHour?.status === 'calibrated' && activeEst.fiveHour.estimatedTotalTokens !== null) ||
+        (activeEst.weekly?.status === 'calibrated' && activeEst.weekly.estimatedTotalTokens !== null);
+
+      if (hasCalibrated) {
+        const parts: string[] = [];
+        if (activeEst.fiveHour) parts.push(`5h: ${formatWindowEstimateBrief(activeEst.fiveHour)}`);
+        if (activeEst.weekly) parts.push(`Wk: ${formatWindowEstimateBrief(activeEst.weekly)}`);
+        if (parts.length > 0) {
+          lines.push(`**Est. Left:** ${parts.join(' · ')}`);
+        }
+      } else {
+        const usedTotal =
+          Math.max(activeEst.fiveHour?.windowUsedTotal ?? 0, activeEst.weekly?.windowUsedTotal ?? 0) ||
+          (active.rolledUp.fresh + active.rolledUp.cacheRead + active.rolledUp.output);
+        const usedBilled = Math.max(activeEst.fiveHour?.windowUsedBilled ?? 0, activeEst.weekly?.windowUsedBilled ?? 0);
+        const billedStr = usedBilled > 0 ? ` (~${formatCompactTokens(usedBilled)} fresh+out)` : '';
+        lines.push(`**Active model tokens:** ${formatCompactTokens(usedTotal)}${billedStr} (calibrating)`);
+      }
+    }
   } else {
     lines.push('$(pulse) *No active workspace session*');
   }
 
   lines.push('');
   lines.push('---');
-  lines.push(`### Quota Pools (${state.quota.status})`);
-  lines.push('');
 
   if (state.quota.status === 'online') {
-    lines.push('| Pool | 5-Hour Window | Weekly Window |');
+    lines.push('| Pool | 5-Hour | Weekly |');
     lines.push('| :--- | :--- | :--- |');
-    const gemini = state.quota.pools.gemini;
-    const nonGoogle = state.quota.pools.nonGoogle;
-
     const fmtWindow = (w: QuotaWindow | null) => {
       if (!w) return '—';
       const countdown = formatResetCountdown(w.resetTime, w.isReady, w.isExhausted);
       return `${Math.round(w.remainingPct)}% (${countdown})`;
     };
 
-    lines.push(`| **Gemini** | ${fmtWindow(gemini?.fiveHour ?? null)} | ${fmtWindow(gemini?.weekly ?? null)} |`);
-    lines.push(`| **Non-Google** | ${fmtWindow(nonGoogle?.fiveHour ?? null)} | ${fmtWindow(nonGoogle?.weekly ?? null)} |`);
+    const poolOrder: Array<{ key: PoolKey; fallbackName: string }> = [
+      { key: 'gemini', fallbackName: 'Gemini Models' },
+      { key: 'argon', fallbackName: 'Gemini 4 Argon' },
+      { key: 'nonGoogle', fallbackName: 'Claude & GPT' },
+    ];
+    for (const p of poolOrder) {
+      const pool = state.quota.pools[p.key];
+      if (!pool) continue;
+      if (p.key === 'argon' && !pool.fiveHour && !pool.weekly) continue;
+      lines.push(
+        `| **${escapeMarkdown(pool.displayName || p.fallbackName)}** | ${fmtWindow(pool.fiveHour)} | ${fmtWindow(pool.weekly)} |`,
+      );
+    }
   } else {
-    lines.push(`*Quota status is currently ${state.quota.status}.*`);
+    lines.push(`*Quota status: ${state.quota.status}*`);
   }
 
-  const tooltipMarkdown = lines.join('\n');
+  lines.push('');
+  lines.push('*Click for sessions & overview*');
 
   return {
-    contextText,
-    contextColor,
-    quotaText,
-    quotaColor,
-    tooltipMarkdown,
+    text,
+    color,
+    tooltipMarkdown: lines.join('\n'),
   };
 }
 
 export function createStatusBarController(
   vscodeApi: StatusBarVscodeLike,
-  onClickContextCmd: string,
-  onClickQuotaCmd: string,
+  onClickCmd: string,
 ): StatusBarController {
-  const contextItem = vscodeApi.window.createStatusBarItem(1, 100);
-  contextItem.command = onClickContextCmd;
-  contextItem.show();
+  const item = vscodeApi.window.createStatusBarItem(1, 100);
+  item.command = onClickCmd;
+  item.show();
 
-  const quotaItem = vscodeApi.window.createStatusBarItem(1, 99);
-  quotaItem.command = onClickQuotaCmd;
-  quotaItem.show();
+  let initialized = false;
+  let lastText: string | undefined;
+  let lastTooltipMarkdown: string | undefined;
+  let lastBackgroundColorId: string | undefined;
 
   return {
-    contextItem,
-    quotaItem,
+    item,
     update(state: MonitorState, config: MonitorConfig): void {
       const vm = buildStatusBarViewModel(state, config);
+      const targetBgColorId =
+        vm.color === 'warning'
+          ? 'statusBarItem.warningBackground'
+          : vm.color === 'error'
+            ? 'statusBarItem.errorBackground'
+            : undefined;
 
-      contextItem.text = vm.contextText;
-      if (vm.contextColor === 'warning') {
-        contextItem.backgroundColor = new vscodeApi.ThemeColor('statusBarItem.warningBackground');
-      } else if (vm.contextColor === 'error') {
-        contextItem.backgroundColor = new vscodeApi.ThemeColor('statusBarItem.errorBackground');
-      } else {
-        contextItem.backgroundColor = undefined;
+      if (
+        initialized &&
+        lastText === vm.text &&
+        lastTooltipMarkdown === vm.tooltipMarkdown &&
+        lastBackgroundColorId === targetBgColorId
+      ) {
+        return;
       }
 
-      quotaItem.text = vm.quotaText;
-      if (vm.quotaColor === 'warning') {
-        quotaItem.backgroundColor = new vscodeApi.ThemeColor('statusBarItem.warningBackground');
-      } else if (vm.quotaColor === 'error') {
-        quotaItem.backgroundColor = new vscodeApi.ThemeColor('statusBarItem.errorBackground');
-      } else {
-        quotaItem.backgroundColor = undefined;
+      if (!initialized || lastText !== vm.text) {
+        item.text = vm.text;
+        lastText = vm.text;
       }
 
-      const md = new vscodeApi.MarkdownString(vm.tooltipMarkdown);
-      md.isTrusted = true;
-      md.supportThemeIcons = true;
-      contextItem.tooltip = md;
-      quotaItem.tooltip = md;
+      if (!initialized || lastBackgroundColorId !== targetBgColorId) {
+        if (targetBgColorId) {
+          item.backgroundColor = new vscodeApi.ThemeColor(targetBgColorId);
+        } else {
+          item.backgroundColor = undefined;
+        }
+        lastBackgroundColorId = targetBgColorId;
+      }
+
+      if (!initialized || lastTooltipMarkdown !== vm.tooltipMarkdown) {
+        const md = new vscodeApi.MarkdownString(vm.tooltipMarkdown);
+        md.isTrusted = true;
+        md.supportThemeIcons = true;
+        item.tooltip = md;
+        lastTooltipMarkdown = vm.tooltipMarkdown;
+      }
+
+      initialized = true;
     },
     dispose(): void {
-      contextItem.dispose();
-      quotaItem.dispose();
+      item.dispose();
     },
   };
 }
