@@ -139,7 +139,7 @@ export class MonitorService {
   private discoveredEndpoints: HubEndpoint[] = [];
   private quotaEndpoint: HubEndpoint | null = null;
   private lastGoodQuota: QuotaSnapshot | null = null;
-  private quotaInFlight = false;
+  private quotaInFlightPromise: Promise<void> | null = null;
   private watchers: Array<{ close(): void }> = [];
 
   private inFlight: Promise<void> | null = null;
@@ -269,6 +269,12 @@ export class MonitorService {
       return;
     }
 
+    // Manual refresh (button/command) publishes quota first; timer ticks and watch events rely on
+    // the quota timer so `quotaUnfocusedMultiplier: 0` still pauses quota polling.
+    if (forceRescan) {
+      await this.refreshQuotaNow();
+    }
+
     if (this.inFlight) {
       this.pendingRefresh = true;
       if (forceRescan) {
@@ -335,53 +341,59 @@ export class MonitorService {
   }
 
   public async refreshQuotaNow(): Promise<void> {
-    // Overlapping polls would double-fetch the same hubs; the next tick picks up instead.
-    if (this.disposed || this.quotaInFlight) {
+    if (this.disposed) {
       return;
     }
-    this.quotaInFlight = true;
-
-    try {
-      let endpoints = this.discoveredEndpoints;
-      if (endpoints.length === 0) {
-        try {
-          endpoints = await this.discoverEndpoints({ workspacePaths: this.workspacePaths });
-        } catch {
-          endpoints = [];
-        }
-        this.discoveredEndpoints = endpoints;
-      }
-
-      // Every hub answers, but a lagging hub serves its own cached window, so rank all of them.
-      const results: Array<{ endpoint: HubEndpoint; snapshot: QuotaSnapshot }> = [];
-      for (const ep of endpoints) {
-        try {
-          results.push({ endpoint: ep, snapshot: await this.hubClient.fetchQuota(ep, this.now()) });
-        } catch {
-          // Discovery can list a hub that already exited; skip it.
-        }
-      }
-
-      const selected = selectFreshQuota(results.map((r) => r.snapshot));
-      // Matched by snapshot identity, so endpoint order never has to line up with result order.
-      const winner = results.find((r) => r.snapshot === selected) ?? null;
-
-      // Only an online result replaces the snapshot; an all-offline poll keeps the last good one.
-      this.quotaEndpoint = winner && winner.snapshot.status === 'online' ? winner.endpoint : null;
-      if (winner && winner.snapshot.status === 'online') {
-        this.lastGoodQuota = winner.snapshot;
-        this.state.quota = winner.snapshot;
-        this.state.hubStatus = 'connected';
-        this.state.hubPort = winner.endpoint.port;
-        this.state.hubSource = winner.endpoint.source;
-        this.state.lastUpdatedAt = this.now();
-      }
-
-      // Emitted on every path so the UI still hears about all-offline and no-endpoint polls.
-      this.onDidUpdateState?.(this.state);
-    } finally {
-      this.quotaInFlight = false;
+    // An overlapping poll must not double-fetch the hubs, but its caller still has to wait for
+    // the in-flight poll's emit, so share the promise instead of early-returning.
+    if (this.quotaInFlightPromise) {
+      return this.quotaInFlightPromise;
     }
+
+    this.quotaInFlightPromise = this.pollQuota().finally(() => {
+      this.quotaInFlightPromise = null;
+    });
+    return this.quotaInFlightPromise;
+  }
+
+  private async pollQuota(): Promise<void> {
+    let endpoints = this.discoveredEndpoints;
+    if (endpoints.length === 0) {
+      try {
+        endpoints = await this.discoverEndpoints({ workspacePaths: this.workspacePaths });
+      } catch {
+        endpoints = [];
+      }
+      this.discoveredEndpoints = endpoints;
+    }
+
+    // Every hub answers, but a lagging hub serves its own cached window, so rank all of them.
+    const results: Array<{ endpoint: HubEndpoint; snapshot: QuotaSnapshot }> = [];
+    for (const ep of endpoints) {
+      try {
+        results.push({ endpoint: ep, snapshot: await this.hubClient.fetchQuota(ep, this.now()) });
+      } catch {
+        // Discovery can list a hub that already exited; skip it.
+      }
+    }
+
+    const selected = selectFreshQuota(results.map((r) => r.snapshot));
+    // Matched by snapshot identity, so endpoint order never has to line up with result order.
+    const winner = results.find((r) => r.snapshot === selected) ?? null;
+
+    // Only an online result replaces the snapshot; an all-offline poll keeps the last good one.
+    this.quotaEndpoint = winner && winner.snapshot.status === 'online' ? winner.endpoint : null;
+    if (winner && winner.snapshot.status === 'online') {
+      this.lastGoodQuota = winner.snapshot;
+      this.state.quota = winner.snapshot;
+      this.state.hubStatus = 'connected';
+      this.state.hubPort = winner.endpoint.port;
+      this.state.hubSource = winner.endpoint.source;
+      this.state.lastUpdatedAt = this.now();
+    }
+
+    // Emitted on every path so the UI still hears about all-offline and no-endpoint polls.
+    this.onDidUpdateState?.(this.state);
   }
 
   private initWatchers(): void {

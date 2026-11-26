@@ -768,4 +768,85 @@ describe('MonitorService Orchestrator', () => {
 
     service.dispose();
   });
+
+  it('10. refreshNow publishes quota before the heavy telemetry read finishes', async () => {
+    // read() blocks once per call: a queue of resolvers so each held read can be released separately.
+    const readReleases: Array<() => void> = [];
+    let quotaValue = 0.8;
+    let quotaFetchCount = 0;
+    const published: number[] = [];
+
+    const mockLocalReader: any = {
+      read: async () => {
+        await new Promise<void>((res) => {
+          readReleases.push(res);
+        });
+        return { summaries: [], callsById: new Map(), lastConversationId: null };
+      },
+      flushCache: async () => {},
+      clearMemoryCache: () => {},
+    };
+
+    const mockHubClient: any = {
+      fetchQuota: async () => {
+        quotaFetchCount++;
+        const q = createMockQuota('online');
+        q.pools.gemini.fiveHour!.remainingFraction = quotaValue;
+        q.pools.gemini.fiveHour!.remainingPct = Math.round(quotaValue * 100);
+        return q;
+      },
+      fetchTrajectories: async () => new Map(),
+      fetchGeneratorMetadata: async () => [],
+    };
+
+    const service = new MonitorService({
+      localReader: mockLocalReader,
+      hubClient: mockHubClient,
+      discoverEndpoints: async () => [{ port: 1, csrfToken: 't', host: '127.0.0.1', source: 'process' }],
+      workspacePaths: ['/w'],
+      timerFactory: {
+        setTimeout: (fn: any, ms?: number) => setTimeout(fn, ms),
+        clearTimeout: (id: any) => clearTimeout(id),
+        setInterval: () => 1,
+        clearInterval: () => {},
+      },
+      watchFactory: () => ({ close() {} }),
+      onDidUpdateState: (state) => published.push(state.quota.pools.gemini.fiveHour?.remainingFraction ?? -1),
+    });
+
+    // Let the start() refresh finish: it blocks in read(), so release it.
+    void service.start();
+    await new Promise((r) => setTimeout(r, 10));
+    readReleases.shift()!();
+    await new Promise((r) => setTimeout(r, 10));
+
+    // Automatic refreshes (start, timers, watch events) leave quota to the quota timer.
+    assert.strictEqual(quotaFetchCount, 0, 'refreshNow without forceRescan does not poll quota');
+
+    // Now hold the heavy path open and ask for a manual refresh.
+    const heavy = service.refreshNow();
+    await new Promise((r) => setTimeout(r, 10));
+    assert.strictEqual(quotaFetchCount, 0, 'coalesced refresh without forceRescan does not poll quota');
+
+    quotaValue = 0.4;
+    const manual = service.refreshNow(true);
+    await new Promise((r) => setTimeout(r, 10));
+    assert.strictEqual(quotaFetchCount, 1, 'manual refresh polls quota');
+
+    // Quota must already be on screen although read() is still blocked.
+    assert.ok(published.includes(0.4), 'quota published while heavy refresh is blocked');
+    assert.strictEqual(service.getState().quota.pools.gemini.fiveHour?.remainingFraction, 0.4);
+
+    // Drain every held read until both refreshes settle.
+    let settled = false;
+    const both = Promise.all([heavy, manual]).finally(() => {
+      settled = true;
+    });
+    for (let i = 0; i < 100 && !settled; i++) {
+      readReleases.shift()?.();
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    await both;
+    service.dispose();
+  });
 });
