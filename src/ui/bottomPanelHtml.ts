@@ -13,7 +13,7 @@ import type {
   SessionNode,
   WindowTokenEstimate,
 } from '../types.ts';
-import { formatCompactTokens, formatResetCountdown, formatResetDateTime } from './statusBar.ts';
+import { formatCompactTokens, formatRemainingPct, formatResetCountdown, formatResetDateTime } from './statusBar.ts';
 
 export interface PanelUiState {
   activeTab?: PanelTabId;
@@ -300,6 +300,7 @@ function renderQuotaWindowRow(label: string, w: QuotaWindow | null): string {
   }
   const pct = clampPct(w.remainingPct);
   const sev = pctSeverityClass(w.remainingPct);
+  const pctLabel = formatRemainingPct(w.remainingPct, w.remainingFraction);
   const countdown = formatResetCountdown(w.resetTime, w.isReady, w.isExhausted);
   const resetDateStr = formatResetDateTime(w.resetTime);
   const resetTitle = resetDateStr ? `Next reset: ${resetDateStr} (${countdown})` : countdown;
@@ -307,7 +308,7 @@ function renderQuotaWindowRow(label: string, w: QuotaWindow | null): string {
     <div class="q-row" title="${escapeHtml(resetTitle)}">
       <div class="q-row-top">
         <span class="q-label">${escapeHtml(label)}</span>
-        <span class="q-val ${sev}">${pct}% <span class="countdown">(${escapeHtml(countdown)})</span></span>
+        <span class="q-val ${sev}">${escapeHtml(pctLabel)} <span class="countdown">(${escapeHtml(countdown)})</span></span>
       </div>
       <div class="bar-track"><div class="bar-fill ${sev} p-${pct}"></div></div>
       ${resetDateStr ? `<div class="q-reset-time"><span class="q-reset-label">Next reset</span><span class="q-reset-val">${escapeHtml(resetDateStr)}</span></div>` : ''}
@@ -652,6 +653,7 @@ export function renderBottomPanelBodyHtml(state: MonitorState, uiState?: PanelUi
 
   const quotaContentHtml = quotaOnline
     ? `
+      ${quota.isStale ? `<div class="section-hint">Stale — last fetched ${escapeHtml(new Date(quota.fetchedAt).toLocaleTimeString())}</div>` : ''}
       <div class="quota-grid">
         ${renderQuotaCard(quota.pools.gemini, 'Gemini Models')}
         ${renderQuotaCard(quota.pools.nonGoogle, 'Claude & GPT')}

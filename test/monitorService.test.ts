@@ -849,4 +849,76 @@ describe('MonitorService Orchestrator', () => {
     await both;
     service.dispose();
   });
+  it('11. an unreachable hub keeps the last good quota flagged stale', async () => {
+    let online = true;
+    const mockHubClient: any = {
+      fetchQuota: async () => createMockQuota(online ? 'online' : 'offline'),
+      fetchTrajectories: async () => new Map(),
+      fetchGeneratorMetadata: async () => [],
+    };
+    const service = new MonitorService({
+      localReader: {
+        read: async () => ({ summaries: [], callsById: new Map(), lastConversationId: null }),
+        flushCache: async () => {},
+        clearMemoryCache: () => {},
+      } as any,
+      hubClient: mockHubClient,
+      discoverEndpoints: async () => [{ port: 1, csrfToken: 't', host: '127.0.0.1', source: 'process' }],
+      workspacePaths: ['/w'],
+      timerFactory: {
+        setTimeout: (fn: any, ms?: number) => setTimeout(fn, ms),
+        clearTimeout: (id: any) => clearTimeout(id),
+        setInterval: () => 1,
+        clearInterval: () => {},
+      },
+      watchFactory: () => ({ close() {} }),
+    });
+    await service.start();
+    await service.refreshQuotaNow();
+    assert.strictEqual(service.getState().quota.pools.gemini.fiveHour?.remainingPct, 85);
+    assert.ok(!service.getState().quota.isStale, 'a fresh online snapshot is not stale');
+
+    online = false;
+    await service.refreshQuotaNow();
+    const q = service.getState().quota;
+    assert.strictEqual(q.status, 'online', 'last good snapshot is kept');
+    assert.strictEqual(q.isStale, true);
+    assert.strictEqual(q.pools.gemini.fiveHour?.remainingPct, 85, 'numbers are not zeroed');
+    service.dispose();
+  });
+
+  it('12. telemetry ignores a quota endpoint the latest discovery no longer lists', async () => {
+    const first: HubEndpoint = { port: 41001, csrfToken: 'a', host: '127.0.0.1', source: 'exports' };
+    const second: HubEndpoint = { port: 41002, csrfToken: 'b', host: '127.0.0.1', source: 'process' };
+    let endpoints: HubEndpoint[] = [first, second];
+    const catalogPorts: number[] = [];
+    const mockHubClient: any = {
+      fetchQuota: async (ep: HubEndpoint) => createMockQuota(ep.port === second.port ? 'online' : 'offline'),
+      fetchTrajectories: async () => new Map(),
+      fetchModelCatalog: async (ep: HubEndpoint) => {
+        catalogPorts.push(ep.port);
+        return [];
+      },
+      fetchGeneratorMetadata: async () => [],
+    };
+
+    const service = new MonitorService({
+      localReader: {
+        read: async () => ({ summaries: [], callsById: new Map(), lastConversationId: null }),
+        flushCache: async () => {},
+        clearMemoryCache: () => {},
+      } as any,
+      hubClient: mockHubClient,
+      discoverEndpoints: async () => endpoints,
+      workspacePaths: ['/w'],
+    });
+
+    await service.refreshQuotaNow();
+    endpoints = [first];
+    await service.refreshNow();
+
+    assert.deepStrictEqual(catalogPorts, [first.port], 'stale quota endpoint falls back to endpoints[0]');
+    assert.strictEqual(service.getState().hubPort, first.port);
+    service.dispose();
+  });
 });

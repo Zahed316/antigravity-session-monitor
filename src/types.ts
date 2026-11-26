@@ -93,6 +93,8 @@ export interface QuotaSnapshot {
   cooldownUntilMs?: number;
   rateLimited?: boolean;
   error?: string;
+  // Set when the latest poll found no online hub and an older snapshot is shown instead.
+  isStale?: boolean;
 }
 
 export interface TokenBreakdownGroup {

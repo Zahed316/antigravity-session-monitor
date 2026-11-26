@@ -116,6 +116,7 @@ function createQuota(partial: Partial<QuotaSnapshot> = {}): QuotaSnapshot {
     status: partial.status ?? 'online',
     source: partial.source ?? 'summary',
     fetchedAt: partial.fetchedAt ?? Date.now(),
+    isStale: partial.isStale,
     pools: partial.pools ?? {
       gemini: {
         key: 'gemini',
@@ -299,6 +300,41 @@ test('buildStatusBarViewModel: quota text and warning/error thresholds', () => {
   state.quota.pools.gemini.fiveHour!.isExhausted = true;
   const vmCrit = buildStatusBarViewModel(state, DEFAULT_CONFIG);
   assert.equal(vmCrit.color, 'error');
+});
+
+test('status bar marks quota stale with a clock glyph and keeps the numbers', () => {
+  const state = createState({ quota: createQuota({ isStale: true }) });
+  const fresh = createState({ quota: createQuota() });
+  const vm = buildStatusBarViewModel(state, DEFAULT_CONFIG);
+  const expected = buildStatusBarViewModel(fresh, DEFAULT_CONFIG).text.replace(' · G ', ' · $(clock) G ');
+  assert.strictEqual(vm.text, expected);
+  assert.match(vm.text, /\$\(clock\) G 85% · C 40%$/);
+  assert.match(vm.tooltipMarkdown, /stale/i);
+});
+
+test('status bar and panel render <1% for a sub-1% window instead of 0%', () => {
+  const quota = createQuota();
+  quota.pools.gemini.fiveHour = {
+    ...quota.pools.gemini.fiveHour!,
+    remainingPct: 0,
+    remainingFraction: 0.004,
+    isReady: true,
+  };
+  const state = createState({ quota });
+
+  assert.match(buildStatusBarViewModel(state, DEFAULT_CONFIG).text, /G <1%/);
+  assert.match(buildStatusBarViewModel(state, DEFAULT_CONFIG).tooltipMarkdown, /<1% \(Ready/);
+  assert.match(renderBottomPanelHtml(state, 'n', 'csp'), /&lt;1% <span class="countdown">\(Ready\)/);
+});
+
+test('panel notes stale quota with the last fetch time above the grid', () => {
+  const fetchedAt = new Date('2026-11-26T10:00:00Z').getTime();
+  const state = createState({ quota: createQuota({ isStale: true, fetchedAt }) });
+  const html = renderBottomPanelHtml(state, 'n', 'csp');
+  const lastFetched = new Date(fetchedAt).toLocaleTimeString();
+  assert.match(html, /class="section-hint">Stale — last fetched /);
+  assert.ok(html.includes(`Stale — last fetched ${lastFetched}`));
+  assert.match(html, /class="quota-grid"/);
 });
 
 test('buildStatusBarViewModel: minimal tooltip includes model, subagent model summary, and quota pools without escaping backticks', () => {

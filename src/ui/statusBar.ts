@@ -86,6 +86,11 @@ export function formatResetCountdown(resetTime: string | null, isReady: boolean,
   return `Resets in ${mins}m`;
 }
 
+export function formatRemainingPct(remainingPct: number, remainingFraction: number): string {
+  // A live window can hold a sliver under 1%: "0%" would read as exhausted while it still resets.
+  return remainingFraction > 0 && Math.round(remainingPct) === 0 ? '<1%' : `${Math.round(remainingPct)}%`;
+}
+
 export function formatResetDateTime(resetTime: string | null): string | null {
   if (!resetTime) return null;
   const ms = Date.parse(resetTime);
@@ -158,14 +163,14 @@ function buildCompactQuotaPart(state: MonitorState): {
   const pcts: number[] = [];
 
   if (gWin) {
-    segments.push(`G ${Math.round(gWin.remainingPct)}%`);
+    segments.push(`G ${formatRemainingPct(gWin.remainingPct, gWin.remainingFraction)}`);
     pcts.push(gWin.remainingPct);
   } else {
     segments.push('G --%');
   }
 
   if (cWin) {
-    segments.push(`C ${Math.round(cWin.remainingPct)}%`);
+    segments.push(`C ${formatRemainingPct(cWin.remainingPct, cWin.remainingFraction)}`);
     pcts.push(cWin.remainingPct);
   } else {
     segments.push('C --%');
@@ -178,7 +183,8 @@ function buildCompactQuotaPart(state: MonitorState): {
     else if (min <= 20) color = 'warning';
   }
 
-  return { text: segments.join(' · '), color };
+  // Clock glyph flags a kept-but-old snapshot; the tooltip and panel carry the word "stale".
+  return { text: state.quota.isStale ? `$(clock) ${segments.join(' · ')}` : segments.join(' · '), color };
 }
 
 export function buildStatusBarViewModel(state: MonitorState, config: MonitorConfig): StatusBarViewModel {
@@ -287,6 +293,12 @@ export function buildStatusBarViewModel(state: MonitorState, config: MonitorConf
   lines.push('---');
 
   if (state.quota.status === 'online') {
+    if (state.quota.isStale) {
+      lines.push(
+        `> Quota data is stale — last fetched ${new Date(state.quota.fetchedAt).toLocaleTimeString()}`,
+      );
+      lines.push('');
+    }
     lines.push('| Pool | 5-Hour | Weekly |');
     lines.push('| :--- | :--- | :--- |');
     const fmtWindow = (w: QuotaWindow | null) => {
@@ -294,7 +306,7 @@ export function buildStatusBarViewModel(state: MonitorState, config: MonitorConf
       const countdown = formatResetCountdown(w.resetTime, w.isReady, w.isExhausted);
       const resetDate = formatResetDateTime(w.resetTime);
       const datePart = resetDate ? ` · ${resetDate}` : '';
-      return `${Math.round(w.remainingPct)}% (${countdown}${datePart})`;
+      return `${formatRemainingPct(w.remainingPct, w.remainingFraction)} (${countdown}${datePart})`;
     };
 
     const poolOrder: Array<{ key: PoolKey; fallbackName: string }> = [

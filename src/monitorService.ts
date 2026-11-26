@@ -381,15 +381,21 @@ export class MonitorService {
     // Matched by snapshot identity, so endpoint order never has to line up with result order.
     const winner = results.find((r) => r.snapshot === selected) ?? null;
 
-    // Only an online result replaces the snapshot; an all-offline poll keeps the last good one.
-    this.quotaEndpoint = winner && winner.snapshot.status === 'online' ? winner.endpoint : null;
+    // Only an online result replaces the snapshot; an all-offline poll keeps the last good one,
+    // flagged stale so the UI never presents a frozen number as live.
     if (winner && winner.snapshot.status === 'online') {
+      this.quotaEndpoint = winner.endpoint;
       this.lastGoodQuota = winner.snapshot;
       this.state.quota = winner.snapshot;
       this.state.hubStatus = 'connected';
       this.state.hubPort = winner.endpoint.port;
       this.state.hubSource = winner.endpoint.source;
       this.state.lastUpdatedAt = this.now();
+    } else {
+      this.quotaEndpoint = null;
+      if (this.lastGoodQuota) {
+        this.state.quota = { ...this.lastGoodQuota, isStale: true };
+      }
     }
 
     // Emitted on every path so the UI still hears about all-offline and no-endpoint polls.
@@ -460,8 +466,11 @@ export class MonitorService {
       if (endpoints.length > 0) {
         // Review Focus #1: Trajectory fallthrough across candidate endpoints
         rpcSummaries = await this.hubClient.fetchTrajectories(endpoints);
-        // Telemetry RPCs follow the hub that last answered quota, not a possibly dead endpoints[0].
-        activeEndpoint = this.quotaEndpoint ?? endpoints[0];
+        // Telemetry RPCs follow the hub that last answered quota, not a possibly dead endpoints[0],
+        // but only while that hub is still listed: discovery drops exited hubs.
+        const quotaHub = this.quotaEndpoint;
+        activeEndpoint =
+          endpoints.find((e) => e.host === quotaHub?.host && e.port === quotaHub.port) ?? endpoints[0];
       }
 
       this.discoveredEndpoints = endpoints;
