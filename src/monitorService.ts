@@ -394,7 +394,8 @@ export class MonitorService {
     } else {
       this.quotaEndpoint = null;
       if (this.lastGoodQuota) {
-        this.state.quota = { ...this.lastGoodQuota, isStale: true };
+        // structuredClone: the published stale snapshot must not share pools with the cache.
+        this.state.quota = { ...structuredClone(this.lastGoodQuota), isStale: true };
       }
     }
 

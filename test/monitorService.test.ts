@@ -851,8 +851,14 @@ describe('MonitorService Orchestrator', () => {
   });
   it('11. an unreachable hub keeps the last good quota flagged stale', async () => {
     let online = true;
+    let geminiPct = 85;
     const mockHubClient: any = {
-      fetchQuota: async () => createMockQuota(online ? 'online' : 'offline'),
+      fetchQuota: async () => {
+        const quota = createMockQuota(online ? 'online' : 'offline');
+        quota.pools.gemini.fiveHour!.remainingPct = geminiPct;
+        quota.pools.gemini.fiveHour!.remainingFraction = geminiPct / 100;
+        return quota;
+      },
       fetchTrajectories: async () => new Map(),
       fetchGeneratorMetadata: async () => [],
     };
@@ -884,6 +890,23 @@ describe('MonitorService Orchestrator', () => {
     assert.strictEqual(q.status, 'online', 'last good snapshot is kept');
     assert.strictEqual(q.isStale, true);
     assert.strictEqual(q.pools.gemini.fiveHour?.remainingPct, 85, 'numbers are not zeroed');
+
+    // A consumer mutating the published snapshot must not poison the cached good one.
+    q.pools.gemini.fiveHour!.remainingPct = 1;
+    await service.refreshQuotaNow();
+    assert.strictEqual(
+      service.getState().quota.pools.gemini.fiveHour?.remainingPct,
+      85,
+      'last good snapshot is not shared with the published one',
+    );
+
+    // Recovery: a hub that answers again clears the flag and publishes current numbers.
+    online = true;
+    geminiPct = 40;
+    await service.refreshQuotaNow();
+    const recovered = service.getState().quota;
+    assert.ok(!recovered.isStale, 'a recovered hub clears the stale flag');
+    assert.strictEqual(recovered.pools.gemini.fiveHour?.remainingPct, 40, 'recovered numbers are current');
     service.dispose();
   });
 

@@ -13,7 +13,13 @@ import type {
   SessionNode,
   WindowTokenEstimate,
 } from '../types.ts';
-import { formatCompactTokens, formatRemainingPct, formatResetCountdown, formatResetDateTime } from './statusBar.ts';
+import {
+  formatCompactTokens,
+  formatRemainingPct,
+  formatResetCountdown,
+  formatResetDateTime,
+  formatStaleSince,
+} from './statusBar.ts';
 
 export interface PanelUiState {
   activeTab?: PanelTabId;
@@ -300,7 +306,7 @@ function renderQuotaWindowRow(label: string, w: QuotaWindow | null): string {
   }
   const pct = clampPct(w.remainingPct);
   const sev = pctSeverityClass(w.remainingPct);
-  const pctLabel = formatRemainingPct(w.remainingPct, w.remainingFraction);
+  const pctLabel = formatRemainingPct(w);
   const countdown = formatResetCountdown(w.resetTime, w.isReady, w.isExhausted);
   const resetDateStr = formatResetDateTime(w.resetTime);
   const resetTitle = resetDateStr ? `Next reset: ${resetDateStr} (${countdown})` : countdown;
@@ -649,11 +655,14 @@ export function renderBottomPanelBodyHtml(state: MonitorState, uiState?: PanelUi
 
   // Quota Overview Section
   const quota = state.quota;
+  // "online with numbers to render" — a stale snapshot still has real numbers worth showing.
   const quotaOnline = quota.status === 'online';
+  const quotaBadge = quota.isStale ? 'Stale' : quotaOnline ? 'Online' : escapeHtml(quota.status);
+  const quotaBadgeStyle = quota.isStale ? 'warn' : quotaOnline ? 'online' : 'offline';
 
   const quotaContentHtml = quotaOnline
     ? `
-      ${quota.isStale ? `<div class="section-hint">Stale — last fetched ${escapeHtml(new Date(quota.fetchedAt).toLocaleTimeString())}</div>` : ''}
+      ${quota.isStale ? `<div class="section-hint">Stale — last successful fetch ${escapeHtml(formatStaleSince(quota.fetchedAt))}</div>` : ''}
       <div class="quota-grid">
         ${renderQuotaCard(quota.pools.gemini, 'Gemini Models')}
         ${renderQuotaCard(quota.pools.nonGoogle, 'Claude & GPT')}
@@ -946,7 +955,7 @@ export function renderBottomPanelBodyHtml(state: MonitorState, uiState?: PanelUi
       <button class="btn-ghost" data-action="toggleScope">
         ${isCurrentScope ? 'Scope: Current Workspace' : 'Scope: All Workspaces'}
       </button>
-      <span class="status-indicator ${quotaOnline ? 'online' : 'offline'}">● ${quotaOnline ? 'Online' : escapeHtml(quota.status)}</span>
+      <span class="status-indicator ${quotaBadgeStyle}">● ${quotaBadge}</span>
       <button class="btn-sm" data-action="refresh">Refresh</button>
     </div>
   </div>
@@ -1056,6 +1065,7 @@ export function renderBottomPanelHtml(
       gap: 8px;
     }
     .status-indicator.online { color: var(--ok); font-weight: 500; }
+    .status-indicator.warn { color: var(--warn); font-weight: 500; }
     .status-indicator.offline { color: var(--err); font-weight: 500; }
 
     .alert-banner {

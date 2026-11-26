@@ -86,9 +86,19 @@ export function formatResetCountdown(resetTime: string | null, isReady: boolean,
   return `Resets in ${mins}m`;
 }
 
-export function formatRemainingPct(remainingPct: number, remainingFraction: number): string {
+export function formatRemainingPct(w: QuotaWindow): string {
+  // isExhausted wins: a stray fraction must never soften an exhausted window into "<1%".
+  if (w.isExhausted) return '0%';
   // A live window can hold a sliver under 1%: "0%" would read as exhausted while it still resets.
-  return remainingFraction > 0 && Math.round(remainingPct) === 0 ? '<1%' : `${Math.round(remainingPct)}%`;
+  return w.remainingFraction > 0 && Math.round(w.remainingPct) === 0 ? '<1%' : `${Math.round(w.remainingPct)}%`;
+}
+
+/** Time of the last successful fetch, with the date once the snapshot is over half a day old. */
+export function formatStaleSince(fetchedAt: number, nowMs = Date.now()): string {
+  const date = new Date(fetchedAt);
+  return nowMs - fetchedAt > 12 * 3_600_000
+    ? (formatResetDateTime(date.toISOString()) ?? date.toLocaleTimeString())
+    : date.toLocaleTimeString();
 }
 
 export function formatResetDateTime(resetTime: string | null): string | null {
@@ -163,14 +173,14 @@ function buildCompactQuotaPart(state: MonitorState): {
   const pcts: number[] = [];
 
   if (gWin) {
-    segments.push(`G ${formatRemainingPct(gWin.remainingPct, gWin.remainingFraction)}`);
+    segments.push(`G ${formatRemainingPct(gWin)}`);
     pcts.push(gWin.remainingPct);
   } else {
     segments.push('G --%');
   }
 
   if (cWin) {
-    segments.push(`C ${formatRemainingPct(cWin.remainingPct, cWin.remainingFraction)}`);
+    segments.push(`C ${formatRemainingPct(cWin)}`);
     pcts.push(cWin.remainingPct);
   } else {
     segments.push('C --%');
@@ -295,7 +305,7 @@ export function buildStatusBarViewModel(state: MonitorState, config: MonitorConf
   if (state.quota.status === 'online') {
     if (state.quota.isStale) {
       lines.push(
-        `> Quota data is stale — last fetched ${new Date(state.quota.fetchedAt).toLocaleTimeString()}`,
+        `> Quota data is stale — last successful fetch ${formatStaleSince(state.quota.fetchedAt)}`,
       );
       lines.push('');
     }
@@ -306,7 +316,7 @@ export function buildStatusBarViewModel(state: MonitorState, config: MonitorConf
       const countdown = formatResetCountdown(w.resetTime, w.isReady, w.isExhausted);
       const resetDate = formatResetDateTime(w.resetTime);
       const datePart = resetDate ? ` · ${resetDate}` : '';
-      return `${formatRemainingPct(w.remainingPct, w.remainingFraction)} (${countdown}${datePart})`;
+      return `${formatRemainingPct(w)} (${countdown}${datePart})`;
     };
 
     const poolOrder: Array<{ key: PoolKey; fallbackName: string }> = [

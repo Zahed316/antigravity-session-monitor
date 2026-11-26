@@ -319,6 +319,7 @@ test('status bar and panel render <1% for a sub-1% window instead of 0%', () => 
     remainingPct: 0,
     remainingFraction: 0.004,
     isReady: true,
+    isExhausted: false,
   };
   const state = createState({ quota });
 
@@ -327,14 +328,55 @@ test('status bar and panel render <1% for a sub-1% window instead of 0%', () => 
   assert.match(renderBottomPanelHtml(state, 'n', 'csp'), /&lt;1% <span class="countdown">\(Ready\)/);
 });
 
-test('panel notes stale quota with the last fetch time above the grid', () => {
+test('status bar and panel render 0% for an exhausted window even with a stray fraction', () => {
+  const quota = createQuota();
+  quota.pools.gemini.fiveHour = {
+    ...quota.pools.gemini.fiveHour!,
+    remainingPct: 0,
+    remainingFraction: 0.004,
+    isExhausted: true,
+  };
+  const state = createState({ quota });
+
+  assert.match(buildStatusBarViewModel(state, DEFAULT_CONFIG).text, /G 0%/);
+  assert.ok(!buildStatusBarViewModel(state, DEFAULT_CONFIG).text.includes('<1%'));
+  assert.ok(!renderBottomPanelHtml(state, 'n', 'csp').includes('&lt;1%'));
+});
+
+test('panel notes stale quota with the last successful fetch above the grid', () => {
   const fetchedAt = new Date('2026-11-26T10:00:00Z').getTime();
   const state = createState({ quota: createQuota({ isStale: true, fetchedAt }) });
   const html = renderBottomPanelHtml(state, 'n', 'csp');
   const lastFetched = new Date(fetchedAt).toLocaleTimeString();
-  assert.match(html, /class="section-hint">Stale — last fetched /);
-  assert.ok(html.includes(`Stale — last fetched ${lastFetched}`));
+  assert.match(html, /class="section-hint">Stale — last successful fetch /);
+  assert.ok(html.includes(`Stale — last successful fetch ${lastFetched}`));
   assert.match(html, /class="quota-grid"/);
+});
+
+test('panel badge reads Stale, not Online, for a kept stale snapshot', () => {
+  const stale = renderBottomPanelHtml(createState({ quota: createQuota({ isStale: true }) }), 'n', 'csp');
+  const fresh = renderBottomPanelHtml(createState({ quota: createQuota() }), 'n', 'csp');
+
+  assert.match(stale, /<span class="status-indicator warn">● Stale<\/span>/);
+  assert.ok(!/status-indicator (online|offline)">● Online/.test(stale), 'stale quota must not claim Online');
+  assert.match(fresh, /<span class="status-indicator online">● Online<\/span>/);
+});
+
+test('stale quota older than 12h shows the fetch date, a fresh one shows only the time', () => {
+  const now = Date.now();
+  const old = buildStatusBarViewModel(
+    createState({ quota: createQuota({ isStale: true, fetchedAt: now - 26 * 3_600_000 }) }),
+    DEFAULT_CONFIG,
+  ).tooltipMarkdown;
+  const recentFetchedAt = now - 3_600_000;
+  const recent = buildStatusBarViewModel(
+    createState({ quota: createQuota({ isStale: true, fetchedAt: recentFetchedAt }) }),
+    DEFAULT_CONFIG,
+  ).tooltipMarkdown;
+
+  assert.match(old, /last successful fetch \w{3} \d{1,2}, \d{2}:\d{2}/);
+  assert.ok(!old.includes(`last successful fetch ${new Date(now - 26 * 3_600_000).toLocaleTimeString()}`));
+  assert.ok(recent.includes(`last successful fetch ${new Date(recentFetchedAt).toLocaleTimeString()}`));
 });
 
 test('buildStatusBarViewModel: minimal tooltip includes model, subagent model summary, and quota pools without escaping backticks', () => {
