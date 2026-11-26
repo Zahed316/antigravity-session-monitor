@@ -236,7 +236,11 @@ describe('MonitorService Orchestrator', () => {
     assert.strictEqual(quotaCalls.length, 0, 'telemetry refresh does not poll quota');
     assert.strictEqual(trajectoryCalls.length, 1, 'fetchTrajectories called once');
     await service.refreshQuotaNow();
-    assert.strictEqual(quotaCalls.length, 1, 'refreshQuotaNow polls quota once');
+    assert.deepStrictEqual(
+      quotaCalls.map((ep) => ep.port),
+      [candidate1.port, candidate2.port],
+      'refreshQuotaNow polls every candidate hub once to rank freshness',
+    );
 
     // Verify selective fetchGeneratorMetadata
     const polledIds = new Set(generatorCalls.map((g) => g.cascadeId));
@@ -719,6 +723,48 @@ describe('MonitorService Orchestrator', () => {
 
     assert.deepStrictEqual(catalogPorts, [live.port], 'model catalog fetched from the quota-answering hub');
     assert.strictEqual(service.getState().hubPort, live.port);
+
+    service.dispose();
+  });
+
+  it('9. refreshQuotaNow picks the hub with the freshest window, not the first online one', async () => {
+    const mockLocalReader: any = {
+      read: async () => ({ summaries: [], callsById: new Map(), lastConversationId: null }),
+      flushCache: async () => {},
+      clearMemoryCache: () => {},
+    };
+    const lagging: HubEndpoint = { port: 45019, csrfToken: 'a', host: '127.0.0.1', source: 'exports' };
+    const current: HubEndpoint = { port: 42643, csrfToken: 'b', host: '127.0.0.1', source: 'process' };
+    const withReset = (resetTime: string): QuotaSnapshot => {
+      const quota = createMockQuota('online');
+      quota.pools.gemini.fiveHour!.resetTime = resetTime;
+      quota.pools.gemini.fiveHour!.remainingPct = 0;
+      quota.pools.gemini.fiveHour!.remainingFraction = 0;
+      quota.pools.gemini.fiveHour!.isExhausted = true;
+      quota.pools.gemini.fiveHour!.isReady = false;
+      return quota;
+    };
+    const mockHubClient: any = {
+      // Lagging hub is listed first and reports an old, already-reset window.
+      fetchQuota: async (ep: HubEndpoint) =>
+        withReset(ep.port === lagging.port ? '2026-11-26T14:15:42Z' : '2026-11-26T19:25:51Z'),
+      fetchTrajectories: async () => new Map(),
+      fetchGeneratorMetadata: async () => [],
+    };
+
+    const service = new MonitorService({
+      localReader: mockLocalReader,
+      hubClient: mockHubClient,
+      discoverEndpoints: async () => [lagging, current],
+      workspacePaths: ['/w'],
+      config: { ...DEFAULT_CONFIG },
+    });
+
+    await service.refreshQuotaNow();
+
+    assert.strictEqual(service.getState().hubPort, current.port, 'fresher hub selected');
+    assert.strictEqual(service.getState().hubSource, 'process');
+    assert.strictEqual(service.getState().quota.pools.gemini.fiveHour?.resetTime, '2026-11-26T19:25:51Z');
 
     service.dispose();
   });

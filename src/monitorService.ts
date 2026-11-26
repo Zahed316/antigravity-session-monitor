@@ -8,6 +8,7 @@ import { buildSessionTree } from './core/sessionTree.ts';
 import { resolveActiveSession } from './core/sessionResolver.ts';
 import { buildModelCatalogIndex, inferModelPool } from './core/modelResolver.ts';
 import { QuotaEstimator } from './core/quotaEstimator.ts';
+import { selectFreshQuota } from './core/quotaFreshness.ts';
 import {
   DEFAULT_CONFIG,
   type CallUsagePoint,
@@ -351,32 +352,28 @@ export class MonitorService {
         this.discoveredEndpoints = endpoints;
       }
 
-      // Prefer the first online endpoint returning quota; Task 2 replaces this with freshness ranking.
-      let onlineEndpoint: HubEndpoint | null = null;
-      let onlineQuota: QuotaSnapshot | null = null;
+      // Every hub answers, but a lagging hub serves its own cached window, so rank all of them.
+      const results: Array<{ endpoint: HubEndpoint; snapshot: QuotaSnapshot }> = [];
       for (const ep of endpoints) {
-        let quota: QuotaSnapshot;
         try {
-          quota = await this.hubClient.fetchQuota(ep, this.now());
+          results.push({ endpoint: ep, snapshot: await this.hubClient.fetchQuota(ep, this.now()) });
         } catch {
-          continue;
+          // Discovery can list a hub that already exited; skip it.
         }
-        if (quota.status !== 'online') {
-          continue;
-        }
-        onlineEndpoint = ep;
-        onlineQuota = quota;
-        break;
       }
 
+      const selected = selectFreshQuota(results.map((r) => r.snapshot));
+      // Matched by snapshot identity, so endpoint order never has to line up with result order.
+      const winner = results.find((r) => r.snapshot === selected) ?? null;
+
       // Only an online result replaces the snapshot; an all-offline poll keeps the last good one.
-      this.quotaEndpoint = onlineEndpoint;
-      if (onlineQuota && onlineEndpoint) {
-        this.lastGoodQuota = onlineQuota;
-        this.state.quota = onlineQuota;
+      this.quotaEndpoint = winner && winner.snapshot.status === 'online' ? winner.endpoint : null;
+      if (winner && winner.snapshot.status === 'online') {
+        this.lastGoodQuota = winner.snapshot;
+        this.state.quota = winner.snapshot;
         this.state.hubStatus = 'connected';
-        this.state.hubPort = onlineEndpoint.port;
-        this.state.hubSource = onlineEndpoint.source;
+        this.state.hubPort = winner.endpoint.port;
+        this.state.hubSource = winner.endpoint.source;
         this.state.lastUpdatedAt = this.now();
       }
 
