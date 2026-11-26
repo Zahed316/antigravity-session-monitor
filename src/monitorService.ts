@@ -139,6 +139,7 @@ export class MonitorService {
   private discoveredEndpoints: HubEndpoint[] = [];
   private quotaEndpoint: HubEndpoint | null = null;
   private lastGoodQuota: QuotaSnapshot | null = null;
+  private quotaSeq = 0;
   private quotaInFlightPromise: Promise<void> | null = null;
   private watchers: Array<{ close(): void }> = [];
 
@@ -386,6 +387,7 @@ export class MonitorService {
 
     // Only an online result replaces the snapshot; an all-offline poll keeps the last good one,
     // flagged stale so the UI never presents a frozen number as live.
+    this.quotaSeq++;
     if (winner && winner.snapshot.status === 'online') {
       this.quotaEndpoint = winner.endpoint;
       this.lastGoodQuota = winner.snapshot;
@@ -464,6 +466,8 @@ export class MonitorService {
 
       // 3. Trajectories on the telemetry cadence; quota keeps whatever the quota poll last found.
       const quotaSnapshot = this.state.quota.status === 'online' ? this.state.quota : buildOfflineQuota(now);
+      // A quota poll landing during the awaits below must win over this cycle's capture.
+      const quotaSeqAtCapture = this.quotaSeq;
       let rpcSummaries: Map<string, any> | null = null;
       let activeEndpoint: HubEndpoint | null = null;
 
@@ -663,12 +667,14 @@ export class MonitorService {
         pinMissing,
         lastConversationId: localSnapshot.lastConversationId,
         artifactHintId: this.artifactHintId,
-        quota: quotaSnapshot,
+        // A quota poll that landed during the awaits above already published fresher quota
+        // and hub fields; splicing this cycle's pre-await capture back would revert them.
+        quota: this.quotaSeq !== quotaSeqAtCapture ? this.state.quota : quotaSnapshot,
         modelCatalog: this.modelCatalog,
         modelEstimates,
-        hubStatus,
-        hubPort: activeEndpoint?.port ?? null,
-        hubSource: activeEndpoint?.source ?? null,
+        hubStatus: this.quotaSeq !== quotaSeqAtCapture ? this.state.hubStatus : hubStatus,
+        hubPort: this.quotaSeq !== quotaSeqAtCapture ? this.state.hubPort : (activeEndpoint?.port ?? null),
+        hubSource: this.quotaSeq !== quotaSeqAtCapture ? this.state.hubSource : (activeEndpoint?.source ?? null),
         sqliteBackend: backend,
         lastUpdatedAt: this.now(),
         isRefreshing: false,

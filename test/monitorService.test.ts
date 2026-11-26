@@ -772,6 +772,72 @@ describe('MonitorService Orchestrator', () => {
     service.dispose();
   });
 
+  it('13. a quota poll landing mid-telemetry is not reverted by the telemetry commit', async () => {
+    // performRefresh captures quota before awaiting the RPCs. A quota poll that lands during
+    // that window must survive the telemetry commit, not be spliced back over.
+    const readReleases: Array<() => void> = [];
+    let quotaValue = 0.85;
+    const mockLocalReader: any = {
+      read: async () => {
+        await new Promise<void>((res) => readReleases.push(res));
+        return { summaries: [], callsById: new Map(), lastConversationId: null };
+      },
+      flushCache: async () => {},
+      clearMemoryCache: () => {},
+    };
+    let holdTrajectories: (() => void) | null = null;
+    const mockHubClient: any = {
+      fetchQuota: async () => {
+        const q = createMockQuota('online');
+        q.pools.gemini.fiveHour!.remainingFraction = quotaValue;
+        q.pools.gemini.fiveHour!.remainingPct = Math.round(quotaValue * 100);
+        return q;
+      },
+      // Telemetry parks here so a quota poll can land mid-refresh.
+      fetchTrajectories: async () =>
+        new Promise((res) => {
+          holdTrajectories = () => res(new Map());
+        }),
+      fetchGeneratorMetadata: async () => [],
+    };
+
+    const service = new MonitorService({
+      localReader: mockLocalReader,
+      hubClient: mockHubClient,
+      discoverEndpoints: async () => [{ port: 1, csrfToken: 't', host: '127.0.0.1', source: 'process' }],
+      workspacePaths: ['/w'],
+      timerFactory: {
+        setTimeout: (fn: any, ms?: number) => setTimeout(fn, ms),
+        clearTimeout: (id: any) => clearTimeout(id),
+        setInterval: () => 1,
+        clearInterval: () => {},
+      },
+      watchFactory: () => ({ close() {} }),
+    });
+
+    void service.start();
+    await new Promise((r) => setTimeout(r, 10));
+    readReleases.shift()!();
+    // start()'s refresh is now parked inside fetchTrajectories, quota already at 0.85.
+    await new Promise((r) => setTimeout(r, 10));
+    assert.strictEqual(service.getState().quota.pools.gemini.fiveHour?.remainingPct, 85);
+
+    quotaValue = 0.4;
+    await service.refreshQuotaNow();
+    assert.strictEqual(service.getState().quota.pools.gemini.fiveHour?.remainingPct, 40, 'quota poll published');
+
+    // Let the parked telemetry pass finish and commit its state.
+    holdTrajectories!();
+    await new Promise((r) => setTimeout(r, 20));
+    assert.strictEqual(
+      service.getState().quota.pools.gemini.fiveHour?.remainingPct,
+      40,
+      'telemetry commit must not revert the fresher quota poll',
+    );
+
+    service.dispose();
+  });
+
   it('10. refreshNow publishes quota before the heavy telemetry read finishes', async () => {
     // read() blocks once per call: a queue of resolvers so each held read can be released separately.
     const readReleases: Array<() => void> = [];

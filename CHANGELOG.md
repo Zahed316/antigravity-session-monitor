@@ -4,6 +4,13 @@ All notable changes to GravityWatch for Antigravity will be documented in this f
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.6] - 2026-11-26
+
+### Fixed
+
+- Quota is fetched at activation instead of waiting a full `quotaRefreshIntervalMs` for the first tick, so the status bar is populated immediately after a window reload.
+- A quota poll landing while the heavier telemetry pass is in flight is no longer overwritten when that pass commits its state.
+
 ## [0.1.5] - 2026-11-26
 
 ### Fixed
