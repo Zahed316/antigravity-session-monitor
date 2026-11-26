@@ -136,6 +136,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     onUnpinSession: () => void monitorService?.unpinSession(),
     onToggleScope: () => void monitorService?.toggleScope(),
     onRefresh: () => void monitorService?.refreshNow(true),
+    // Coming back from the terminal: pull fresh quota before the panel repaints.
+    onViewVisible: () => void monitorService?.refreshQuotaNow(),
     initialLayout: initialPanelLayout as any,
     onLayoutChange: (layout) => {
       void context.globalState.update('antigravityMonitor.panelLayout.v1', layout);

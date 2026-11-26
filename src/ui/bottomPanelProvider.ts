@@ -86,6 +86,8 @@ export interface BottomPanelCallbacks {
   onUnpinSession: () => void;
   onToggleScope: () => void;
   onRefresh: () => void;
+  /** Called when a hidden view becomes visible again: the cached state is stale by then. */
+  onViewVisible?: () => void;
   initialLayout?: Partial<PanelLayoutState>;
   onLayoutChange?: (layout: PanelLayoutState) => void;
 }
@@ -205,7 +207,10 @@ export class BottomPanelController {
       return;
     }
 
+    // Repaint from the cached state immediately, then fetch: updates that arrived while the
+    // view was hidden were dropped, so the cache can be a whole interval old.
     this.pushCurrentBody();
+    this.callbacks.onViewVisible?.();
   }
 
   private renderFullHtml(): void {
@@ -235,7 +240,10 @@ export class BottomPanelController {
         this.expandedIds.add(message.sessionId);
       }
       this.pushCurrentBody();
-    } else if (message.type === 'toggleListExpand' && (message.list === 'sessions' || message.list === 'unattached')) {
+    } else if (
+      message.type === 'toggleListExpand' &&
+      (message.list === 'sessions' || message.list === 'unattached' || message.list === 'forecast')
+    ) {
       const key = message.list;
       if (this.expandedLists.has(key)) this.expandedLists.delete(key);
       else this.expandedLists.add(key);

@@ -9,6 +9,7 @@ import {
   type QuotaSnapshot,
   type SessionMetrics,
   type SessionNode,
+  type ModelTokenEstimate,
 } from '../src/types.ts';
 import {
   formatCompactTokens,
@@ -932,17 +933,26 @@ function manyRoots(count: number, prefix = 'Root'): SessionNode[] {
 }
 
 function sectionHtml(bodyHtml: string, id: string): string {
-  const start = bodyHtml.indexOf(`data-section-id="${id}"`);
-  assert.notEqual(start, -1, `section ${id} renders`);
-  const next = bodyHtml.indexOf('class="section-card', start + 1);
-  return bodyHtml.slice(start, next === -1 ? undefined : next);
+  // Anchor on the outer card tag. `data-section-id` also appears in each header, and the
+  // forecast body renders its own nested .section-card, so delimit by card boundaries only.
+  const at = bodyHtml.indexOf(`data-section-id="${id}" data-tab-id="`);
+  assert.notEqual(at, -1, `section ${id} renders`);
+  const cardStart = bodyHtml.lastIndexOf('<div class="section-card', at);
+  // Skip this card's own drag attribute, then find the next card's tag.
+  const ownDrag = bodyHtml.indexOf('data-drag-type="section"', at);
+  const nextDrag = bodyHtml.indexOf('data-drag-type="section"', ownDrag + 1);
+  const nextCardStart = nextDrag === -1 ? bodyHtml.length : bodyHtml.lastIndexOf('<div class="section-card', nextDrag);
+  // The last overview card is followed by the Details tab, which has its own tables.
+  const detailsStart = bodyHtml.indexOf('data-tab-view="details"');
+  const end = detailsStart === -1 ? nextCardStart : Math.min(nextCardStart, detailsStart);
+  return bodyHtml.slice(cardStart, end);
 }
 
 function countSessionRows(html: string): number {
   return (html.match(/class="session-row[ "]/g) ?? []).length;
 }
 
-test('renderBottomPanelBodyHtml: sessions list caps at 5 recent roots with a Show all toggle', () => {
+test('renderBottomPanelBodyHtml: sessions list caps at 5 recent roots with a More toggle', () => {
   const roots = manyRoots(7);
   const state = createState({ roots, selectedSession: roots[0], activeSession: roots[0] });
 
@@ -952,13 +962,13 @@ test('renderBottomPanelBodyHtml: sessions list caps at 5 recent roots with a Sho
   assert.equal(countSessionRows(sessions), 5, 'collapsed sessions list renders exactly 5 rows');
   assert.match(sessions, /Sessions \(7\)/, 'section title still shows the total count');
   assert.match(sessions, /data-action="toggleListExpand" data-list="sessions"/);
-  assert.match(sessions, />Show all 7</);
+  assert.match(sessions, />More \(7\)</);
   assert.ok(sessions.includes('Root 1'), 'newest root kept');
   assert.ok(!sessions.includes('Root 6'), '6th root hidden when collapsed');
   assert.ok(!sessions.includes('Root 7'), '7th root hidden when collapsed');
 });
 
-test('renderBottomPanelBodyHtml: expandedLists sessions renders all roots with a Show fewer toggle', () => {
+test('renderBottomPanelBodyHtml: expandedLists sessions renders all roots with a Less toggle', () => {
   const roots = manyRoots(7);
   const state = createState({ roots, selectedSession: roots[0], activeSession: roots[0] });
 
@@ -967,8 +977,8 @@ test('renderBottomPanelBodyHtml: expandedLists sessions renders all roots with a
   assert.equal(countSessionRows(sessions), 7, 'expanded sessions list renders every root');
   assert.ok(sessions.includes('Root 6') && sessions.includes('Root 7'));
   assert.match(sessions, /data-action="toggleListExpand" data-list="sessions"/);
-  assert.match(sessions, />Show fewer</);
-  assert.ok(!sessions.includes('Show all 7'));
+  assert.match(sessions, />Less</);
+  assert.ok(!sessions.includes('More (7)'), 'expanded list shows Less, not More');
 });
 
 test('renderBottomPanelBodyHtml: unattached subagents cap independently of the sessions toggle', () => {
@@ -981,7 +991,7 @@ test('renderBottomPanelBodyHtml: unattached subagents cap independently of the s
   const collapsedUnattached = sectionHtml(collapsed, 'unattached');
   assert.equal(countSessionRows(collapsedUnattached), 5, 'collapsed unattached list renders exactly 5 rows');
   assert.match(collapsedUnattached, /data-action="toggleListExpand" data-list="unattached"/);
-  assert.match(collapsedUnattached, />Show all 6</);
+  assert.match(collapsedUnattached, />More \(6\)</);
   assert.ok(!collapsedUnattached.includes('Loose 6'), '6th unattached hidden when collapsed');
 
   // Expanding sessions must not expand unattached.
@@ -989,13 +999,64 @@ test('renderBottomPanelBodyHtml: unattached subagents cap independently of the s
   assert.equal(countSessionRows(sectionHtml(sessionsOnly, 'sessions')), 7);
   const sessionsOnlyUnattached = sectionHtml(sessionsOnly, 'unattached');
   assert.equal(countSessionRows(sessionsOnlyUnattached), 5, 'unattached stays capped');
-  assert.match(sessionsOnlyUnattached, />Show all 6</);
+  assert.match(sessionsOnlyUnattached, />More \(6\)</);
 
   // And the reverse.
   const unattachedOnly = renderBottomPanelBodyHtml(state, { expandedLists: ['unattached'] });
   assert.equal(countSessionRows(sectionHtml(unattachedOnly, 'sessions')), 5, 'sessions stays capped');
   assert.equal(countSessionRows(sectionHtml(unattachedOnly, 'unattached')), 6);
-  assert.match(sectionHtml(unattachedOnly, 'unattached'), />Show fewer</);
+  assert.match(sectionHtml(unattachedOnly, 'unattached'), />Less</);
+});
+
+function manyEstimates(count: number): ModelTokenEstimate[] {
+  return Array.from({ length: count }, (_, i) => ({
+    modelLabel: `Model ${i + 1}`,
+    poolKey: 'gemini' as const,
+    fiveHour: {
+      status: 'calibrated' as const,
+      estimatedTotalTokens: 100_000 - i * 1000,
+      estimatedBilledTokens: 50_000 - i * 500,
+      tokensPerPctTotal: 5_000,
+      tokensPerPctBilled: 2_500,
+      windowUsedTotal: 10_000,
+      windowUsedBilled: 5_000,
+      sampleCount: 3,
+    },
+    weekly: null,
+  }));
+}
+
+test('renderBottomPanelBodyHtml: forecast caps at 5 models with a More toggle', () => {
+  const estimates = manyEstimates(8);
+  const state = createState({ modelEstimates: estimates });
+
+  const collapsed = sectionHtml(renderBottomPanelBodyHtml(state), 'forecast');
+  assert.equal((collapsed.match(/<tr>/g) ?? []).length, 6, 'header row plus 5 model rows');
+  assert.match(collapsed, /data-action="toggleListExpand" data-list="forecast"/);
+  assert.match(collapsed, />More \(8\)</);
+  assert.ok(collapsed.includes('Model 5'), 'top 5 kept');
+  assert.ok(!collapsed.includes('Model 6'), '6th model hidden when collapsed');
+
+  const expanded = sectionHtml(renderBottomPanelBodyHtml(state, { expandedLists: ['forecast'] }), 'forecast');
+  assert.equal((expanded.match(/<tr>/g) ?? []).length, 9, 'header row plus all 8 model rows');
+  assert.match(expanded, />Less</);
+  assert.ok(expanded.includes('Model 8'), 'last model visible when expanded');
+});
+
+test('renderBottomPanelBodyHtml: a pinned session outside the newest 5 stays visible', () => {
+  const roots = manyRoots(8);
+  // Pin the oldest: it is not in the newest 5 and would normally be sliced away.
+  const state = createState({
+    roots,
+    pinnedSessionId: roots[7].id,
+    activeSession: roots[0],
+    selectedSession: roots[0],
+  });
+
+  const sessions = sectionHtml(renderBottomPanelBodyHtml(state), 'sessions');
+  assert.equal(countSessionRows(sessions), 6, 'newest 5 plus the pinned outsider');
+  assert.ok(sessions.includes('Root 8'), 'pinned session rendered despite being oldest');
+  assert.ok(!sessions.includes('Root 7'), 'non-pinned outsider still hidden');
 });
 
 test('sanitizePanelLayout: default overview order puts sessions immediately after quota', () => {
@@ -1007,6 +1068,47 @@ test('sanitizePanelLayout: default overview order puts sessions immediately afte
 // ============================================================================
 // 4. BottomPanelController & Provider Tests
 // ============================================================================
+
+test('BottomPanelController: becoming visible refreshes an out-of-date quota instead of repainting it', () => {
+  // Switching away to the terminal and back must not show the quota as it was when the
+  // view was hidden: hidden updates are dropped, so the cached state is the old one.
+  let visibilityListener: (() => void) | null = null;
+  const mockView: WebviewViewLike = {
+    visible: true,
+    webview: {
+      html: '',
+      postMessage: () => true,
+      onDidReceiveMessage: () => ({ dispose() {} }),
+      cspSource: 'vscode-webview:',
+    } as any,
+    onDidChangeVisibility(cb: () => void) {
+      visibilityListener = cb;
+      return { dispose() {} };
+    },
+    onDidDispose: () => ({ dispose() {} }),
+  };
+
+  let visibleRefreshes = 0;
+  const ctrl = new BottomPanelController({
+    onSelectSession: () => {},
+    onPinSession: () => {},
+    onUnpinSession: () => {},
+    onToggleScope: () => {},
+    onRefresh: () => {},
+    onViewVisible: () => {
+      visibleRefreshes++;
+    },
+  });
+  ctrl.setView(mockView);
+  ctrl.update(createState());
+
+  mockView.visible = false;
+  visibilityListener!();
+  mockView.visible = true;
+  visibilityListener!();
+
+  assert.equal(visibleRefreshes, 1, 'showing the panel asks for a fresh quota fetch');
+});
 
 test('BottomPanelController: gates setHtml and postMessage on view.visible, renders on show', () => {
   let htmlSetCount = 0;

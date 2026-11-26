@@ -4,6 +4,18 @@ All notable changes to GravityWatch for Antigravity will be documented in this f
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.8] - 2026-11-26
+
+### Fixed
+
+- Switching away to the terminal and back no longer repaints an old quota reading. Hiding the panel drops state updates, so the panel could show whatever the quota was when you left. It now fetches fresh quota when the view becomes visible.
+
+### Changed
+
+- Model Usage Forecast shows the 5 most-used models with a `More (N)` / `Less` toggle. It is ordered by calibration then token volume, not recency.
+- List toggles are worded `More (N)` / `Less` everywhere; the Sessions and Unattached Subagents lists drop the older `Show all N` / `Show fewer` wording.
+- A pinned or active entry is never hidden by a list cap.
+
 ## [0.1.7] - 2026-11-26
 
 ### Changed

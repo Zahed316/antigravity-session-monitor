@@ -355,7 +355,14 @@ function poolDisplayLabel(poolKey: PoolKey): string {
   return 'Claude & GPT';
 }
 
-function renderModelForecastSection(estimates: ModelTokenEstimate[] | undefined, isHelpOpen = false): string {
+// Shortcut: fixed preview size, no per-list config; make it a setting if users ask.
+const LIST_PREVIEW_LIMIT = 5;
+
+function renderModelForecastSection(
+  estimates: ModelTokenEstimate[] | undefined,
+  isHelpOpen = false,
+  expandedListSet?: ReadonlySet<string>,
+): string {
   if (!estimates || estimates.length === 0) {
     return `
       <div class="section-card">
@@ -372,7 +379,17 @@ function renderModelForecastSection(estimates: ModelTokenEstimate[] | undefined,
     `;
   }
 
-  const rows = estimates
+  // Already ordered calibrated-first then by token volume, so the first rows are the most used.
+  const isExpanded = expandedListSet?.has('forecast') === true;
+  const visibleEstimates = isExpanded ? estimates : estimates.slice(0, LIST_PREVIEW_LIMIT);
+  const forecastToggle =
+    estimates.length > LIST_PREVIEW_LIMIT
+      ? `<button class="btn-ghost list-toggle" data-action="toggleListExpand" data-list="forecast">${
+          isExpanded ? 'Less' : escapeHtml(`More (${estimates.length})`)
+        }</button>`
+      : '';
+
+  const rows = visibleEstimates
     .map(
       (item) => `
       <tr>
@@ -408,6 +425,7 @@ function renderModelForecastSection(estimates: ModelTokenEstimate[] | undefined,
           <tbody>${rows}</tbody>
         </table>
       </div>
+      ${forecastToggle}
     </div>
   `;
 }
@@ -648,14 +666,17 @@ export function renderBottomPanelBodyHtml(state: MonitorState, uiState?: PanelUi
       .join('');
   }
 
-  // Shortcut: fixed 5-row preview, no per-window config; make it a setting when users ask.
-  const LIST_PREVIEW_LIMIT = 5;
   function renderCappedList(nodes: SessionNode[], listKey: 'sessions' | 'unattached', depth = 0): string {
     const isExpanded = expandedListSet.has(listKey);
-    const visible = isExpanded ? nodes : nodes.slice(0, LIST_PREVIEW_LIMIT);
+    // A pinned or active row that falls outside the newest N must stay visible: a pin that
+    // silently vanishes from the preview reads as a bug.
+    const pinned = nodes.filter((n) => n.id === state.pinnedSessionId || n.id === (state.activeSession?.id ?? ''));
+    const recent = nodes.slice(0, LIST_PREVIEW_LIMIT);
+    const kept = [...recent, ...pinned.filter((n) => !recent.includes(n))];
+    const visible = isExpanded ? nodes : kept;
     const rowsHtml = renderSessionRows(visible, depth);
     if (nodes.length <= LIST_PREVIEW_LIMIT) return rowsHtml;
-    const label = isExpanded ? 'Show fewer' : escapeHtml(`Show all ${nodes.length}`);
+    const label = isExpanded ? 'Less' : escapeHtml(`More (${nodes.length})`);
     return `${rowsHtml}<button class="btn-ghost list-toggle" data-action="toggleListExpand" data-list="${listKey}">${label}</button>`;
   }
 
@@ -914,7 +935,7 @@ export function renderBottomPanelBodyHtml(state: MonitorState, uiState?: PanelUi
       title: 'Model Usage Forecast',
       hint: 'Estimated remaining tokens per model',
       helpId: 'model-forecast',
-      bodyHtml: renderModelForecastSection(state.modelEstimates, isHelpOpen('model-forecast')),
+      bodyHtml: renderModelForecastSection(state.modelEstimates, isHelpOpen('model-forecast'), expandedListSet),
     }),
     sessions: renderSectionWindow({
       id: 'sessions',
