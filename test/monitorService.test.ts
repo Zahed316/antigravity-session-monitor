@@ -823,18 +823,20 @@ describe('MonitorService Orchestrator', () => {
     readReleases.shift()!();
     await new Promise((r) => setTimeout(r, 10));
 
-    // Automatic refreshes (start, timers, watch events) leave quota to the quota timer.
-    assert.strictEqual(quotaFetchCount, 0, 'refreshNow without forceRescan does not poll quota');
+    // start() polled quota once itself; from here on, automatic refreshes (timers,
+    // watch events) leave quota to the quota timer.
+    const afterStart = quotaFetchCount;
+    assert.strictEqual(afterStart, 1, 'start() polls quota once instead of waiting for the first tick');
 
     // Now hold the heavy path open and ask for a manual refresh.
     const heavy = service.refreshNow();
     await new Promise((r) => setTimeout(r, 10));
-    assert.strictEqual(quotaFetchCount, 0, 'coalesced refresh without forceRescan does not poll quota');
+    assert.strictEqual(quotaFetchCount, afterStart, 'coalesced refresh without forceRescan does not poll quota');
 
     quotaValue = 0.4;
     const manual = service.refreshNow(true);
     await new Promise((r) => setTimeout(r, 10));
-    assert.strictEqual(quotaFetchCount, 1, 'manual refresh polls quota');
+    assert.strictEqual(quotaFetchCount, afterStart + 1, 'manual refresh polls quota');
 
     // Quota must already be on screen although read() is still blocked.
     assert.ok(published.includes(0.4), 'quota published while heavy refresh is blocked');

@@ -198,6 +198,9 @@ export class MonitorService {
     this.initWatchers();
     this.resetPollingTimer();
     this.resetQuotaPollingTimer();
+    // Startup polls quota itself: the first timer tick is a whole interval away, and
+    // refreshNow() below is unforced so it would leave quota blank until then.
+    await this.refreshQuotaNow();
     await this.refreshNow();
   }
 
