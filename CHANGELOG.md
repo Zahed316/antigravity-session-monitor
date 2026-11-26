@@ -4,6 +4,13 @@ All notable changes to GravityWatch for Antigravity will be documented in this f
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.7] - 2026-11-26
+
+### Changed
+
+- The Sessions and Unattached Subagents sections show the 5 most recently used entries, with a `Show all N` / `Show fewer` toggle. Both toggles are independent.
+- Overview order now puts Sessions directly under the quota pools; Model Usage Forecast moves below it. An existing saved panel layout keeps its own order.
+
 ## [0.1.6] - 2026-11-26
 
 ### Fixed
