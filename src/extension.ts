@@ -138,6 +138,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     onRefresh: () => void monitorService?.refreshNow(true),
     // Coming back from the terminal: pull fresh quota before the panel repaints.
     onViewVisible: () => void monitorService?.refreshQuotaNow(),
+    // Every setting is native to VS Code; the panel only links to the settings UI.
+    onOpenSettings: () => {
+      void vscode.commands.executeCommand('workbench.action.openSettings', '@ext:Zahed-r.antigravity-session-monitor');
+    },
     initialLayout: initialPanelLayout as any,
     onLayoutChange: (layout) => {
       void context.globalState.update('antigravityMonitor.panelLayout.v1', layout);
@@ -293,6 +297,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   context.subscriptions.push(
     vscode.commands.registerCommand('antigravityMonitor.refresh', async () => {
       await monitorService?.refreshNow(true);
+    }),
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('antigravityMonitor.resetPanelLayout', async () => {
+      panelProvider.controller.resetLayout();
+      await vscode.window.showInformationMessage('GravityWatch: panel layout reset to defaults.');
     }),
   );
 

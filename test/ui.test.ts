@@ -9,6 +9,7 @@ import {
   type QuotaSnapshot,
   type SessionMetrics,
   type SessionNode,
+  type PanelLayoutState,
   type ModelTokenEstimate,
 } from '../src/types.ts';
 import {
@@ -1069,6 +1070,66 @@ test('sanitizePanelLayout: default overview order puts sessions immediately afte
 // 4. BottomPanelController & Provider Tests
 // ============================================================================
 
+test('renderBottomPanelBodyHtml: the top bar exposes a settings button that posts openSettings', () => {
+  const html = renderBottomPanelBodyHtml(createState());
+  assert.match(html, /data-action="openSettings"/, 'settings affordance present');
+  assert.match(html, /aria-label="Extension settings"/);
+  // The click handler ships in the document script, not the body fragment: check the full page.
+  const page = renderBottomPanelHtml(createState(), 'nonce', 'vscode-webview:');
+  assert.match(page, /vscode\.postMessage\(\{ type: 'openSettings' \}\)/, 'button is wired to a message, not a dead link');
+});
+
+test('BottomPanelController: settings button and layout reset reach their callbacks', () => {
+  let msgListener: ((msg: any) => void) | null = null;
+  let settingsOpened = 0;
+  let savedLayout: PanelLayoutState | null = null;
+  const mockView: WebviewViewLike = {
+    visible: true,
+    webview: {
+      html: '',
+      postMessage: () => true,
+      onDidReceiveMessage: (cb: (msg: any) => void) => {
+        msgListener = cb;
+        return { dispose() {} };
+      },
+      cspSource: 'vscode-webview:',
+    } as any,
+    onDidChangeVisibility: () => ({ dispose() {} }),
+    onDidDispose: () => ({ dispose() {} }),
+  };
+
+  const ctrl = new BottomPanelController({
+    onSelectSession: () => {},
+    onPinSession: () => {},
+    onUnpinSession: () => {},
+    onToggleScope: () => {},
+    onRefresh: () => {},
+    onOpenSettings: () => {
+      settingsOpened++;
+    },
+    initialLayout: { sectionOrder: { overview: ['sessions', 'quota', 'forecast', 'unattached'] } } as any,
+    onLayoutChange: (layout) => {
+      savedLayout = layout;
+    },
+  });
+  ctrl.setView(mockView);
+  ctrl.update(createState());
+
+  msgListener!({ type: 'openSettings' });
+  assert.equal(settingsOpened, 1, 'settings message reaches the extension');
+
+  // A dragged order must survive until an explicit reset.
+  assert.deepEqual(ctrl.getLayout().sectionOrder.overview, ['sessions', 'quota', 'forecast', 'unattached']);
+
+  ctrl.resetLayout();
+  assert.deepEqual(
+    ctrl.getLayout().sectionOrder.overview,
+    ['quota', 'sessions', 'forecast', 'unattached'],
+    'reset restores the default order',
+  );
+  assert.deepEqual(savedLayout!.sectionOrder.overview, ['quota', 'sessions', 'forecast', 'unattached'], 'reset is persisted');
+});
+
 test('BottomPanelController: becoming visible refreshes an out-of-date quota instead of repainting it', () => {
   // Switching away to the terminal and back must not show the quota as it was when the
   // view was hidden: hidden updates are dropped, so the cached state is the old one.
@@ -1095,6 +1156,7 @@ test('BottomPanelController: becoming visible refreshes an out-of-date quota ins
     onUnpinSession: () => {},
     onToggleScope: () => {},
     onRefresh: () => {},
+    onOpenSettings: () => {},
     onViewVisible: () => {
       visibleRefreshes++;
     },
@@ -1153,6 +1215,7 @@ test('BottomPanelController: gates setHtml and postMessage on view.visible, rend
     onUnpinSession: () => {},
     onToggleScope: () => {},
     onRefresh: () => {},
+    onOpenSettings: () => {},
   };
 
   const ctrl = new BottomPanelController(callbacks);
@@ -1248,6 +1311,7 @@ test('BottomPanelController: collapse/expand and reorder tabs and sections with 
     onUnpinSession: () => {},
     onToggleScope: () => {},
     onRefresh: () => {},
+    onOpenSettings: () => {},
     onLayoutChange: (layout) => {
       savedLayout = layout;
     },

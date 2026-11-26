@@ -1,10 +1,10 @@
 {
   "name": "antigravity-session-monitor",
   "displayName": "GravityWatch for Antigravity",
-  "description": "GravityWatch — read-only live status bar and bottom panel for Antigravity session context windows, subagent token rollups, and 5h/weekly quota pools.",
+  "description": "GravityWatch \u2014 read-only live status bar and bottom panel for Antigravity session context windows, subagent token rollups, and 5h/weekly quota pools.",
   "icon": "logo.png",
   "publisher": "Zahed-r",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "license": "MIT",
   "engines": {
     "vscode": "^1.99.0"
@@ -33,7 +33,7 @@
   },
   "badges": [
     {
-      "url": "https://img.shields.io/badge/VS_Code_Marketplace-v0.1.8-007ACC?logo=visualstudiocode",
+      "url": "https://img.shields.io/badge/VS_Code_Marketplace-v0.1.9-007ACC?logo=visualstudiocode",
       "href": "https://marketplace.visualstudio.com/items?itemName=Zahed-r.antigravity-session-monitor",
       "description": "Marketplace version"
     },
@@ -112,6 +112,11 @@
         "title": "Refresh Telemetry",
         "category": "Antigravity Monitor",
         "icon": "$(refresh)"
+      },
+      {
+        "command": "antigravityMonitor.resetPanelLayout",
+        "title": "Reset Panel Layout",
+        "category": "GravityWatch"
       }
     ],
     "configuration": {

@@ -4,6 +4,17 @@ All notable changes to GravityWatch for Antigravity will be documented in this f
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.9] - 2026-11-26
+
+### Added
+
+- A settings button (`⚙`) in the panel's top bar opens the VS Code settings filtered to this extension. Every setting stays native to VS Code, so there is one source of truth and no second validation layer.
+- `GravityWatch: Reset Panel Layout` command restores the default tab and section order after dragging.
+
+### Changed
+
+- The reset is persisted immediately, so a reset survives a window reload.
+
 ## [0.1.8] - 2026-11-26
 
 ### Fixed

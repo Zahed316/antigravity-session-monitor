@@ -989,6 +989,7 @@ export function renderBottomPanelBodyHtml(state: MonitorState, uiState?: PanelUi
       </button>
       <span class="status-indicator ${quotaBadgeStyle}">● ${quotaBadge}</span>
       <button class="btn-sm" data-action="refresh">Refresh</button>
+      <button class="btn-ghost" data-action="openSettings" title="Extension settings" aria-label="Extension settings">⚙</button>
     </div>
   </div>
 
@@ -1759,6 +1760,9 @@ export function renderBottomPanelHtml(
         if (list) {
           vscode.postMessage({ type: 'toggleListExpand', list });
         }
+      } else if (action === 'openSettings') {
+        event.stopPropagation();
+        vscode.postMessage({ type: 'openSettings' });
       } else if ((action === 'pinSession' || action === 'unpinSession')) {
         event.stopPropagation();
         if (action === 'pinSession' && sessionId) {

@@ -86,6 +86,7 @@ export interface BottomPanelCallbacks {
   onUnpinSession: () => void;
   onToggleScope: () => void;
   onRefresh: () => void;
+  onOpenSettings: () => void;
   /** Called when a hidden view becomes visible again: the cached state is stale by then. */
   onViewVisible?: () => void;
   initialLayout?: Partial<PanelLayoutState>;
@@ -127,6 +128,11 @@ export class BottomPanelController {
 
   public getLayout(): PanelLayoutState {
     return this.layout;
+  }
+
+  /** Restore the default tab and section order, discarding the user's saved arrangement. */
+  public resetLayout(): void {
+    this.updateLayout(sanitizePanelLayout(undefined));
   }
 
   public getUiState(): PanelUiState {
@@ -306,6 +312,8 @@ export class BottomPanelController {
       this.callbacks.onUnpinSession();
     } else if (message.type === 'toggleScope') {
       this.callbacks.onToggleScope();
+    } else if (message.type === 'openSettings') {
+      this.callbacks.onOpenSettings();
     } else if (message.type === 'refresh') {
       this.callbacks.onRefresh();
     }
