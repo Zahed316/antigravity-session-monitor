@@ -133,7 +133,10 @@ export class MonitorService {
   private started = false;
 
   private pollingTimer: any = null;
+  private quotaTimer: any = null;
   private watchDebounceTimer: any = null;
+  private discoveredEndpoints: HubEndpoint[] = [];
+  private lastGoodQuota: QuotaSnapshot | null = null;
   private watchers: Array<{ close(): void }> = [];
 
   private inFlight: Promise<void> | null = null;
@@ -191,6 +194,7 @@ export class MonitorService {
     await this.quotaEstimator.load();
     this.initWatchers();
     this.resetPollingTimer();
+    this.resetQuotaPollingTimer();
     await this.refreshNow();
   }
 
@@ -204,11 +208,13 @@ export class MonitorService {
     }
     this.isWindowFocused = focused;
     this.resetPollingTimer();
+    this.resetQuotaPollingTimer();
   }
 
   public updateConfig(config: MonitorConfig): void {
     this.config = { ...config };
     this.resetPollingTimer();
+    this.resetQuotaPollingTimer();
   }
 
   public setWorkspacePaths(paths: string[]): void {
@@ -301,6 +307,67 @@ export class MonitorService {
     }, intervalMs);
   }
 
+  private resetQuotaPollingTimer(): void {
+    if (this.quotaTimer !== null) {
+      this.timerFactory.clearInterval(this.quotaTimer);
+      this.quotaTimer = null;
+    }
+
+    if (!this.started || this.disposed) {
+      return;
+    }
+
+    // Multiplier 0 pauses quota polling while unfocused: no timer registered at all.
+    if (!this.isWindowFocused && this.config.quotaUnfocusedMultiplier === 0) {
+      return;
+    }
+
+    const intervalMs = this.isWindowFocused
+      ? this.config.quotaRefreshIntervalMs
+      : this.config.quotaRefreshIntervalMs * this.config.quotaUnfocusedMultiplier;
+
+    this.quotaTimer = this.timerFactory.setInterval(() => {
+      void this.refreshQuotaNow();
+    }, intervalMs);
+  }
+
+  public async refreshQuotaNow(): Promise<void> {
+    if (this.disposed) {
+      return;
+    }
+
+    let endpoints = this.discoveredEndpoints;
+    if (endpoints.length === 0) {
+      try {
+        endpoints = await this.discoverEndpoints({ workspacePaths: this.workspacePaths });
+      } catch {
+        endpoints = [];
+      }
+      this.discoveredEndpoints = endpoints;
+    }
+
+    // Prefer the first online endpoint returning quota; Task 2 replaces this with freshness ranking.
+    for (const ep of endpoints) {
+      let quota: QuotaSnapshot;
+      try {
+        quota = await this.hubClient.fetchQuota(ep, this.now());
+      } catch {
+        continue;
+      }
+      if (quota.status !== 'online') {
+        continue;
+      }
+      this.lastGoodQuota = quota;
+      this.state.quota = quota;
+      this.state.hubStatus = 'connected';
+      this.state.hubPort = ep.port;
+      this.state.hubSource = ep.source;
+      this.state.lastUpdatedAt = this.now();
+      this.onDidUpdateState?.(this.state);
+      break;
+    }
+  }
+
   private initWatchers(): void {
     const targets = [this.antigravityRoot, path.join(this.antigravityRoot, 'conversations')];
 
@@ -357,33 +424,18 @@ export class MonitorService {
         endpoints = [];
       }
 
-      // 3. Quota and Trajectories with fallthrough
-      let quotaSnapshot = buildOfflineQuota(now);
+      // 3. Trajectories on the telemetry cadence; quota keeps whatever the quota poll last found.
+      const quotaSnapshot = this.state.quota.status === 'online' ? this.state.quota : buildOfflineQuota(now);
       let rpcSummaries: Map<string, any> | null = null;
       let activeEndpoint: HubEndpoint | null = null;
 
       if (endpoints.length > 0) {
         // Review Focus #1: Trajectory fallthrough across candidate endpoints
         rpcSummaries = await this.hubClient.fetchTrajectories(endpoints);
-
-        // Review Focus #1: Prefer first online endpoint returning valid quota
-        for (const ep of endpoints) {
-          try {
-            const q = await this.hubClient.fetchQuota(ep, now);
-            if (q.status === 'online') {
-              quotaSnapshot = q;
-              activeEndpoint = ep;
-              break;
-            }
-          } catch {
-            // Fall through to next candidate
-          }
-        }
-
-        if (!activeEndpoint && endpoints.length > 0) {
-          activeEndpoint = endpoints[0];
-        }
+        activeEndpoint = endpoints[0];
       }
+
+      this.discoveredEndpoints = endpoints;
 
       const hubStatus =
         endpoints.length === 0
@@ -637,6 +689,11 @@ export class MonitorService {
     if (this.pollingTimer !== null) {
       this.timerFactory.clearInterval(this.pollingTimer);
       this.pollingTimer = null;
+    }
+
+    if (this.quotaTimer !== null) {
+      this.timerFactory.clearInterval(this.quotaTimer);
+      this.quotaTimer = null;
     }
 
     if (this.watchDebounceTimer !== null) {

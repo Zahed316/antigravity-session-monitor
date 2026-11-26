@@ -232,9 +232,11 @@ describe('MonitorService Orchestrator', () => {
 
     await service.refreshNow();
 
-    // Verify quota & trajectories polled once per cycle
-    assert.strictEqual(quotaCalls.length, 1, 'fetchQuota called once');
+    // Verify quota & trajectories polling: quota polls on its own cadence, trajectories with telemetry
+    assert.strictEqual(quotaCalls.length, 0, 'telemetry refresh does not poll quota');
     assert.strictEqual(trajectoryCalls.length, 1, 'fetchTrajectories called once');
+    await service.refreshQuotaNow();
+    assert.strictEqual(quotaCalls.length, 1, 'refreshQuotaNow polls quota once');
 
     // Verify selective fetchGeneratorMetadata
     const polledIds = new Set(generatorCalls.map((g) => g.cascadeId));
@@ -329,6 +331,8 @@ describe('MonitorService Orchestrator', () => {
   });
 
   it('3. Focus cadence (10s focused -> 30s unfocused), serialized inFlight coalescing, and clean disposal', async () => {
+    const QUOTA_INTERVAL_MS = 45_000;
+    const quotaMs = new Set([QUOTA_INTERVAL_MS, QUOTA_INTERVAL_MS * DEFAULT_CONFIG.quotaUnfocusedMultiplier]);
     let timerInterval: number | null = null;
     let timerCleared = false;
     let timerIdCounter = 1;
@@ -337,7 +341,10 @@ describe('MonitorService Orchestrator', () => {
       setTimeout: (fn: any, ms?: number) => setTimeout(fn, ms),
       clearTimeout: (id: any) => clearTimeout(id),
       setInterval: (_fn: any, ms?: number) => {
-        timerInterval = ms ?? null;
+        // Quota polls on its own timer; label the telemetry timer by its distinct cadence.
+        if (!quotaMs.has(ms as number)) {
+          timerInterval = ms ?? null;
+        }
         return timerIdCounter++ as any;
       },
       clearInterval: (_id: any) => {
@@ -389,6 +396,7 @@ describe('MonitorService Orchestrator', () => {
         ...DEFAULT_CONFIG,
         refreshIntervalMs: 10_000,
         unfocusedRefreshIntervalMs: 30_000,
+        quotaRefreshIntervalMs: QUOTA_INTERVAL_MS,
       },
       timerFactory: fakeTimers,
       watchFactory: fakeWatchFactory,
@@ -435,7 +443,85 @@ describe('MonitorService Orchestrator', () => {
     assert.strictEqual(watchClosed, true, 'Watchers closed on dispose');
   });
 
-  it('4. selectForPanel triggers refreshNow immediately when service is started', async () => {
+  it('4. Quota polls on its own cadence (focused, multiplied unfocused, paused at multiplier 0)', async () => {
+    // Cadence values are all distinct so the active timer can be identified by its
+    // interval, not by registration order (updateConfig re-registers only quota).
+    const active = new Map<number, { ms: number | undefined; fn: () => void }>();
+    let nextId = 1;
+
+    const fakeTimers = {
+      setTimeout: (fn: any, ms?: number) => setTimeout(fn, ms),
+      clearTimeout: (id: any) => clearTimeout(id),
+      setInterval: (fn: any, ms?: number) => {
+        const id = nextId++;
+        active.set(id, { ms, fn });
+        return id as any;
+      },
+      clearInterval: (id: any) => {
+        active.delete(id);
+      },
+    };
+
+    const quotaIntervals = () => [...active.values()].filter((t) => t.ms === 30_000 || t.ms === 60_000);
+    const telemetryIntervals = () => [...active.values()].filter((t) => t.ms === 10_000 || t.ms === 20_000);
+
+    let quotaCalls = 0;
+    const mockHubClient: any = {
+      fetchQuota: async () => {
+        quotaCalls++;
+        return createMockQuota('online');
+      },
+      fetchTrajectories: async () => new Map(),
+      fetchGeneratorMetadata: async () => [],
+    };
+    const mockLocalReader: any = {
+      read: async () => ({ summaries: [], callsById: new Map(), lastConversationId: null }),
+      flushCache: async () => {},
+      clearMemoryCache: () => {},
+    };
+
+    const makeConfig = (multiplier: number): MonitorConfig => ({
+      ...DEFAULT_CONFIG,
+      refreshIntervalMs: 10_000,
+      unfocusedRefreshIntervalMs: 20_000,
+      quotaRefreshIntervalMs: 30_000,
+      quotaUnfocusedMultiplier: multiplier,
+    });
+
+    const service = new MonitorService({
+      localReader: mockLocalReader,
+      hubClient: mockHubClient,
+      discoverEndpoints: async () => [{ port: 1, csrfToken: 't', host: '127.0.0.1', source: 'process' }],
+      workspacePaths: ['/w'],
+      config: makeConfig(2),
+      timerFactory: fakeTimers,
+      watchFactory: () => ({ close() {} }),
+    });
+
+    await service.start();
+    assert.strictEqual(telemetryIntervals().length, 1, 'telemetry timer registered');
+    assert.strictEqual(telemetryIntervals()[0].ms, 10_000);
+    assert.strictEqual(quotaIntervals().length, 1, 'quota timer registered');
+    assert.strictEqual(quotaIntervals()[0].ms, 30_000, 'focused quota cadence is quotaRefreshIntervalMs');
+
+    service.setWindowFocused(false);
+    assert.deepStrictEqual(telemetryIntervals().map((t) => t.ms), [20_000]);
+    assert.deepStrictEqual(quotaIntervals().map((t) => t.ms), [60_000], 'unfocused quota is interval * multiplier');
+
+    service.updateConfig(makeConfig(0));
+    assert.strictEqual(quotaIntervals().length, 0, 'multiplier 0 registers no quota timer while unfocused');
+    const pausedCalls = quotaCalls;
+    await new Promise((r) => setTimeout(r, 20));
+    assert.strictEqual(quotaCalls, pausedCalls, 'no quota fetch while paused despite a stale timer reference');
+
+    service.setWindowFocused(true);
+    assert.deepStrictEqual(quotaIntervals().map((t) => t.ms), [30_000], 'quota polling resumes when focused');
+
+    service.dispose();
+    service.dispose();
+  });
+
+  it('5. selectForPanel triggers refreshNow immediately when service is started', async () => {
     let refreshCount = 0;
     const mockLocalReader: any = {
       read: async () => {
@@ -478,6 +564,40 @@ describe('MonitorService Orchestrator', () => {
     service.selectForPanel(null);
     await new Promise((r) => setTimeout(r, 15));
     assert.strictEqual(refreshCount, 2, 'selectForPanel(null) did not trigger refresh');
+
+    service.dispose();
+  });
+
+  it('6. refreshQuotaNow discovers endpoints when none cached and updates hub fields', async () => {
+    const mockLocalReader: any = {
+      read: async () => ({ summaries: [], callsById: new Map(), lastConversationId: null }),
+      flushCache: async () => {},
+      clearMemoryCache: () => {},
+    };
+    let discoverCalls = 0;
+    const mockHubClient: any = {
+      fetchQuota: async () => createMockQuota('online'),
+      fetchTrajectories: async () => new Map(),
+      fetchGeneratorMetadata: async () => [],
+    };
+
+    const service = new MonitorService({
+      localReader: mockLocalReader,
+      hubClient: mockHubClient,
+      discoverEndpoints: async () => {
+        discoverCalls++;
+        return [{ port: 41001, csrfToken: 't', host: '127.0.0.1', source: 'process' }];
+      },
+      workspacePaths: ['/w'],
+      config: { ...DEFAULT_CONFIG },
+    });
+
+    await service.refreshQuotaNow();
+    assert.strictEqual(discoverCalls, 1, 'quota poll discovers endpoints when none cached');
+    assert.strictEqual(service.getState().quota.status, 'online');
+    assert.strictEqual(service.getState().hubStatus, 'connected');
+    assert.strictEqual(service.getState().hubPort, 41001);
+    assert.strictEqual(service.getState().hubSource, 'process');
 
     service.dispose();
   });
