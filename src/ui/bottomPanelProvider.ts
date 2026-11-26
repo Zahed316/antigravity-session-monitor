@@ -9,7 +9,7 @@ import type {
 import { renderBottomPanelBodyHtml, renderBottomPanelHtml, type PanelUiState } from './bottomPanelHtml.ts';
 
 const DEFAULT_TAB_ORDER: PanelTabId[] = ['overview', 'details'];
-const DEFAULT_OVERVIEW_SECTIONS: OverviewSectionId[] = ['quota', 'forecast', 'sessions', 'unattached'];
+const DEFAULT_OVERVIEW_SECTIONS: OverviewSectionId[] = ['quota', 'sessions', 'forecast', 'unattached'];
 const DEFAULT_DETAILS_SECTIONS: DetailsSectionId[] = ['sessionSummary', 'breakdown', 'subagents', 'contextChart'];
 const ALL_SECTIONS: PanelSectionId[] = [...DEFAULT_OVERVIEW_SECTIONS, ...DEFAULT_DETAILS_SECTIONS];
 
@@ -109,6 +109,7 @@ export class BottomPanelController {
   private expandedIds = new Set<string>();
   private breakdownOpen = false;
   private openHelpIds = new Set<string>();
+  private expandedLists = new Set<string>();
   private layout: PanelLayoutState;
   private lastPushedBodyHtml: string | null = null;
 
@@ -132,6 +133,7 @@ export class BottomPanelController {
       expandedIds: this.expandedIds,
       breakdownOpen: this.breakdownOpen,
       openHelpIds: this.openHelpIds,
+      expandedLists: this.expandedLists,
       layout: this.layout,
     };
   }
@@ -232,6 +234,11 @@ export class BottomPanelController {
       } else {
         this.expandedIds.add(message.sessionId);
       }
+      this.pushCurrentBody();
+    } else if (message.type === 'toggleListExpand' && (message.list === 'sessions' || message.list === 'unattached')) {
+      const key = message.list;
+      if (this.expandedLists.has(key)) this.expandedLists.delete(key);
+      else this.expandedLists.add(key);
       this.pushCurrentBody();
     } else if (message.type === 'toggleBreakdown') {
       this.breakdownOpen = typeof message.open === 'boolean' ? message.open : !this.breakdownOpen;

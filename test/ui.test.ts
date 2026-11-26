@@ -33,6 +33,7 @@ import {
 import {
   BottomPanelController,
   createBottomPanelProvider,
+  sanitizePanelLayout,
   type WebviewViewLike,
   type BottomPanelCallbacks,
 } from '../src/ui/bottomPanelProvider.ts';
@@ -921,6 +922,89 @@ test('renderBottomPanelHtml: strict CSP, XSS safety, quota strip, tree, detail c
 });
 
 // ============================================================================
+// 3b. Capped session/agent lists (5 recent + show-more toggle)
+// ============================================================================
+
+function manyRoots(count: number, prefix = 'Root'): SessionNode[] {
+  return Array.from({ length: count }, (_, i) =>
+    createNode({ id: `${prefix.toLowerCase()}-${i + 1}`, title: `${prefix} ${i + 1}` }),
+  );
+}
+
+function sectionHtml(bodyHtml: string, id: string): string {
+  const start = bodyHtml.indexOf(`data-section-id="${id}"`);
+  assert.notEqual(start, -1, `section ${id} renders`);
+  const next = bodyHtml.indexOf('class="section-card', start + 1);
+  return bodyHtml.slice(start, next === -1 ? undefined : next);
+}
+
+function countSessionRows(html: string): number {
+  return (html.match(/class="session-row[ "]/g) ?? []).length;
+}
+
+test('renderBottomPanelBodyHtml: sessions list caps at 5 recent roots with a Show all toggle', () => {
+  const roots = manyRoots(7);
+  const state = createState({ roots, selectedSession: roots[0], activeSession: roots[0] });
+
+  const bodyHtml = renderBottomPanelBodyHtml(state);
+  const sessions = sectionHtml(bodyHtml, 'sessions');
+
+  assert.equal(countSessionRows(sessions), 5, 'collapsed sessions list renders exactly 5 rows');
+  assert.match(sessions, /Sessions \(7\)/, 'section title still shows the total count');
+  assert.match(sessions, /data-action="toggleListExpand" data-list="sessions"/);
+  assert.match(sessions, />Show all 7</);
+  assert.ok(sessions.includes('Root 1'), 'newest root kept');
+  assert.ok(!sessions.includes('Root 6'), '6th root hidden when collapsed');
+  assert.ok(!sessions.includes('Root 7'), '7th root hidden when collapsed');
+});
+
+test('renderBottomPanelBodyHtml: expandedLists sessions renders all roots with a Show fewer toggle', () => {
+  const roots = manyRoots(7);
+  const state = createState({ roots, selectedSession: roots[0], activeSession: roots[0] });
+
+  const sessions = sectionHtml(renderBottomPanelBodyHtml(state, { expandedLists: ['sessions'] }), 'sessions');
+
+  assert.equal(countSessionRows(sessions), 7, 'expanded sessions list renders every root');
+  assert.ok(sessions.includes('Root 6') && sessions.includes('Root 7'));
+  assert.match(sessions, /data-action="toggleListExpand" data-list="sessions"/);
+  assert.match(sessions, />Show fewer</);
+  assert.ok(!sessions.includes('Show all 7'));
+});
+
+test('renderBottomPanelBodyHtml: unattached subagents cap independently of the sessions toggle', () => {
+  const roots = manyRoots(7);
+  const unattached = manyRoots(6, 'Loose');
+  const state = createState({ roots, unattachedSubagents: unattached, selectedSession: roots[0], activeSession: roots[0] });
+
+  const collapsed = renderBottomPanelBodyHtml(state);
+  assert.equal(countSessionRows(sectionHtml(collapsed, 'sessions')), 5);
+  const collapsedUnattached = sectionHtml(collapsed, 'unattached');
+  assert.equal(countSessionRows(collapsedUnattached), 5, 'collapsed unattached list renders exactly 5 rows');
+  assert.match(collapsedUnattached, /data-action="toggleListExpand" data-list="unattached"/);
+  assert.match(collapsedUnattached, />Show all 6</);
+  assert.ok(!collapsedUnattached.includes('Loose 6'), '6th unattached hidden when collapsed');
+
+  // Expanding sessions must not expand unattached.
+  const sessionsOnly = renderBottomPanelBodyHtml(state, { expandedLists: ['sessions'] });
+  assert.equal(countSessionRows(sectionHtml(sessionsOnly, 'sessions')), 7);
+  const sessionsOnlyUnattached = sectionHtml(sessionsOnly, 'unattached');
+  assert.equal(countSessionRows(sessionsOnlyUnattached), 5, 'unattached stays capped');
+  assert.match(sessionsOnlyUnattached, />Show all 6</);
+
+  // And the reverse.
+  const unattachedOnly = renderBottomPanelBodyHtml(state, { expandedLists: ['unattached'] });
+  assert.equal(countSessionRows(sectionHtml(unattachedOnly, 'sessions')), 5, 'sessions stays capped');
+  assert.equal(countSessionRows(sectionHtml(unattachedOnly, 'unattached')), 6);
+  assert.match(sectionHtml(unattachedOnly, 'unattached'), />Show fewer</);
+});
+
+test('sanitizePanelLayout: default overview order puts sessions immediately after quota', () => {
+  const order = sanitizePanelLayout().sectionOrder.overview;
+  assert.deepEqual(order, ['quota', 'sessions', 'forecast', 'unattached']);
+  assert.equal(order.indexOf('sessions'), order.indexOf('quota') + 1);
+});
+
+// ============================================================================
 // 4. BottomPanelController & Provider Tests
 // ============================================================================
 
@@ -1022,6 +1106,17 @@ test('BottomPanelController: gates setHtml and postMessage on view.visible, rend
   assert.deepEqual(Array.from(ctrl.getUiState().expandedIds ?? []), ['root-1']);
   messageListener!({ type: 'toggleExpand', sessionId: 'root-1' });
   assert.deepEqual(Array.from(ctrl.getUiState().expandedIds ?? []), []);
+
+  // Inbound toggleListExpand toggles expandedLists Set both ways (independent of expandedIds)
+  messageListener!({ type: 'toggleListExpand', list: 'sessions' });
+  assert.deepEqual(Array.from(ctrl.getUiState().expandedLists ?? []), ['sessions']);
+  assert.deepEqual(Array.from(ctrl.getUiState().expandedIds ?? []), [], 'list toggle does not touch expandedIds');
+  messageListener!({ type: 'toggleListExpand', list: 'unattached' });
+  assert.deepEqual(Array.from(ctrl.getUiState().expandedLists ?? []), ['sessions', 'unattached']);
+  messageListener!({ type: 'toggleListExpand', list: 'sessions' });
+  assert.deepEqual(Array.from(ctrl.getUiState().expandedLists ?? []), ['unattached']);
+  messageListener!({ type: 'toggleListExpand', list: 'bogus' });
+  assert.deepEqual(Array.from(ctrl.getUiState().expandedLists ?? []), ['unattached'], 'unknown list key ignored');
 
   // Inbound message dispatches to callback
   messageListener!({ type: 'selectSession', sessionId: 'target-123' });

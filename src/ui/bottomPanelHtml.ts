@@ -26,6 +26,7 @@ export interface PanelUiState {
   expandedIds?: ReadonlySet<string> | string[];
   breakdownOpen?: boolean;
   openHelpIds?: ReadonlySet<string> | string[];
+  expandedLists?: ReadonlySet<string> | string[];
   layout?: PanelLayoutState;
 }
 
@@ -524,11 +525,15 @@ export function renderBottomPanelBodyHtml(state: MonitorState, uiState?: PanelUi
       ? uiState.openHelpIds
       : new Set<string>(Array.isArray(uiState?.openHelpIds) ? uiState.openHelpIds : []);
   const isHelpOpen = (id: string): boolean => openHelpSet.has(id);
+  const expandedListSet =
+    uiState?.expandedLists instanceof Set
+      ? uiState.expandedLists
+      : new Set<string>(Array.isArray(uiState?.expandedLists) ? uiState.expandedLists : []);
 
   const layout: PanelLayoutState = uiState?.layout ?? {
     tabOrder: ['overview', 'details'],
     sectionOrder: {
-      overview: ['quota', 'forecast', 'sessions', 'unattached'],
+      overview: ['quota', 'sessions', 'forecast', 'unattached'],
       details: ['sessionSummary', 'breakdown', 'subagents', 'contextChart'],
     },
     collapsedTabs: [],
@@ -643,15 +648,21 @@ export function renderBottomPanelBodyHtml(state: MonitorState, uiState?: PanelUi
       .join('');
   }
 
+  // Shortcut: fixed 5-row preview, no per-window config; make it a setting when users ask.
+  const LIST_PREVIEW_LIMIT = 5;
+  function renderCappedList(nodes: SessionNode[], listKey: 'sessions' | 'unattached', depth = 0): string {
+    const isExpanded = expandedListSet.has(listKey);
+    const visible = isExpanded ? nodes : nodes.slice(0, LIST_PREVIEW_LIMIT);
+    const rowsHtml = renderSessionRows(visible, depth);
+    if (nodes.length <= LIST_PREVIEW_LIMIT) return rowsHtml;
+    const label = isExpanded ? 'Show fewer' : escapeHtml(`Show all ${nodes.length}`);
+    return `${rowsHtml}<button class="btn-ghost list-toggle" data-action="toggleListExpand" data-list="${listKey}">${label}</button>`;
+  }
+
   const sessionsHtml =
     roots.length > 0
-      ? renderSessionRows(roots)
+      ? renderCappedList(roots, 'sessions')
       : '<div class="empty-inline">No sessions match the current workspace scope.</div>';
-
-  const unattachedHtml =
-    unattached.length > 0
-      ? `<div class="sub-group-title">Unattached Subagents (${unattached.length})</div>${renderSessionRows(unattached, 1)}`
-      : '';
 
   // Quota Overview Section
   const quota = state.quota;
@@ -920,7 +931,7 @@ export function renderBottomPanelBodyHtml(state: MonitorState, uiState?: PanelUi
             tab: 'overview',
             title: `Unattached Subagents (${unattached.length})`,
             hint: 'Subagents without a detected parent',
-            bodyHtml: `<div class="session-list">${renderSessionRows(unattached, 1)}</div>`,
+            bodyHtml: `<div class="session-list">${renderCappedList(unattached, 'unattached', 1)}</div>`,
           })
         : '',
   };
@@ -1298,6 +1309,10 @@ export function renderBottomPanelHtml(
     .session-list {
       display: flex;
       flex-direction: column;
+    }
+    .list-toggle {
+      align-self: flex-start;
+      margin-top: 6px;
     }
     .session-row {
       display: flex;
@@ -1717,6 +1732,12 @@ export function renderBottomPanelHtml(
       } else if (action === 'toggleExpand' && sessionId) {
         event.stopPropagation();
         vscode.postMessage({ type: 'toggleExpand', sessionId });
+      } else if (action === 'toggleListExpand') {
+        event.stopPropagation();
+        const list = target.getAttribute('data-list');
+        if (list) {
+          vscode.postMessage({ type: 'toggleListExpand', list });
+        }
       } else if ((action === 'pinSession' || action === 'unpinSession')) {
         event.stopPropagation();
         if (action === 'pinSession' && sessionId) {
