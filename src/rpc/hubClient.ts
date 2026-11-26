@@ -80,24 +80,18 @@ function evaluateQuotaValues(
   let fraction = hasRemaining ? Number(rawFraction) : 0;
   fraction = Math.max(0, Math.min(1, fraction));
 
-  let isReady = fraction > 0;
-  let isExhausted = fraction === 0;
-
-  // Review Focus #4: resetTime <= nowMs -> clamp to 100% (Ready)
-  if (resetTimeStr !== null) {
+  // Review Focus #4: resetTime passed with no reported fraction -> the window rolled over, treat as full.
+  // An explicit remainingFraction (including 0) is authoritative; do not overwrite it.
+  if (!hasRemaining && resetTimeStr !== null) {
     const resetMs = Date.parse(resetTimeStr);
     if (!Number.isNaN(resetMs) && resetMs <= nowMs) {
       fraction = 1.0;
-      isReady = true;
-      isExhausted = false;
     }
   }
 
   const remainingPct = Math.round(fraction * 100);
-  if (remainingPct === 0) {
-    isReady = false;
-    isExhausted = true;
-  }
+  const isReady = fraction > 0;
+  const isExhausted = fraction === 0;
 
   return {
     fraction,

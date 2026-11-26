@@ -12,6 +12,7 @@ import {
 } from '../src/types.ts';
 import {
   formatCompactTokens,
+  formatResetCountdown,
   formatResetDateTime,
   buildStatusBarViewModel,
   createStatusBarController,
@@ -1023,4 +1024,9 @@ test('BottomPanelController: collapse/expand and reorder tabs and sections with 
   assert.ok(savedLayout.collapsedTabs.includes('overview'));
   const lastHtml4 = postedMessages[postedMessages.length - 1].bodyHtml as string;
   assert.match(lastHtml4, /class="tab-view hidden" data-tab-view="overview"/);
+});
+
+test('formatResetCountdown reports Exhausted for 0% with a passed resetTime, Ready only when quota is actually back', () => {
+  assert.strictEqual(formatResetCountdown('2026-11-26T14:15:42Z', false, true), 'Exhausted');
+  assert.strictEqual(formatResetCountdown(null, false, true), 'Exhausted');
 });

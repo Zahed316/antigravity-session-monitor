@@ -68,7 +68,8 @@ export function escapeMarkdown(text: string): string {
 
 export function formatResetCountdown(resetTime: string | null, isReady: boolean, isExhausted: boolean): string {
   if (isReady) return 'Ready';
-  if (!resetTime) return isExhausted ? 'Exhausted' : 'Active';
+  if (isExhausted) return 'Exhausted';
+  if (!resetTime) return 'Active';
   const diffMs = Date.parse(resetTime) - Date.now();
   if (diffMs <= 0) return 'Ready';
   const totalMin = Math.ceil(diffMs / 60_000);

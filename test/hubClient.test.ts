@@ -247,8 +247,7 @@ test('Review Focus #4: normalizeQuotaFromSummary handles 0% proto3 zero, unlimit
           {
             bucketId: 'claude-weekly',
             window: 'weekly',
-            remainingFraction: 0.0,
-            // resetTime is in the past! (resetTime <= nowMs) -> clamped to 100% Ready!
+            // remainingFraction omitted + resetTime is in the past! (resetTime <= nowMs) -> clamped to 100% Ready!
             resetTime: '2026-11-14T02:00:00Z',
           },
         ],
@@ -725,4 +724,29 @@ test('Review Focus 1B: mergeQuotaItem tie-breaker keeps the later resetTime on e
   };
   const snap2 = normalizeQuotaFromSummary(rawNoReset, nowMs);
   assert.equal(snap2.pools.gemini.fiveHour?.resetTime, '2026-11-14T13:00:00Z');
+});
+
+test('a reported 0% keeps 0% even when resetTime has passed', () => {
+  // Hub says exhausted and its resetTime already passed. Proto3 zero is ambiguous,
+  // so an explicit remainingFraction: 0 plus a resetTime is a real exhausted bucket.
+  const nowMs = Date.parse('2026-11-26T15:49:00Z');
+  const snap = normalizeQuotaFromSummary(
+    {
+      response: {
+        groups: [
+          {
+            displayName: 'Claude and GPT models',
+            buckets: [
+              { bucketId: '3p-5h', window: '5h', remainingFraction: 0, resetTime: '2026-11-26T14:15:42Z' },
+              { bucketId: '3p-weekly', window: 'weekly', remainingFraction: 0.5, resetTime: '2026-12-03T09:15:42Z' },
+            ],
+          },
+        ],
+      },
+    },
+    nowMs,
+  );
+  assert.strictEqual(snap.pools.nonGoogle.fiveHour?.remainingFraction, 0);
+  assert.strictEqual(snap.pools.nonGoogle.fiveHour?.isExhausted, true);
+  assert.strictEqual(snap.pools.nonGoogle.fiveHour?.isReady, false);
 });
