@@ -136,7 +136,9 @@ export class MonitorService {
   private quotaTimer: any = null;
   private watchDebounceTimer: any = null;
   private discoveredEndpoints: HubEndpoint[] = [];
+  private quotaEndpoint: HubEndpoint | null = null;
   private lastGoodQuota: QuotaSnapshot | null = null;
+  private quotaInFlight = false;
   private watchers: Array<{ close(): void }> = [];
 
   private inFlight: Promise<void> | null = null;
@@ -332,39 +334,56 @@ export class MonitorService {
   }
 
   public async refreshQuotaNow(): Promise<void> {
-    if (this.disposed) {
+    // Overlapping polls would double-fetch the same hubs; the next tick picks up instead.
+    if (this.disposed || this.quotaInFlight) {
       return;
     }
+    this.quotaInFlight = true;
 
-    let endpoints = this.discoveredEndpoints;
-    if (endpoints.length === 0) {
-      try {
-        endpoints = await this.discoverEndpoints({ workspacePaths: this.workspacePaths });
-      } catch {
-        endpoints = [];
+    try {
+      let endpoints = this.discoveredEndpoints;
+      if (endpoints.length === 0) {
+        try {
+          endpoints = await this.discoverEndpoints({ workspacePaths: this.workspacePaths });
+        } catch {
+          endpoints = [];
+        }
+        this.discoveredEndpoints = endpoints;
       }
-      this.discoveredEndpoints = endpoints;
-    }
 
-    // Prefer the first online endpoint returning quota; Task 2 replaces this with freshness ranking.
-    for (const ep of endpoints) {
-      let quota: QuotaSnapshot;
-      try {
-        quota = await this.hubClient.fetchQuota(ep, this.now());
-      } catch {
-        continue;
+      // Prefer the first online endpoint returning quota; Task 2 replaces this with freshness ranking.
+      let onlineEndpoint: HubEndpoint | null = null;
+      let onlineQuota: QuotaSnapshot | null = null;
+      for (const ep of endpoints) {
+        let quota: QuotaSnapshot;
+        try {
+          quota = await this.hubClient.fetchQuota(ep, this.now());
+        } catch {
+          continue;
+        }
+        if (quota.status !== 'online') {
+          continue;
+        }
+        onlineEndpoint = ep;
+        onlineQuota = quota;
+        break;
       }
-      if (quota.status !== 'online') {
-        continue;
+
+      // Only an online result replaces the snapshot; an all-offline poll keeps the last good one.
+      this.quotaEndpoint = onlineEndpoint;
+      if (onlineQuota && onlineEndpoint) {
+        this.lastGoodQuota = onlineQuota;
+        this.state.quota = onlineQuota;
+        this.state.hubStatus = 'connected';
+        this.state.hubPort = onlineEndpoint.port;
+        this.state.hubSource = onlineEndpoint.source;
+        this.state.lastUpdatedAt = this.now();
       }
-      this.lastGoodQuota = quota;
-      this.state.quota = quota;
-      this.state.hubStatus = 'connected';
-      this.state.hubPort = ep.port;
-      this.state.hubSource = ep.source;
-      this.state.lastUpdatedAt = this.now();
+
+      // Emitted on every path so the UI still hears about all-offline and no-endpoint polls.
       this.onDidUpdateState?.(this.state);
-      break;
+    } finally {
+      this.quotaInFlight = false;
     }
   }
 
@@ -432,7 +451,8 @@ export class MonitorService {
       if (endpoints.length > 0) {
         // Review Focus #1: Trajectory fallthrough across candidate endpoints
         rpcSummaries = await this.hubClient.fetchTrajectories(endpoints);
-        activeEndpoint = endpoints[0];
+        // Telemetry RPCs follow the hub that last answered quota, not a possibly dead endpoints[0].
+        activeEndpoint = this.quotaEndpoint ?? endpoints[0];
       }
 
       this.discoveredEndpoints = endpoints;
