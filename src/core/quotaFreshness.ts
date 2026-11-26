@@ -14,11 +14,12 @@ function offlineSnapshot(fetchedAt: number): QuotaSnapshot {
 }
 
 /**
- * Latest resetTime across every non-null window: a hub whose window resets later is
- * serving a newer window than one whose window already reset.
+ * Earliest resetTime across every non-null window: the bucket that rolled most
+ * recently is the earliest to reset next. Ranking by the latest instead would let a
+ * shared long window (weekly, identical on every hub) mask a lagging 5h bucket.
  */
 export function snapshotFreshnessMs(snapshot: QuotaSnapshot): number {
-  let latest = Number.NEGATIVE_INFINITY;
+  let earliest = Number.POSITIVE_INFINITY;
   for (const pool of Object.values(snapshot.pools)) {
     for (const window of [pool.fiveHour, pool.weekly]) {
       if (!window?.resetTime) {
@@ -26,11 +27,11 @@ export function snapshotFreshnessMs(snapshot: QuotaSnapshot): number {
       }
       const ms = Date.parse(window.resetTime);
       if (!Number.isNaN(ms)) {
-        latest = Math.max(latest, ms);
+        earliest = Math.min(earliest, ms);
       }
     }
   }
-  return latest;
+  return earliest === Number.POSITIVE_INFINITY ? Number.NEGATIVE_INFINITY : earliest;
 }
 
 export function selectFreshQuota(snapshots: QuotaSnapshot[]): QuotaSnapshot {

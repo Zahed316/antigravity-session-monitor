@@ -27,10 +27,10 @@ function snap(status: QuotaSnapshot['status'], gemini5h: QuotaWindow, fetchedAt 
   };
 }
 
-test('snapshotFreshnessMs returns the latest resetTime across windows, -Infinity with none', () => {
+test('snapshotFreshnessMs returns the earliest resetTime across windows, -Infinity with none', () => {
   const s = snap('online', win(0.5, '2026-11-26T17:45:44Z'));
   s.pools.nonGoogle.weekly = win(0.2, '2026-12-03T09:15:42Z');
-  assert.strictEqual(snapshotFreshnessMs(s), Date.parse('2026-12-03T09:15:42Z'));
+  assert.strictEqual(snapshotFreshnessMs(s), Date.parse('2026-11-26T17:45:44Z'));
 
   const empty = snap('online', null as any);
   empty.pools.gemini.fiveHour = null;
@@ -58,4 +58,17 @@ test('selectFreshQuota breaks resetTime ties by later fetchedAt', () => {
   const older = snap('online', win(0.9, '2026-11-26T19:25:51Z'), 1);
   const newer = snap('online', win(0.3, '2026-11-26T19:25:51Z'), 2);
   assert.strictEqual(selectFreshQuota([older, newer]), newer);
+});
+test('selectFreshQuota breaks a shared long window by the window that rolled most recently', () => {
+  // Live case, 18:19Z: both hubs report the same weekly resetTime (a long, stable
+  // window), but only the current one has rolled its 5h bucket forward. Taking the
+  // latest resetTime across windows ties them and picks whichever hub came first.
+  const sameWeekly = '2026-12-03T09:15:42Z';
+  const lagging = snap('online', win(0.0131, '2026-11-26T17:45:44Z'), 1000);
+  lagging.pools.gemini.weekly = win(0.4974, sameWeekly);
+  const current = snap('online', win(1, '2026-11-26T22:45:44Z'), 1000);
+  current.pools.gemini.weekly = win(0.4974, sameWeekly);
+
+  assert.strictEqual(selectFreshQuota([lagging, current]), current);
+  assert.strictEqual(selectFreshQuota([current, lagging]), current, 'order independent');
 });

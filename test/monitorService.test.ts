@@ -737,6 +737,9 @@ describe('MonitorService Orchestrator', () => {
     const current: HubEndpoint = { port: 42643, csrfToken: 'b', host: '127.0.0.1', source: 'process' };
     const withReset = (resetTime: string): QuotaSnapshot => {
       const quota = createMockQuota('online');
+      // Both pools roll together in reality; a stale second pool would otherwise mask
+      // the comparison by contributing an older resetTime to both hubs.
+      quota.pools.nonGoogle.fiveHour!.resetTime = resetTime;
       quota.pools.gemini.fiveHour!.resetTime = resetTime;
       quota.pools.gemini.fiveHour!.remainingPct = 0;
       quota.pools.gemini.fiveHour!.remainingFraction = 0;

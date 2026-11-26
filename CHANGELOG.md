@@ -4,6 +4,16 @@ All notable changes to GravityWatch for Antigravity will be documented in this f
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.5] - 2026-11-26
+
+### Fixed
+
+- Quota now polls on `quotaRefreshIntervalMs` (x `quotaUnfocusedMultiplier` when unfocused, paused at `0`). Previously the setting was read but never used and quota only refreshed with the telemetry loop. A manual refresh always polls.
+- With several Antigravity hubs running, a stale hub can no longer win: the snapshot whose buckets rolled most recently is selected instead of the first hub in process order, and the freshness rank no longer ties on a long shared weekly window.
+- An explicit `remainingFraction: 0` is no longer clamped to 100% when its `resetTime` has passed, and an exhausted window no longer reads "Ready".
+- The refresh button re-fetches and shows quota before the heavier session telemetry pass completes.
+- When the hub is unreachable, the last good quota stays visible and is marked stale with a clock glyph, a tooltip line, and a panel note. Windows under 1% render as `<1%`.
+
 ## [0.1.4] - 2026-11-26
 
 ### Changed
