@@ -12,6 +12,7 @@ import {
 } from '../src/types.ts';
 import {
   formatCompactTokens,
+  formatResetDateTime,
   buildStatusBarViewModel,
   createStatusBarController,
   type StatusBarVscodeLike,
@@ -135,19 +136,6 @@ function createQuota(partial: Partial<QuotaSnapshot> = {}): QuotaSnapshot {
           isExhausted: false,
         },
       },
-      argon: {
-        key: 'argon',
-        displayName: 'Gemini 4 Argon',
-        fiveHour: null,
-        weekly: {
-          window: 'weekly',
-          remainingPct: 74,
-          remainingFraction: 0.74,
-          resetTime: new Date(Date.now() + 500_000_000).toISOString(),
-          isReady: false,
-          isExhausted: false,
-        },
-      },
       nonGoogle: {
         key: 'nonGoogle',
         displayName: 'Non-Google Models',
@@ -212,6 +200,15 @@ test('formatCompactTokens formats token counts compactly across ranges', () => {
   assert.equal(formatCompactTokens(1_200_000), '1.2M');
 });
 
+test('formatResetDateTime formats ISO dates into local month, day, hour and minute', () => {
+  assert.equal(formatResetDateTime(null), null);
+  assert.equal(formatResetDateTime('not-a-date'), null);
+  const sample = new Date(2026, 10, 15, 21, 30).toISOString();
+  const formatted = formatResetDateTime(sample);
+  assert.ok(formatted !== null);
+  assert.match(formatted!, /Nov 15, \d{2}:\d{2}/);
+});
+
 test('buildStatusBarViewModel: active workspace session formatting, icons, and thresholds', () => {
   const config: MonitorConfig = { ...DEFAULT_CONFIG, contextWarningPct: 75, contextCriticalPct: 90 };
 
@@ -237,7 +234,6 @@ test('buildStatusBarViewModel: active workspace session formatting, icons, and t
   assert.match(vm.text, /\$\(sync~spin\)/);
   assert.match(vm.text, /47%/);
   assert.match(vm.text, /G 85%/);
-  assert.match(vm.text, /A 74%/);
   assert.match(vm.text, /C 40%/);
   assert.equal(vm.color, 'normal');
 
@@ -280,9 +276,9 @@ test('buildStatusBarViewModel: empty workspace returns $(pulse) No session + quo
 test('buildStatusBarViewModel: quota text and warning/error thresholds', () => {
   const state = createState();
 
-  // Online with normal pools (Gemini 85%, Argon 74%, Non-Google 40%)
+  // Online with normal pools (Gemini 85%, Non-Google 40%)
   const vmOnline = buildStatusBarViewModel(state, DEFAULT_CONFIG);
-  assert.match(vmOnline.text, /G 85% · A 74% · C 40%/);
+  assert.match(vmOnline.text, /G 85% · C 40%/);
   assert.equal(vmOnline.color, 'normal');
 
   // Quota offline
@@ -361,19 +357,6 @@ test('buildStatusBarViewModel: minimal tooltip includes model, subagent model su
             isExhausted: false,
           },
           weekly: null,
-        },
-        argon: {
-          key: 'argon',
-          displayName: 'Gemini 4 Argon',
-          fiveHour: null,
-          weekly: {
-            window: 'weekly',
-            remainingPct: 74,
-            remainingFraction: 0.74,
-            resetTime: new Date(Date.now() + 500_000_000).toISOString(),
-            isReady: false,
-            isExhausted: false,
-          },
         },
         nonGoogle: {
           key: 'nonGoogle',
@@ -797,9 +780,8 @@ test('renderBottomPanelHtml: strict CSP, XSS safety, quota strip, tree, detail c
   // 3. Pin Missing banner
   assert.match(html, /Pinned session is missing/);
 
-  // 4. Quota strip (3 pools: Gemini, Argon, Non-Google)
+  // 4. Quota strip (2 pools: Gemini, Non-Google)
   assert.match(html, /Gemini/);
-  assert.match(html, /Argon/);
   assert.match(html, /Non-Google/);
 
   // 5. Overview shows Model Usage Forecast + expanded subagent model pill + CSP-safe bars & ctx-meter
@@ -807,14 +789,34 @@ test('renderBottomPanelHtml: strict CSP, XSS safety, quota strip, tree, detail c
   assert.match(html, /Claude Opus 4\.6 \(Thinking\)/);
   assert.match(html, /Gemini 3\.8 Flash/);
   assert.match(html, /bar-fill ok p-85/);
-  assert.match(html, /bar-fill ok p-74/);
   assert.match(html, /bar-fill ok p-40/);
   assert.match(html, /class="ctx-meter /);
   assert.match(html, /class="ctx-meter-fill /);
   assert.match(html, /class="ctx-meter-text">/);
   assert.ok(!html.includes('style="'), 'Must not emit inline style attributes blocked by strict CSP');
 
-  // 6. Details tab renders SVG Chart with compaction marker & subagents table & breakdown open state
+  // 6. Help buttons, explanation boxes, and next reset date/time display
+  assert.match(html, /class="help-btn"/);
+  assert.match(html, /data-help-id="quota-pools"/);
+  assert.match(html, /data-help-id="model-forecast"/);
+  assert.match(html, /data-help-id="sessions"/);
+  assert.match(html, /id="help-box-quota-pools"/);
+  assert.match(html, /id="help-box-model-forecast"/);
+  assert.match(html, /~116M tok/);
+  assert.match(html, /~11\.3M fresh\+out/);
+  assert.match(html, /Calibrating \(waiting drop\)/);
+  assert.match(html, /q-reset-time/);
+  assert.match(html, /Next reset/);
+
+  // Open help in Overview tab renders active button and visible help box
+  const openHelpOverview = renderBottomPanelHtml(state, nonce, cspSource, {
+    activeTab: 'overview',
+    openHelpIds: ['model-forecast'],
+  });
+  assert.match(openHelpOverview, /<button class="help-btn active" data-action="toggleHelp" data-help-id="model-forecast"/);
+  assert.match(openHelpOverview, /<div id="help-box-model-forecast" class="help-box">/);
+
+  // 7. Details tab renders SVG Chart with compaction marker & subagents table & breakdown open state
   const detailsHtml = renderBottomPanelHtml(state, nonce, cspSource, {
     activeTab: 'details',
     expandedIds: ['xss-session'],
@@ -826,8 +828,12 @@ test('renderBottomPanelHtml: strict CSP, XSS safety, quota strip, tree, detail c
   assert.match(detailsHtml, /14/);
   assert.match(detailsHtml, /Gemini 3\.8 Flash/);
   assert.match(detailsHtml, /<details class="breakdown-details" open>/);
+  assert.match(detailsHtml, /data-help-id="session-kpis"/);
+  assert.match(detailsHtml, /data-help-id="breakdown"/);
+  assert.match(detailsHtml, /data-help-id="subagents"/);
+  assert.match(detailsHtml, /data-help-id="context-growth"/);
 
-  // 7. renderBottomPanelBodyHtml and DOM root wrapper
+  // 8. renderBottomPanelBodyHtml and DOM root wrapper
   const bodyHtml = renderBottomPanelBodyHtml(state);
   assert.ok(!bodyHtml.includes('<!DOCTYPE html>'));
   assert.ok(renderBottomPanelHtml(state, nonce, cspSource).includes(`<div id="panel-root">\n    ${bodyHtml}\n  </div>`));
@@ -943,5 +949,78 @@ test('BottomPanelController: gates setHtml and postMessage on view.visible, rend
   assert.equal(selectedIds.length, 1);
   assert.equal(selectedIds[0], 'target-123');
 
+  // Inbound toggleHelp toggles openHelpIds and posts targeted updateState
+  messageListener!({ type: 'toggleHelp', helpId: 'model-forecast', open: true });
+  assert.deepEqual(Array.from(ctrl.getUiState().openHelpIds ?? []), ['model-forecast']);
+  assert.ok(postedMessages[postedMessages.length - 1].bodyHtml.includes('id="help-box-model-forecast" class="help-box"'));
+
+  messageListener!({ type: 'toggleHelp', helpId: 'model-forecast', open: false });
+  assert.deepEqual(Array.from(ctrl.getUiState().openHelpIds ?? []), []);
+  assert.ok(postedMessages[postedMessages.length - 1].bodyHtml.includes('id="help-box-model-forecast" class="help-box hidden"'));
+
   ctrl.dispose();
+});
+
+test('BottomPanelController: collapse/expand and reorder tabs and sections with persistence', () => {
+  let savedLayout: any = null;
+  let messageHandler: ((msg: any) => void) | null = null;
+  const postedMessages: any[] = [];
+
+  const controller = new BottomPanelController({
+    onSelectSession: () => {},
+    onPinSession: () => {},
+    onUnpinSession: () => {},
+    onToggleScope: () => {},
+    onRefresh: () => {},
+    onLayoutChange: (layout) => {
+      savedLayout = layout;
+    },
+  });
+
+  const view = {
+    visible: true,
+    webview: {
+      html: '',
+      cspSource: 'vscode-webview:',
+      postMessage: (msg: unknown) => {
+        postedMessages.push(msg);
+        return true;
+      },
+      onDidReceiveMessage: (fn: (msg: any) => void) => {
+        messageHandler = fn;
+        return { dispose: () => {} };
+      },
+    },
+    onDidChangeVisibility: () => ({ dispose: () => {} }),
+    onDidDispose: () => ({ dispose: () => {} }),
+  };
+
+  controller.setView(view);
+  controller.update(createState());
+  const handler = messageHandler as ((msg: any) => void) | null;
+  assert.ok(handler, 'messageHandler should be registered');
+
+  // Reorder tabs
+  handler({ type: 'reorderTabs', order: ['details', 'overview'] });
+  assert.deepEqual(savedLayout.tabOrder, ['details', 'overview']);
+  const lastHtml1 = postedMessages[postedMessages.length - 1].bodyHtml as string;
+  assert.ok(lastHtml1.indexOf('data-tab-id="details"') < lastHtml1.indexOf('data-tab-id="overview"'));
+
+  // Collapse a section
+  handler({ type: 'toggleSectionCollapse', sectionId: 'quota' });
+  assert.ok(savedLayout.collapsedSections.includes('quota'));
+  const lastHtml2 = postedMessages[postedMessages.length - 1].bodyHtml as string;
+  assert.match(lastHtml2, /is-collapsed" data-section-id="quota"/);
+
+  // Reorder overview sections
+  handler({ type: 'reorderSections', tab: 'overview', order: ['sessions', 'forecast', 'quota', 'unattached'] });
+  assert.deepEqual(savedLayout.sectionOrder.overview, ['sessions', 'forecast', 'quota', 'unattached']);
+  const lastHtml3 = postedMessages[postedMessages.length - 1].bodyHtml as string;
+  assert.ok(lastHtml3.indexOf('data-section-id="sessions"') < lastHtml3.indexOf('data-section-id="quota"'));
+
+  // Collapse active tab
+  handler({ type: 'toggleTabCollapse', tab: 'overview' });
+  assert.ok(savedLayout.collapsedTabs.includes('overview'));
+  const lastHtml4 = postedMessages[postedMessages.length - 1].bodyHtml as string;
+  assert.match(lastHtml4, /class="tab-view hidden" data-tab-view="overview"/);
 });

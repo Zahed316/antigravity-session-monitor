@@ -1,0 +1,181 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-labelledby="v1-title v1-desc">
+  <title id="v1-title">GravityWatch Avatar - Quantum Orbital Singularity</title>
+  <desc id="v1-desc">A deep-space cosmic emblem featuring a glowing antigravity core, 3D orbital rings, and a neon heartbeat pulse</desc>
+  <defs>
+    <!-- Background gradients -->
+    <radialGradient id="v1-space-bg" cx="50%" cy="45%" r="65%">
+      <stop offset="0%" stop-color="#18234d" />
+      <stop offset="55%" stop-color="#0c1126" />
+      <stop offset="100%" stop-color="#050711" />
+    </radialGradient>
+    
+    <radialGradient id="v1-core-glow" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#00f5d4" stop-opacity="0.8" />
+      <stop offset="35%" stop-color="#00b4d8" stop-opacity="0.4" />
+      <stop offset="70%" stop-color="#7209b7" stop-opacity="0.15" />
+      <stop offset="100%" stop-color="#050711" stop-opacity="0" />
+    </radialGradient>
+
+    <!-- Ring gradients -->
+    <linearGradient id="v1-ring-cyan" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#00f5d4" />
+      <stop offset="50%" stop-color="#0096c7" />
+      <stop offset="100%" stop-color="#4361ee" />
+    </linearGradient>
+
+    <linearGradient id="v1-ring-violet" x1="100%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#f72585" />
+      <stop offset="50%" stop-color="#7209b7" />
+      <stop offset="100%" stop-color="#3a0ca3" />
+    </linearGradient>
+
+    <!-- Pulse ECG gradient -->
+    <linearGradient id="v1-pulse-grad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#00b4d8" stop-opacity="0.3" />
+      <stop offset="25%" stop-color="#00f5d4" />
+      <stop offset="50%" stop-color="#ffffff" />
+      <stop offset="75%" stop-color="#00f5d4" />
+      <stop offset="100%" stop-color="#4895ef" stop-opacity="0.3" />
+    </linearGradient>
+
+    <!-- Golden Satellite gradient -->
+    <radialGradient id="v1-sat-glow" cx="40%" cy="40%" r="60%">
+      <stop offset="0%" stop-color="#ffffff" />
+      <stop offset="30%" stop-color="#ffd166" />
+      <stop offset="75%" stop-color="#f77f00" />
+      <stop offset="100%" stop-color="#d62828" stop-opacity="0" />
+    </radialGradient>
+
+    <!-- Outer rim highlight -->
+    <linearGradient id="v1-rim-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#4895ef" stop-opacity="0.6" />
+      <stop offset="50%" stop-color="#7209b7" stop-opacity="0.2" />
+      <stop offset="100%" stop-color="#00f5d4" stop-opacity="0.5" />
+    </linearGradient>
+
+    <!-- Filters for luminous glow -->
+    <filter id="v1-glow-subtle" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="4" result="blur" />
+      <feMerge>
+        <feMergeNode in="blur" />
+        <feMergeNode in="SourceGraphic" />
+      </feMerge>
+    </filter>
+
+    <filter id="v1-glow-strong" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="8" result="blur1" />
+      <feGaussianBlur stdDeviation="16" result="blur2" />
+      <feMerge>
+        <feMergeNode in="blur2" />
+        <feMergeNode in="blur1" />
+        <feMergeNode in="SourceGraphic" />
+      </feMerge>
+    </filter>
+  </defs>
+
+  <!-- Background Base (Circle & Squircle compatible) -->
+  <rect x="12" y="12" width="488" height="488" rx="112" fill="url(#v1-space-bg)" />
+  <rect x="12" y="12" width="488" height="488" rx="112" fill="none" stroke="url(#v1-rim-grad)" stroke-width="3" />
+
+  <!-- Inner circular subtle frame for perfect round avatar cropping -->
+  <circle cx="256" cy="256" r="236" fill="none" stroke="#4895ef" stroke-width="1.5" stroke-opacity="0.15" stroke-dasharray="8 6" />
+
+  <!-- Center core ambiance -->
+  <circle cx="256" cy="256" r="180" fill="url(#v1-core-glow)" />
+
+  <!-- Deep space subtle grid / coordinates -->
+  <g opacity="0.1" stroke="#8da9c4" stroke-width="1.5">
+    <line x1="256" y1="36" x2="256" y2="476" stroke-dasharray="4 8" />
+    <line x1="36" y1="256" x2="476" y2="256" stroke-dasharray="4 8" />
+    <circle cx="256" cy="256" r="140" fill="none" stroke-dasharray="2 6" />
+    <circle cx="256" cy="256" r="200" fill="none" stroke-dasharray="4 8" />
+  </g>
+
+  <!-- 3D Orbit Ring 1 (Back segment) -->
+  <g transform="rotate(-24 256 256)">
+    <ellipse cx="256" cy="256" rx="190" ry="64" fill="none" stroke="url(#v1-ring-violet)" stroke-width="4.5" stroke-opacity="0.4" stroke-dasharray="280 200" stroke-dashoffset="140" />
+    
+    <!-- 3D Orbit Ring 2 (Primary Outer Orbit) -->
+    <ellipse cx="256" cy="256" rx="155" ry="52" fill="none" stroke="url(#v1-ring-cyan)" stroke-width="7" stroke-linecap="round" opacity="0.85" filter="url(#v1-glow-subtle)" />
+    
+    <!-- Secondary Inner Orbit -->
+    <ellipse cx="256" cy="256" rx="105" ry="34" fill="none" stroke="#4895ef" stroke-width="5" stroke-opacity="0.75" />
+    
+    <!-- Central Gravity Singularity Core -->
+    <circle cx="256" cy="256" r="42" fill="#0c1126" stroke="#00f5d4" stroke-width="3" />
+    <circle cx="256" cy="256" r="28" fill="url(#v1-ring-cyan)" opacity="0.9" filter="url(#v1-glow-subtle)" />
+    <circle cx="256" cy="256" r="12" fill="#ffffff" />
+  </g>
+
+  <!-- Orbit Particle Nodes -->
+  <circle cx="395" cy="202" r="6" fill="#00f5d4" filter="url(#v1-glow-subtle)" />
+  <circle cx="118" cy="312" r="4.5" fill="#f72585" opacity="0.8" />
+  <circle cx="165" cy="180" r="3.5" fill="#4895ef" opacity="0.6" />
+
+  <!-- Luminous Heartbeat / Vital Pulse Line (The "Watch" in GravityWatch) -->
+  <g filter="url(#v1-glow-strong)">
+    <path d="M 44,256 
+             L 132,256 
+             L 156,236 
+             L 178,276 
+             L 204,210 
+             L 230,314 
+             L 262,156 
+             L 294,332 
+             L 322,232 
+             L 342,268 
+             L 362,256 
+             L 468,256"
+          fill="none" 
+          stroke="url(#v1-pulse-grad)" 
+          stroke-width="9" 
+          stroke-linecap="round" 
+          stroke-linejoin="round" />
+  </g>
+
+  <!-- White-hot core trace for the pulse -->
+  <path d="M 44,256 
+           L 132,256 
+           L 156,236 
+           L 178,276 
+           L 204,210 
+           L 230,314 
+           L 262,156 
+           L 294,332 
+           L 322,232 
+           L 342,268 
+           L 362,256 
+           L 468,256"
+        fill="none" 
+        stroke="#ffffff" 
+        stroke-width="3" 
+        stroke-linecap="round" 
+        stroke-linejoin="round" />
+
+  <!-- Radiant Golden Satellite (The Monitored Session Entity) -->
+  <g transform="translate(378, 142)">
+    <!-- Outer energy aura -->
+    <circle cx="0" cy="0" r="38" fill="url(#v1-sat-glow)" opacity="0.5" />
+    <circle cx="0" cy="0" r="22" fill="url(#v1-sat-glow)" opacity="0.8" filter="url(#v1-glow-subtle)" />
+    <!-- Solid beacon sphere -->
+    <circle cx="0" cy="0" r="13" fill="#ffbe0b" />
+    <circle cx="-3" cy="-3" r="4.5" fill="#ffffff" />
+    <!-- Satellite mini telemetry ping ring -->
+    <circle cx="0" cy="0" r="26" fill="none" stroke="#ffd166" stroke-width="2" stroke-opacity="0.6" stroke-dasharray="4 4" />
+  </g>
+
+  <!-- Secondary Satellite (Antigravity worker) -->
+  <g transform="translate(142, 362)">
+    <circle cx="0" cy="0" r="16" fill="#00f5d4" opacity="0.25" />
+    <circle cx="0" cy="0" r="7" fill="#00f5d4" filter="url(#v1-glow-subtle)" />
+    <circle cx="-1.5" cy="-1.5" r="2" fill="#ffffff" />
+  </g>
+
+  <!-- Top Glass Sheen / Specular Arc -->
+  <path d="M 36,128 C 92,60 180,32 256,32 C 332,32 420,60 476,128" 
+        fill="none" 
+        stroke="#ffffff" 
+        stroke-width="2" 
+        stroke-opacity="0.15" 
+        stroke-linecap="round" />
+</svg>

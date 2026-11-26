@@ -125,6 +125,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   );
   context.subscriptions.push(statusBar);
 
+  const initialPanelLayout = context.globalState.get<Record<string, unknown>>(
+    'antigravityMonitor.panelLayout.v1',
+  );
+
   // Bottom Panel Provider
   const panelProvider = createBottomPanelProvider(vscode, {
     onSelectSession: (id) => monitorService?.selectForPanel(id),
@@ -132,6 +136,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     onUnpinSession: () => void monitorService?.unpinSession(),
     onToggleScope: () => void monitorService?.toggleScope(),
     onRefresh: () => void monitorService?.refreshNow(true),
+    initialLayout: initialPanelLayout as any,
+    onLayoutChange: (layout) => {
+      void context.globalState.update('antigravityMonitor.panelLayout.v1', layout);
+    },
   });
 
   context.subscriptions.push(

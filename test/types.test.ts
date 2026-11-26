@@ -56,13 +56,6 @@ test('domain types compose cleanly for quota, telemetry, RPC, and state', () => 
     weekly: null,
   };
 
-  const argonPool: QuotaPool = {
-    key: 'argon',
-    displayName: 'Gemini 4 Argon',
-    fiveHour: null,
-    weekly: null,
-  };
-
   const nonGooglePool: QuotaPool = {
     key: 'nonGoogle',
     displayName: 'Claude / 3P',
@@ -75,7 +68,6 @@ test('domain types compose cleanly for quota, telemetry, RPC, and state', () => 
     source: 'summary',
     pools: {
       gemini: geminiPool,
-      argon: argonPool,
       nonGoogle: nonGooglePool,
     },
     fetchedAt: 1763088000000,

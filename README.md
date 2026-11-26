@@ -1,14 +1,14 @@
 <div align="center">
 
-<img src="logo.png" alt="GravityWatch logo: orbit rings around a cyan heartbeat pulse with an amber satellite dot, on a navy rounded square" width="160"/>
+<img src="https://raw.githubusercontent.com/Zahed316/antigravity-session-monitor/main/logo.png" alt="GravityWatch logo: orbit rings around a cyan heartbeat pulse with an amber satellite dot, on a navy rounded square" width="160"/>
 
 # GravityWatch for Antigravity
 
 Read-only live status bar and bottom panel for Antigravity session context windows, subagent token rollups, and 5h/weekly quota pools.
 
-[![Version](https://img.shields.io/visual-studio-marketplace/v/Zahed-r.antigravity-session-monitor)](https://marketplace.visualstudio.com/items?itemName=Zahed-r.antigravity-session-monitor)
-[![Installs](https://img.shields.io/visual-studio-marketplace/i/Zahed-r.antigravity-session-monitor)](https://marketplace.visualstudio.com/items?itemName=Zahed-r.antigravity-session-monitor)
-[![License](https://img.shields.io/visual-studio-marketplace/l/Zahed-r.antigravity-session-monitor)](LICENSE)
+[![Marketplace](https://img.shields.io/badge/VS_Code_Marketplace-v0.1.4-007ACC?logo=visualstudiocode)](https://marketplace.visualstudio.com/items?itemName=Zahed-r.antigravity-session-monitor)
+[![License](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/Zahed316/antigravity-session-monitor/blob/main/LICENSE)
+[![GitHub Stars](https://img.shields.io/github/stars/Zahed316/antigravity-session-monitor?style=flat)](https://github.com/Zahed316/antigravity-session-monitor/stargazers)
 
 </div>
 
@@ -30,7 +30,7 @@ It is strictly read-only and 100% local: it never patches the host extension, ne
 From the VS Code Marketplace, search for **GravityWatch for Antigravity** (publisher `Zahed-r`), or install a packaged VSIX directly:
 
 ```sh
-code --install-extension antigravity-session-monitor-0.1.0.vsix
+code --install-extension antigravity-session-monitor-0.1.4.vsix
 ```
 
 Requires VS Code 1.99+.
@@ -70,7 +70,7 @@ All commands live under the **Antigravity Monitor** category and are available f
 
 ## Status
 
-**0.1.0 — experimental.** One maintainer, early days. Antigravity's data layouts are undocumented and may change between its releases, which can break parsing until GravityWatch catches up. File an issue if it does.
+**0.1.4 — experimental.** One maintainer, early days. Antigravity's data layouts are undocumented and may change between its releases, which can break parsing until GravityWatch catches up. File an issue if it does.
 
 ## Trademark
 

@@ -85,6 +85,20 @@ export function formatResetCountdown(resetTime: string | null, isReady: boolean,
   return `Resets in ${mins}m`;
 }
 
+export function formatResetDateTime(resetTime: string | null): string | null {
+  if (!resetTime) return null;
+  const ms = Date.parse(resetTime);
+  if (Number.isNaN(ms)) return null;
+  const d = new Date(ms);
+  const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  const month = MONTHS[d.getMonth()];
+  const day = d.getDate();
+  const pad = (n: number) => String(n).padStart(2, '0');
+  const hours = pad(d.getHours());
+  const mins = pad(d.getMinutes());
+  return `${month} ${day}, ${hours}:${mins}`;
+}
+
 export function formatWindowEstimateBrief(est: WindowTokenEstimate | null | undefined): string {
   if (!est) return '—';
   if (est.status === 'calibrated' && est.estimatedTotalTokens !== null) {
@@ -137,7 +151,6 @@ function buildCompactQuotaPart(state: MonitorState): {
   }
 
   const gWin = state.quota.pools.gemini?.fiveHour ?? state.quota.pools.gemini?.weekly;
-  const aWin = state.quota.pools.argon?.weekly ?? state.quota.pools.argon?.fiveHour;
   const cWin = state.quota.pools.nonGoogle?.fiveHour ?? state.quota.pools.nonGoogle?.weekly;
 
   const segments: string[] = [];
@@ -148,11 +161,6 @@ function buildCompactQuotaPart(state: MonitorState): {
     pcts.push(gWin.remainingPct);
   } else {
     segments.push('G --%');
-  }
-
-  if (aWin) {
-    segments.push(`A ${Math.round(aWin.remainingPct)}%`);
-    pcts.push(aWin.remainingPct);
   }
 
   if (cWin) {
@@ -283,18 +291,18 @@ export function buildStatusBarViewModel(state: MonitorState, config: MonitorConf
     const fmtWindow = (w: QuotaWindow | null) => {
       if (!w) return '—';
       const countdown = formatResetCountdown(w.resetTime, w.isReady, w.isExhausted);
-      return `${Math.round(w.remainingPct)}% (${countdown})`;
+      const resetDate = formatResetDateTime(w.resetTime);
+      const datePart = resetDate ? ` · ${resetDate}` : '';
+      return `${Math.round(w.remainingPct)}% (${countdown}${datePart})`;
     };
 
     const poolOrder: Array<{ key: PoolKey; fallbackName: string }> = [
       { key: 'gemini', fallbackName: 'Gemini Models' },
-      { key: 'argon', fallbackName: 'Gemini 4 Argon' },
       { key: 'nonGoogle', fallbackName: 'Claude & GPT' },
     ];
     for (const p of poolOrder) {
       const pool = state.quota.pools[p.key];
       if (!pool) continue;
-      if (p.key === 'argon' && !pool.fiveHour && !pool.weekly) continue;
       lines.push(
         `| **${escapeMarkdown(pool.displayName || p.fallbackName)}** | ${fmtWindow(pool.fiveHour)} | ${fmtWindow(pool.weekly)} |`,
       );

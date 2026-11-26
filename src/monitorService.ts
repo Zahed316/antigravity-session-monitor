@@ -67,7 +67,6 @@ function buildOfflineQuota(nowMs: number, error?: string): QuotaSnapshot {
     source: 'none',
     pools: {
       gemini: buildEmptyQuotaPool('gemini', 'Gemini Models'),
-      argon: buildEmptyQuotaPool('argon', 'Gemini 4 Argon'),
       nonGoogle: buildEmptyQuotaPool('nonGoogle', 'Claude & GPT'),
     },
     fetchedAt: nowMs,

@@ -4,7 +4,7 @@
   "description": "GravityWatch — read-only live status bar and bottom panel for Antigravity session context windows, subagent token rollups, and 5h/weekly quota pools.",
   "icon": "logo.png",
   "publisher": "Zahed-r",
-  "version": "0.1.0",
+  "version": "0.1.4",
   "license": "MIT",
   "engines": {
     "vscode": "^1.99.0"
@@ -33,19 +33,19 @@
   },
   "badges": [
     {
-      "url": "https://img.shields.io/visual-studio-marketplace/v/Zahed-r.antigravity-session-monitor",
+      "url": "https://img.shields.io/badge/VS_Code_Marketplace-v0.1.4-007ACC?logo=visualstudiocode",
       "href": "https://marketplace.visualstudio.com/items?itemName=Zahed-r.antigravity-session-monitor",
       "description": "Marketplace version"
     },
     {
-      "url": "https://img.shields.io/visual-studio-marketplace/i/Zahed-r.antigravity-session-monitor",
-      "href": "https://marketplace.visualstudio.com/items?itemName=Zahed-r.antigravity-session-monitor",
-      "description": "Install count"
-    },
-    {
-      "url": "https://img.shields.io/visual-studio-marketplace/l/Zahed-r.antigravity-session-monitor",
+      "url": "https://img.shields.io/badge/License-MIT-blue.svg",
       "href": "https://github.com/Zahed316/antigravity-session-monitor/blob/main/LICENSE",
       "description": "License"
+    },
+    {
+      "url": "https://img.shields.io/github/stars/Zahed316/antigravity-session-monitor?style=flat",
+      "href": "https://github.com/Zahed316/antigravity-session-monitor/stargazers",
+      "description": "GitHub stars"
     }
   ],
   "qna": "marketplace",

@@ -513,9 +513,7 @@ test('normalizeQuotaFromSummary unwraps response.groups and separates argon, gem
   const snap = normalizeQuotaFromSummary(raw, nowMs);
   assert.equal(snap.status, 'online');
   assert.equal(snap.pools.gemini.fiveHour?.remainingPct, 88);
-  assert.equal(snap.pools.gemini.weekly?.remainingPct, 91);
-  assert.equal(snap.pools.argon.weekly?.remainingPct, 74);
-  assert.equal(snap.pools.argon.fiveHour, null);
+  assert.equal(snap.pools.gemini.weekly?.remainingPct, 74);
   assert.equal(snap.pools.nonGoogle.fiveHour?.remainingPct, 55);
   assert.equal(snap.pools.nonGoogle.weekly?.remainingPct, 82);
 });
@@ -555,7 +553,7 @@ test('normalizeQuotaFromUserStatus classifies >6h reset windows as weekly and se
   const snap = normalizeQuotaFromUserStatus(raw, nowMs);
   assert.equal(snap.status, 'online');
   assert.equal(snap.pools.gemini.fiveHour?.remainingPct, 90);
-  assert.equal(snap.pools.argon.weekly?.remainingPct, 74);
+  assert.equal(snap.pools.gemini.weekly?.remainingPct, 74);
   assert.equal(snap.pools.nonGoogle.weekly?.remainingPct, 65);
 });
 
@@ -589,7 +587,7 @@ test('extractModelCatalogFromUserStatus extracts modelEnum, nested modelId.id, l
     label: 'Gemini 4 Argon (Low)',
     rawId: 'MODEL_PLACEHOLDER_M419',
     modelId: 'gemini-4-argon-low',
-    poolKey: 'argon',
+    poolKey: 'gemini',
   });
   assert.equal(entries[1].poolKey, 'nonGoogle');
   assert.equal(entries[1].modelId, 'claude-opus-4-6-thinking');

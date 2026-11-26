@@ -10,7 +10,7 @@ import type {
 } from '../types.ts';
 import { inferModelPool } from './modelResolver.ts';
 
-const CALIBRATION_VERSION = 1;
+const CALIBRATION_VERSION = 2;
 const MIN_FRACTION_DROP = 0.0002;
 const RESET_FRACTION_JUMP = 0.005;
 
@@ -52,36 +52,36 @@ function calibrationKey(modelLabel: string, windowKey: '5h' | 'weekly'): string 
   return `${modelLabel}::${windowKey}`;
 }
 
-function aggregateTokensByModel(nodes: SessionNode[]): Map<string, ModelTokenTotals> {
-  const byModel = new Map<string, ModelTokenTotals>();
+interface SessionNodeTokens {
+  modelLabel: string;
+  fresh: number;
+  cacheRead: number;
+  output: number;
+}
+
+function collectSessionNodes(nodes: SessionNode[]): Map<string, SessionNodeTokens> {
+  const result = new Map<string, SessionNodeTokens>();
   const visited = new Set<string>();
 
   function visit(node: SessionNode): void {
     if (!node) {
       return;
     }
-    if (node.id) {
-      if (visited.has(node.id)) {
+    const id = node.id ? String(node.id) : '';
+    if (id) {
+      if (visited.has(id)) {
         return;
       }
-      visited.add(node.id);
+      visited.add(id);
     }
 
     const modelLabel = (node.model ?? '').trim();
-    const isKnown = modelLabel.length > 0 && modelLabel.toLowerCase() !== 'unknown';
-    const hasOwnTokens =
-      node.own &&
-      (node.own.calls > 0 ||
-        node.own.fresh > 0 ||
-        node.own.cacheRead > 0 ||
-        node.own.output > 0);
+    const fresh = Math.max(0, node.own?.fresh ?? 0);
+    const cacheRead = Math.max(0, node.own?.cacheRead ?? 0);
+    const output = Math.max(0, node.own?.output ?? 0);
 
-    if (isKnown && hasOwnTokens) {
-      const existing = byModel.get(modelLabel) ?? { fresh: 0, cacheRead: 0, output: 0 };
-      existing.fresh += Math.max(0, node.own.fresh);
-      existing.cacheRead += Math.max(0, node.own.cacheRead);
-      existing.output += Math.max(0, node.own.output);
-      byModel.set(modelLabel, existing);
+    if (id) {
+      result.set(id, { modelLabel, fresh, cacheRead, output });
     }
 
     if (Array.isArray(node.children)) {
@@ -93,6 +93,26 @@ function aggregateTokensByModel(nodes: SessionNode[]): Map<string, ModelTokenTot
 
   for (const node of nodes) {
     visit(node);
+  }
+
+  return result;
+}
+
+function aggregateTokensByModel(sessions: Map<string, SessionNodeTokens>): Map<string, ModelTokenTotals> {
+  const byModel = new Map<string, ModelTokenTotals>();
+
+  for (const session of sessions.values()) {
+    const modelLabel = session.modelLabel;
+    const isKnown = modelLabel.length > 0 && modelLabel.toLowerCase() !== 'unknown';
+    if (!isKnown) {
+      continue;
+    }
+
+    const existing = byModel.get(modelLabel) ?? { fresh: 0, cacheRead: 0, output: 0 };
+    existing.fresh += session.fresh;
+    existing.cacheRead += session.cacheRead;
+    existing.output += session.output;
+    byModel.set(modelLabel, existing);
   }
 
   return byModel;
@@ -147,7 +167,8 @@ export class QuotaEstimator {
 
   private readonly calibration = new Map<string, CalibrationEntry>();
   private readonly windowUsed = new Map<string, WindowUsage>();
-  private prevTokensByModel = new Map<string, ModelTokenTotals>();
+  private readonly pendingSinceDrop = new Map<string, { total: number; billed: number }>();
+  private prevSessionTokens = new Map<string, { fresh: number; cacheRead: number; output: number }>();
   private prevWindows: Partial<Record<PoolKey, { fiveHour?: WindowSnapshot; weekly?: WindowSnapshot }>> = {};
   private hasBaseline = false;
   private dirty = false;
@@ -236,10 +257,17 @@ export class QuotaEstimator {
     nowMs?: number;
   }): ModelTokenEstimate[] {
     const { quota, nodes, nowMs = Date.now() } = params;
-    const currTokensByModel = aggregateTokensByModel(nodes);
+    const currentSessions = collectSessionNodes(nodes);
+    const currTokensByModel = aggregateTokensByModel(currentSessions);
 
     if (!this.hasBaseline) {
-      this.prevTokensByModel = currTokensByModel;
+      for (const [id, session] of currentSessions) {
+        this.prevSessionTokens.set(id, {
+          fresh: session.fresh,
+          cacheRead: session.cacheRead,
+          output: session.output,
+        });
+      }
       if (quota.status === 'online') {
         this.captureWindowSnapshots(quota);
         this.hasBaseline = true;
@@ -248,29 +276,46 @@ export class QuotaEstimator {
     }
 
     if (quota.status !== 'online') {
-      this.prevTokensByModel = currTokensByModel;
+      for (const [id, session] of currentSessions) {
+        this.prevSessionTokens.set(id, {
+          fresh: session.fresh,
+          cacheRead: session.cacheRead,
+          output: session.output,
+        });
+      }
       return this.buildEstimates(quota, currTokensByModel);
     }
 
-    // Compute per-model positive deltas since last observation
+    // Compute per-model positive deltas by iterating over current sessions
     const deltasByModel = new Map<string, { deltaTotal: number; deltaBilled: number; poolKey: PoolKey }>();
-    for (const [modelLabel, curr] of currTokensByModel.entries()) {
-      const prev = this.prevTokensByModel.get(modelLabel) ?? { fresh: 0, cacheRead: 0, output: 0 };
-      const dFresh = Math.max(0, curr.fresh - prev.fresh);
-      const dCache = Math.max(0, curr.cacheRead - prev.cacheRead);
-      const dOutput = Math.max(0, curr.output - prev.output);
+    for (const [id, session] of currentSessions) {
+      const prev = this.prevSessionTokens.get(id) ?? { fresh: 0, cacheRead: 0, output: 0 };
+      const dFresh = Math.max(0, session.fresh - prev.fresh);
+      const dCache = Math.max(0, session.cacheRead - prev.cacheRead);
+      const dOutput = Math.max(0, session.output - prev.output);
       const deltaTotal = dFresh + dCache + dOutput;
       const deltaBilled = dFresh + dOutput;
-      if (deltaTotal > 0) {
-        deltasByModel.set(modelLabel, {
-          deltaTotal,
-          deltaBilled,
-          poolKey: this.poolResolver(modelLabel),
-        });
+
+      const isKnown = session.modelLabel.length > 0 && session.modelLabel.toLowerCase() !== 'unknown';
+      if (isKnown && deltaTotal > 0) {
+        const existing = deltasByModel.get(session.modelLabel) ?? {
+          deltaTotal: 0,
+          deltaBilled: 0,
+          poolKey: this.poolResolver(session.modelLabel),
+        };
+        existing.deltaTotal += deltaTotal;
+        existing.deltaBilled += deltaBilled;
+        deltasByModel.set(session.modelLabel, existing);
       }
+
+      this.prevSessionTokens.set(id, {
+        fresh: session.fresh,
+        cacheRead: session.cacheRead,
+        output: session.output,
+      });
     }
 
-    const poolKeys: PoolKey[] = ['gemini', 'argon', 'nonGoogle'];
+    const poolKeys: PoolKey[] = ['gemini', 'nonGoogle'];
     const windows: Array<{ prop: 'fiveHour' | 'weekly'; key: '5h' | 'weekly' }> = [
       { prop: 'fiveHour', key: '5h' },
       { prop: 'weekly', key: 'weekly' },
@@ -285,45 +330,86 @@ export class QuotaEstimator {
         const prevWin = this.prevWindows[poolKey]?.[w.prop];
         if (!currWin) continue;
 
-        const prevResetMs = prevWin?.resetTime ? Date.parse(prevWin.resetTime) : Number.NaN;
+        if (!prevWin) {
+          if (!this.prevWindows[poolKey]) {
+            this.prevWindows[poolKey] = {};
+          }
+          this.prevWindows[poolKey]![w.prop] = {
+            remainingFraction: currWin.remainingFraction,
+            resetTime: currWin.resetTime,
+          };
+          continue;
+        }
+
+        const prevResetMs = prevWin.resetTime ? Date.parse(prevWin.resetTime) : Number.NaN;
         const currResetMs = currWin.resetTime ? Date.parse(currWin.resetTime) : Number.NaN;
         const resetTimeAdvanced =
           Number.isFinite(prevResetMs) &&
           Number.isFinite(currResetMs) &&
           currResetMs - prevResetMs > 60_000;
         const resetOccurred =
-          prevWin !== undefined &&
-          (currWin.remainingFraction > prevWin.remainingFraction + RESET_FRACTION_JUMP ||
-            resetTimeAdvanced);
+          currWin.remainingFraction > prevWin.remainingFraction + RESET_FRACTION_JUMP ||
+          resetTimeAdvanced;
 
         if (resetOccurred) {
+          const suffix = `::${w.key}`;
           for (const key of Array.from(this.windowUsed.keys())) {
-            if (key.endsWith(`::${w.key}`)) {
-              const modelName = key.slice(0, -(`::${w.key}`.length));
+            if (key.endsWith(suffix)) {
+              const modelName = key.slice(0, -suffix.length);
               if (this.poolResolver(modelName) === poolKey) {
                 this.windowUsed.delete(key);
               }
             }
           }
+          for (const key of Array.from(this.pendingSinceDrop.keys())) {
+            if (key.endsWith(suffix)) {
+              const modelName = key.slice(0, -suffix.length);
+              if (this.poolResolver(modelName) === poolKey) {
+                this.pendingSinceDrop.delete(key);
+              }
+            }
+          }
+          if (!this.prevWindows[poolKey]) {
+            this.prevWindows[poolKey] = {};
+          }
+          this.prevWindows[poolKey]![w.prop] = {
+            remainingFraction: currWin.remainingFraction,
+            resetTime: currWin.resetTime,
+          };
           continue;
         }
 
-        // Accumulate window tokens & attribute drops when unambiguously caused by 1 model in pool
-        const activeInPool: Array<{ modelLabel: string; deltaTotal: number; deltaBilled: number }> = [];
+        // Accumulate window tokens & pending tokens for each model in poolKey
         for (const [modelLabel, delta] of deltasByModel.entries()) {
           if (delta.poolKey !== poolKey) continue;
-          activeInPool.push({ modelLabel, deltaTotal: delta.deltaTotal, deltaBilled: delta.deltaBilled });
-          const uKey = calibrationKey(modelLabel, w.key);
-          const u = this.windowUsed.get(uKey) ?? { total: 0, billed: 0 };
+          const cKey = calibrationKey(modelLabel, w.key);
+
+          const u = this.windowUsed.get(cKey) ?? { total: 0, billed: 0 };
           u.total += delta.deltaTotal;
           u.billed += delta.deltaBilled;
-          this.windowUsed.set(uKey, u);
+          this.windowUsed.set(cKey, u);
+
+          const p = this.pendingSinceDrop.get(cKey) ?? { total: 0, billed: 0 };
+          p.total += delta.deltaTotal;
+          p.billed += delta.deltaBilled;
+          this.pendingSinceDrop.set(cKey, p);
         }
 
-        if (prevWin) {
-          const drop = prevWin.remainingFraction - currWin.remainingFraction;
-          if (drop > MIN_FRACTION_DROP && activeInPool.length === 1) {
-            const target = activeInPool[0];
+        const drop = prevWin.remainingFraction - currWin.remainingFraction;
+        if (drop > MIN_FRACTION_DROP) {
+          const suffix = `::${w.key}`;
+          const pendingInPool: Array<{ modelLabel: string; pending: { total: number; billed: number } }> = [];
+          for (const [key, pending] of this.pendingSinceDrop.entries()) {
+            if (key.endsWith(suffix)) {
+              const modelName = key.slice(0, -suffix.length);
+              if (this.poolResolver(modelName) === poolKey && pending.total > 0) {
+                pendingInPool.push({ modelLabel: modelName, pending });
+              }
+            }
+          }
+
+          if (pendingInPool.length === 1 && pendingInPool[0].pending.total > 0) {
+            const target = pendingInPool[0];
             const cKey = calibrationKey(target.modelLabel, w.key);
             const existing = this.calibration.get(cKey) ?? {
               sumDeltaPct: 0,
@@ -333,19 +419,35 @@ export class QuotaEstimator {
               updatedAt: nowMs,
             };
             existing.sumDeltaPct += drop * 100;
-            existing.sumDeltaTotal += target.deltaTotal;
-            existing.sumDeltaBilled += target.deltaBilled;
+            existing.sumDeltaTotal += target.pending.total;
+            existing.sumDeltaBilled += target.pending.billed;
             existing.sampleCount += 1;
             existing.updatedAt = nowMs;
             this.calibration.set(cKey, existing);
             this.dirty = true;
           }
+
+          // Whether pendingInPool.length === 1 or > 1, clear this.pendingSinceDrop for all models in that poolKey and w.key
+          for (const key of Array.from(this.pendingSinceDrop.keys())) {
+            if (key.endsWith(suffix)) {
+              const modelName = key.slice(0, -suffix.length);
+              if (this.poolResolver(modelName) === poolKey) {
+                this.pendingSinceDrop.delete(key);
+              }
+            }
+          }
+
+          // Update prevWindows after processing the drop
+          if (!this.prevWindows[poolKey]) {
+            this.prevWindows[poolKey] = {};
+          }
+          this.prevWindows[poolKey]![w.prop] = {
+            remainingFraction: currWin.remainingFraction,
+            resetTime: currWin.resetTime,
+          };
         }
       }
     }
-
-    this.prevTokensByModel = currTokensByModel;
-    this.captureWindowSnapshots(quota);
 
     if (this.dirty) {
       void this.flush();
@@ -356,7 +458,7 @@ export class QuotaEstimator {
 
   private captureWindowSnapshots(quota: QuotaSnapshot): void {
     const next: Partial<Record<PoolKey, { fiveHour?: WindowSnapshot; weekly?: WindowSnapshot }>> = {};
-    for (const poolKey of ['gemini', 'argon', 'nonGoogle'] as PoolKey[]) {
+    for (const poolKey of ['gemini', 'nonGoogle'] as PoolKey[]) {
       const pool = quota.pools[poolKey];
       if (!pool) continue;
       next[poolKey] = {

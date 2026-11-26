@@ -26,7 +26,22 @@ export const DEFAULT_CONFIG: MonitorConfig = {
   dataRootOverride: '',
 };
 
-export type PoolKey = 'gemini' | 'argon' | 'nonGoogle';
+export type PoolKey = 'gemini' | 'nonGoogle';
+
+export type PanelTabId = 'overview' | 'details';
+export type OverviewSectionId = 'quota' | 'forecast' | 'sessions' | 'unattached';
+export type DetailsSectionId = 'sessionSummary' | 'breakdown' | 'subagents' | 'contextChart';
+export type PanelSectionId = OverviewSectionId | DetailsSectionId;
+
+export interface PanelLayoutState {
+  tabOrder: PanelTabId[];
+  sectionOrder: {
+    overview: OverviewSectionId[];
+    details: DetailsSectionId[];
+  };
+  collapsedTabs: PanelTabId[];
+  collapsedSections: PanelSectionId[];
+}
 
 export interface ModelCatalogEntry {
   rawId: string;

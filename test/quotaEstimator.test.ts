@@ -36,17 +36,6 @@ function makeQuota(params: {
           isExhausted: false,
         },
       },
-      argon: {
-        key: 'argon',
-        displayName: 'Gemini 4 Argon',
-        fiveHour: null,
-        weekly: {
-          window: "weekly", remainingPct: params.argonWeekly ?? 75, remainingFraction: (params.argonWeekly ?? 75) / 100,
-          resetTime: new Date(now + 400_000_000).toISOString(),
-          isReady: false,
-          isExhausted: false,
-        },
-      },
       nonGoogle: {
         key: 'nonGoogle',
         displayName: 'Claude & GPT',
@@ -214,12 +203,12 @@ test('QuotaEstimator: persists calibration across load/flush and handles window 
     const est1 = new QuotaEstimator({ storagePath });
     await est1.load();
     est1.observe({
-      quota: makeQuota({ argonWeekly: 75 }),
+      quota: makeQuota({ geminiWeekly: 75 }),
       nodes: [makeSession({ id: 'a1', model: 'Gemini 4 Argon (Low)', fresh: 0, cacheRead: 0, output: 0 })],
       nowMs: 1_000,
     });
     est1.observe({
-      quota: makeQuota({ argonWeekly: 70 }),
+      quota: makeQuota({ geminiWeekly: 70 }),
       nodes: [makeSession({ id: 'a1', model: 'Gemini 4 Argon (Low)', fresh: 10_000, cacheRead: 40_000, output: 5_000 })],
       nowMs: 2_000,
     });
@@ -229,7 +218,7 @@ test('QuotaEstimator: persists calibration across load/flush and handles window 
     const est2 = new QuotaEstimator({ storagePath });
     await est2.load();
     const res = est2.observe({
-      quota: makeQuota({ argonWeekly: 70 }),
+      quota: makeQuota({ geminiWeekly: 70 }),
       nodes: [makeSession({ id: 'a1', model: 'Gemini 4 Argon (Low)', fresh: 10_000, cacheRead: 40_000, output: 5_000 })],
       nowMs: 3_000,
     });
@@ -327,5 +316,128 @@ test('QuotaEstimator: recursive child-subagent token aggregation and pre-calibra
   assert.equal(flash2.fiveHour?.status, 'calibrated');
   assert.equal(flash2.fiveHour?.estimatedTotalTokens, 1_500_000);
   assert.equal(flash2.fiveHour?.estimatedBilledTokens, 300_000);
+});
+
+test('QuotaEstimator: tokens accumulated across multiple no-drop ticks are properly summed on later drop', () => {
+  const estimator = new QuotaEstimator();
+  const s1 = makeSession({
+    id: 's1',
+    model: 'Gemini 3.8 Flash',
+    fresh: 10_000,
+    cacheRead: 0,
+    output: 0,
+  });
+
+  // Tick 1 (Baseline): 80% remaining -> calibrating
+  estimator.observe({
+    quota: makeQuota({ gemini5h: 80 }),
+    nodes: [s1],
+    nowMs: 1_000_000,
+  });
+
+  // Tick 2 (No drop): +20k fresh tokens, still 80%
+  const s1Tick2 = makeSession({
+    id: 's1',
+    model: 'Gemini 3.8 Flash',
+    fresh: 30_000,
+    cacheRead: 0,
+    output: 0,
+  });
+  const res2 = estimator.observe({
+    quota: makeQuota({ gemini5h: 80 }),
+    nodes: [s1Tick2],
+    nowMs: 1_010_000,
+  });
+  const flash2 = res2.find((e) => e.modelLabel === 'Gemini 3.8 Flash');
+  assert.equal(flash2?.fiveHour?.status, 'calibrating');
+  assert.equal(flash2?.fiveHour?.windowUsedTotal, 20_000);
+
+  // Tick 3 (No drop): +30k fresh tokens (total 60k), still 80%
+  const s1Tick3 = makeSession({
+    id: 's1',
+    model: 'Gemini 3.8 Flash',
+    fresh: 60_000,
+    cacheRead: 0,
+    output: 0,
+  });
+  const res3 = estimator.observe({
+    quota: makeQuota({ gemini5h: 80 }),
+    nodes: [s1Tick3],
+    nowMs: 1_020_000,
+  });
+  const flash3 = res3.find((e) => e.modelLabel === 'Gemini 3.8 Flash');
+  assert.equal(flash3?.fiveHour?.status, 'calibrating');
+  assert.equal(flash3?.fiveHour?.windowUsedTotal, 50_000);
+
+  // Tick 4 (Drop arrives): +50k fresh tokens (total 110k), gemini 5h drops 80% -> 75% (-5%)
+  // Total tokens across ticks 2, 3, 4 = 20k + 30k + 50k = 100k!
+  // At -5% drop => 100k / 5 = 20,000 tokens per 1%
+  // Estimated remaining at 75% => 75 * 20,000 = 1,500,000
+  const s1Tick4 = makeSession({
+    id: 's1',
+    model: 'Gemini 3.8 Flash',
+    fresh: 110_000,
+    cacheRead: 0,
+    output: 0,
+  });
+  const res4 = estimator.observe({
+    quota: makeQuota({ gemini5h: 75 }),
+    nodes: [s1Tick4],
+    nowMs: 1_030_000,
+  });
+  const flash4 = res4.find((e) => e.modelLabel === 'Gemini 3.8 Flash');
+  assert.ok(flash4);
+  assert.equal(flash4.fiveHour?.status, 'calibrated');
+  assert.equal(flash4.fiveHour?.sampleCount, 1);
+  assert.equal(Math.round(flash4.fiveHour?.tokensPerPctTotal ?? 0), 20_000);
+  assert.equal(flash4.fiveHour?.estimatedTotalTokens, 1_500_000);
+  assert.equal(flash4.fiveHour?.windowUsedTotal, 100_000);
+});
+
+test('QuotaEstimator: switching node.model on existing session does not attribute historical tokens to new model', () => {
+  const estimator = new QuotaEstimator();
+
+  // Tick 1: session s1 has 5,000,000 tokens on Flash
+  const s1 = makeSession({
+    id: 's1',
+    model: 'Gemini 3.8 Flash',
+    fresh: 5_000_000,
+    cacheRead: 0,
+    output: 0,
+  });
+  estimator.observe({
+    quota: makeQuota({ gemini5h: 80 }),
+    nodes: [s1],
+    nowMs: 1_000_000,
+  });
+
+  // Tick 2: s1 switches model to Hydrogen mid-session and generates only 10,000 new tokens (5,010,000 total).
+  // Quota drops by 5% (80% -> 75%).
+  // Hydrogen should only see the +10,000 delta, NOT 5,010,000!
+  const s1Switched = makeSession({
+    id: 's1',
+    model: 'Gemini 4 Hydrogen',
+    fresh: 5_010_000,
+    cacheRead: 0,
+    output: 0,
+  });
+  const res2 = estimator.observe({
+    quota: makeQuota({ gemini5h: 75 }),
+    nodes: [s1Switched],
+    nowMs: 1_010_000,
+  });
+
+  const hydrogen = res2.find((e) => e.modelLabel === 'Gemini 4 Hydrogen');
+  assert.ok(hydrogen);
+  assert.equal(hydrogen.fiveHour?.status, 'calibrated');
+  assert.equal(hydrogen.fiveHour?.sampleCount, 1);
+  // 10,000 / 5 = 2,000 tokens per 1% (NOT (5M + 10k) / 5)
+  assert.equal(Math.round(hydrogen.fiveHour?.tokensPerPctTotal ?? 0), 2_000);
+  assert.equal(hydrogen.fiveHour?.estimatedTotalTokens, 150_000);
+  assert.equal(hydrogen.fiveHour?.windowUsedTotal, 10_000);
+
+  // Flash should not have any calibration or window usage from this switch
+  const flash = res2.find((e) => e.modelLabel === 'Gemini 3.8 Flash');
+  assert.equal(flash?.fiveHour?.sampleCount ?? 0, 0);
 });
 

@@ -170,7 +170,7 @@ export function resolveModelName(
 }
 
 /**
- * Infers the quota pool key ('gemini', 'argon', or 'nonGoogle') from a model name or label.
+ * Infers the quota pool key ('gemini' or 'nonGoogle') from a model name or label.
  */
 export function inferModelPool(
   rawOrLabel: string,
@@ -200,11 +200,8 @@ export function inferModelPool(
     }
   }
 
-  // 2. Fallbacks: argon first, then gemini, else nonGoogle
-  if (/argon/i.test(rawOrLabel)) {
-    return 'argon';
-  }
-  if (/gemini/i.test(rawOrLabel)) {
+  // 2. Fallbacks: gemini (including argon) vs nonGoogle
+  if (/gemini|argon/i.test(rawOrLabel)) {
     return 'gemini';
   }
   return 'nonGoogle';

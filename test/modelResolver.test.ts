@@ -13,7 +13,7 @@ test('resolveModelName: live catalog matches placeholder enum, modelId, and subs
       label: 'Gemini 4 Argon (Custom)',
       rawId: 'MODEL_PLACEHOLDER_M999',
       modelId: 'gemini-4-argon-custom',
-      poolKey: 'argon',
+      poolKey: 'gemini',
     },
     {
       label: 'Claude Opus 4.6 (Thinking)',
@@ -49,8 +49,8 @@ test('resolveModelName: SQLite slugs humanize cleanly and unknown inputs do not 
 });
 
 test('inferModelPool: classifies argon, nonGoogle, and gemini accurately', () => {
-  assert.equal(inferModelPool('Gemini 4 Argon (Low)'), 'argon');
-  assert.equal(inferModelPool('gemini-4-argon-trial'), 'argon');
+  assert.equal(inferModelPool('Gemini 4 Argon (Low)'), 'gemini');
+  assert.equal(inferModelPool('gemini-4-argon-trial'), 'gemini');
   assert.equal(inferModelPool('Claude Opus 4.6 (Thinking)'), 'nonGoogle');
   assert.equal(inferModelPool('Claude Sonnet 4.6'), 'nonGoogle');
   assert.equal(inferModelPool('GPT-OSS 120B (Medium)'), 'nonGoogle');

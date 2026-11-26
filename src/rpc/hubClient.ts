@@ -44,7 +44,6 @@ function buildOfflineQuota(nowMs: number, error?: string): QuotaSnapshot {
     source: 'none',
     pools: {
       gemini: buildEmptyPool('gemini', 'Gemini Models'),
-      argon: buildEmptyPool('argon', 'Gemini 4 Argon'),
       nonGoogle: buildEmptyPool('nonGoogle', 'Claude & GPT'),
     },
     fetchedAt: nowMs,
@@ -182,7 +181,6 @@ export function computeBackoffWithJitterMs(
 export function normalizeQuotaFromSummary(raw: unknown, nowMs = Date.now()): QuotaSnapshot {
   const pools: Record<PoolKey, QuotaPool> = {
     gemini: buildEmptyPool('gemini', 'Gemini Models'),
-    argon: buildEmptyPool('argon', 'Gemini 4 Argon'),
     nonGoogle: buildEmptyPool('nonGoogle', 'Claude & GPT'),
   };
 
@@ -221,14 +219,7 @@ export function normalizeQuotaFromSummary(raw: unknown, nowMs = Date.now()): Quo
       const windowKey: '5h' | 'weekly' = isWeekly ? 'weekly' : '5h';
 
       const target = `${groupName} ${bucketId ?? ''}`;
-      let poolKey: PoolKey;
-      if (/argon/i.test(target)) {
-        poolKey = 'argon';
-      } else if (/gemini/i.test(target)) {
-        poolKey = 'gemini';
-      } else {
-        poolKey = 'nonGoogle';
-      }
+      const poolKey: PoolKey = /gemini|argon/i.test(target) ? 'gemini' : 'nonGoogle';
 
       const evaluated = evaluateQuotaValues(bucket.remainingFraction, bucket.resetTime, nowMs);
       if (!evaluated) {
@@ -262,7 +253,6 @@ export function normalizeQuotaFromSummary(raw: unknown, nowMs = Date.now()): Quo
 export function normalizeQuotaFromUserStatus(raw: unknown, nowMs = Date.now()): QuotaSnapshot {
   const pools: Record<PoolKey, QuotaPool> = {
     gemini: buildEmptyPool('gemini', 'Gemini Models'),
-    argon: buildEmptyPool('argon', 'Gemini 4 Argon'),
     nonGoogle: buildEmptyPool('nonGoogle', 'Claude & GPT'),
   };
 
@@ -287,14 +277,7 @@ export function normalizeQuotaFromUserStatus(raw: unknown, nowMs = Date.now()): 
     const modelOrAlias = (cfg.modelOrAlias ?? {}) as Record<string, unknown>;
     const name = `${cfg.label ?? ''} ${modelOrAlias.model ?? ''}`.trim();
 
-    let poolKey: PoolKey;
-    if (/argon/i.test(name)) {
-      poolKey = 'argon';
-    } else if (/gemini/i.test(name)) {
-      poolKey = 'gemini';
-    } else {
-      poolKey = 'nonGoogle';
-    }
+    const poolKey: PoolKey = /gemini|argon/i.test(name) ? 'gemini' : 'nonGoogle';
 
     const quotaInfo = (cfg.quotaInfo ?? {}) as Record<string, unknown>;
     const resetTimeStr = typeof quotaInfo.resetTime === 'string' ? quotaInfo.resetTime.trim() : '';

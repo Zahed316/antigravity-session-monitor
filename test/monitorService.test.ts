@@ -51,19 +51,6 @@ function createMockQuota(status: 'online' | 'offline' = 'online'): QuotaSnapshot
         },
         weekly: null,
       },
-      argon: {
-        key: 'argon',
-        displayName: 'Gemini 4 Argon',
-        fiveHour: null,
-        weekly: {
-          window: 'weekly',
-          remainingPct: 74,
-          remainingFraction: 0.74,
-          resetTime: '2026-11-20T05:00:00Z',
-          isReady: false,
-          isExhausted: false,
-        },
-      },
       nonGoogle: {
         key: 'nonGoogle',
         displayName: 'Non-Google',
