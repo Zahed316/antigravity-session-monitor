@@ -188,17 +188,20 @@ export async function readStandaloneIdeAuthState(
  *   relaunch: { file: string, args: string[] },
  *   processName: string, platform: string,
  *   minSettleMs, waitTimeoutMs, graceKillTimeoutMs, forceKillTimeoutMs,
- *   killEnabled: boolean, resultPath: string
+ *   killEnabled: boolean, killCommand?: { file, args } (test seam),
+ *   resultPath: string
  * }
  *
  * Safety contract (task-7 rules):
  * 1. Aborts BEFORE modifying `state.vscdb` when the `-wal`/`-shm` sidecars
  *    never clear (escalating graceful->force kill of the IDE image first) or
- *    when the `.bak` copy fails.
+ *    when the `.bak` copy fails its integrity check.
  * 2. Writes ONLY the payload keys via targeted `INSERT OR REPLACE` (node:sqlite
  *    -> sqlite3 CLI -> python3 backends), then re-reads and byte-verifies every
  *    key; on any failure restores the `.bak` copy.
  * 3. Relaunches the IDE with ELECTRON_RUN_AS_NODE cleared.
+ * 4. The payload file carries the target access token and is deleted on EVERY
+ *    exit path (success and failure alike).
  */
 export function buildStandaloneSwitchWorkerScript(): string {
   return String.raw`'use strict';
@@ -210,6 +213,7 @@ export function buildStandaloneSwitchWorkerScript(): string {
  */
 const fs = require('fs');
 const cp = require('child_process');
+const crypto = require('crypto');
 
 function sleepSync(ms) {
   try {
@@ -228,13 +232,18 @@ function sidecarFilesPresent(dbPath) {
   return exists(dbPath + '-wal') || exists(dbPath + '-shm');
 }
 
-function killProcess(processName, platform, force) {
+function killProcess(payload, force) {
   try {
-    if (platform === 'win32') {
-      cp.execFileSync('taskkill', force ? ['/F', '/IM', processName + '.exe'] : ['/IM', processName + '.exe'], { stdio: 'ignore', timeout: 8000 });
+    if (payload.killCommand) {
+      // Test seam: injected kill command; 'force'/'term' appended as the last arg.
+      cp.execFileSync(payload.killCommand.file, payload.killCommand.args.concat(force ? 'force' : 'term'), { stdio: 'ignore', timeout: 8000 });
+      return;
+    }
+    if (payload.platform === 'win32') {
+      cp.execFileSync('taskkill', force ? ['/F', '/IM', payload.processName + '.exe'] : ['/IM', payload.processName + '.exe'], { stdio: 'ignore', timeout: 8000 });
     } else {
       // -x: exact image-name match only, so this worker is never its own victim.
-      cp.execFileSync('pkill', [force ? '-9' : '-TERM', '-x', processName], { stdio: 'ignore', timeout: 8000 });
+      cp.execFileSync('pkill', [force ? '-9' : '-TERM', '-x', payload.processName], { stdio: 'ignore', timeout: 8000 });
     }
   } catch (_) {
     // No matching process or missing tool: nothing to kill.
@@ -255,7 +264,7 @@ function waitIdeExit(payload) {
       sleepSync(50);
     }
     if (phase.kill !== null && payload.killEnabled !== false) {
-      killProcess(payload.processName, payload.platform, phase.kill);
+      killProcess(payload, phase.kill);
     }
   }
   return !sidecarFilesPresent(payload.stateDbPath);
@@ -264,8 +273,11 @@ function waitIdeExit(payload) {
 function copyBackup(dbPath) {
   const bakPath = dbPath + '.bak';
   fs.copyFileSync(dbPath, bakPath);
-  if (fs.statSync(bakPath).size !== fs.statSync(dbPath).size) {
-    throw new Error('backup size mismatch');
+  const dbBuf = fs.readFileSync(dbPath);
+  const bakBuf = fs.readFileSync(bakPath);
+  // Byte-length + content hash: a truncated or torn copy must abort the switch.
+  if (bakBuf.length !== dbBuf.length || crypto.createHash('sha256').update(dbBuf).digest('hex') !== crypto.createHash('sha256').update(bakBuf).digest('hex')) {
+    throw new Error('backup integrity check failed');
   }
   return bakPath;
 }
@@ -389,9 +401,7 @@ function run(payload, payloadPath) {
     try { fs.copyFileSync(bakPath, payload.stateDbPath); } catch (_) { /* best effort restore */ }
     return { ok: false, stage: failStage, restored: true };
   }
-  try { fs.unlinkSync(payloadPath); } catch (_) { /* best effort cleanup */ }
-  try { fs.unlinkSync(__filename); } catch (_) { /* best effort cleanup */ }
-  return { ok: true, stage: 'done', relaunched: relaunchIde(payload) };
+  return { ok: true, stage: 'done', relaunched: relaunchIde(payload), backupPath: bakPath };
 }
 
 function main() {
@@ -405,6 +415,11 @@ function main() {
   } catch (err) {
     result = { ok: false, stage: 'worker_error', message: String((err && err.message) || err) };
   }
+  // The payload carries the target access token: purge it on EVERY exit path.
+  if (payloadPath) {
+    try { fs.unlinkSync(payloadPath); } catch (_) { /* best effort */ }
+  }
+  try { fs.unlinkSync(__filename); } catch (_) { /* best effort */ }
   if (payload && payload.resultPath) {
     try { fs.writeFileSync(payload.resultPath, JSON.stringify(result)); } catch (_) { /* best effort */ }
   }
@@ -436,6 +451,8 @@ export interface StandaloneSwitchPayload {
   graceKillTimeoutMs: number;
   forceKillTimeoutMs: number;
   killEnabled: boolean;
+  /** Test seam: overrides the pkill/taskkill escalation when present. */
+  killCommand?: { file: string; args: string[] };
   resultPath: string;
 }
 
@@ -460,15 +477,20 @@ export interface StandaloneSwitchParams {
   platform?: NodeJS.Platform;
   env?: NodeJS.ProcessEnv;
   nodeExecPath?: string;
-  fs?: Pick<typeof fsModule, 'mkdir' | 'writeFile'>;
+  fs?: Pick<typeof fsModule, 'mkdir' | 'writeFile' | 'unlink' | 'readFile'>;
   spawn?: SpawnLike;
   quitIde?: () => Promise<void> | void;
   timeouts?: StandaloneSwitchTimeouts;
+  /** Max time to wait for the worker's result file; 0 = fire-and-forget (tests). */
+  waitForResultMs?: number;
+  delay?: (ms: number) => Promise<void>;
 }
 
 export interface StandaloneSwitchOutcome {
   launched: boolean;
   reason?: string;
+  /** Path of the safety backup copy, for user-visible recovery instructions. */
+  backupPath?: string;
 }
 
 function bytesB64(bytes: Uint8Array | string): string {
@@ -482,10 +504,14 @@ function entryValueB64(entry: string): string {
 function buildSwitchKeys(targetEmail: string, ideState: VaultIdeState): StandaloneSwitchPayloadKey[] {
   const keys: StandaloneSwitchPayloadKey[] = [];
   if (ideState.oauthToken) {
-    // shortcut: refreshToken/expiry are not carried by VaultIdeState, so the
-    // entry is re-encoded with an empty refresh token — the IDE re-derives it
-    // via official refresh on next launch; upgrade once a live capture shows
-    // the required values.
+    // UNVERIFIED ASSUMPTION (no live capture): refreshToken '' and
+    // expirySeconds 0 are written because VaultIdeState does not carry them —
+    // no refresh/expiry data is invented here. Either the IDE re-derives the
+    // refresh token via official refresh on next launch, OR it treats the
+    // entry as expired/malformed and forces a full re-login (defeating the
+    // switch). Live capture of the real entry is a release prerequisite
+    // (task-7-report); the `.bak` copy reported to the user is the recovery
+    // path for the forced-re-login outcome.
     keys.push({
       key: OAUTH_TOKEN_STATE_KEY,
       valueB64: entryValueB64(
@@ -515,13 +541,32 @@ function buildRelaunch(ideInfo: StandaloneIdeInfo, platform: NodeJS.Platform): S
   return { file: ideInfo.executablePath, args: [] };
 }
 
+const RESULT_POLL_INTERVAL_MS = 100;
+const RESULT_WAIT_MARGIN_MS = 5_000;
+
+async function cleanupFiles(
+  fsDep: Pick<typeof fsModule, 'unlink'>,
+  files: readonly string[],
+): Promise<void> {
+  for (const file of files) {
+    try {
+      await fsDep.unlink(file);
+    } catch {
+      // Absent or already removed: fine.
+    }
+  }
+}
+
 /**
  * Launches the detached switch worker for the standalone IDE, then asks the
  * host IDE to quit. The worker owns the whole DB transaction: it waits for the
  * IDE to exit and the `-wal`/`-shm` sidecars to clear, copies `state.vscdb` to
  * `.bak` (aborting untouched on failure), writes only the 4 auth keys with
- * byte verification, restores `.bak` on failure, deletes the payload, and
- * relaunches the IDE with `ELECTRON_RUN_AS_NODE` cleared.
+ * byte verification, restores `.bak` on failure, deletes the payload (on every
+ * exit path — it carries the target access token), and relaunches the IDE with
+ * `ELECTRON_RUN_AS_NODE` cleared. The worker's result file is read back so the
+ * caller gets the REAL outcome (wal_timeout / bak_copy_failed / write_failed
+ * surface as a failed switch), and is deleted after being consumed.
  */
 export async function performStandaloneIdeSwitch(params: StandaloneSwitchParams): Promise<StandaloneSwitchOutcome> {
   if (!params.globalStorageDir) {
@@ -530,6 +575,7 @@ export async function performStandaloneIdeSwitch(params: StandaloneSwitchParams)
   const fsDep = params.fs ?? fsModule;
   const platform = params.platform ?? process.platform;
   const ideInfo = params.ideInfo ?? resolveStandaloneIdeInfo({ platform, env: params.env });
+  const backupPath = `${ideInfo.stateDbPath}.bak`;
   const payload: StandaloneSwitchPayload = {
     stateDbPath: ideInfo.stateDbPath,
     keys: buildSwitchKeys(params.targetEmail, params.ideState),
@@ -545,10 +591,16 @@ export async function performStandaloneIdeSwitch(params: StandaloneSwitchParams)
   };
   const payloadPath = path.join(params.globalStorageDir, SWITCH_PAYLOAD_FILE);
   const workerPath = path.join(params.globalStorageDir, SWITCH_WORKER_FILE);
+  const resultPath = payload.resultPath;
+
+  // Stale artifacts from a previous crashed run must never be mistaken for
+  // this run's output (and may contain an old access token).
+  await cleanupFiles(fsDep, [payloadPath, workerPath, resultPath]);
 
   try {
     await fsDep.mkdir(params.globalStorageDir, { recursive: true });
-    await fsDep.writeFile(payloadPath, JSON.stringify(payload), 'utf8');
+    // 0600: the payload carries the target account's access token.
+    await fsDep.writeFile(payloadPath, JSON.stringify(payload), { encoding: 'utf8', mode: 0o600 });
     await fsDep.writeFile(workerPath, buildStandaloneSwitchWorkerScript(), 'utf8');
   } catch {
     return { launched: false, reason: 'worker_files_write_failed' };
@@ -557,14 +609,16 @@ export async function performStandaloneIdeSwitch(params: StandaloneSwitchParams)
   try {
     // ELECTRON_RUN_AS_NODE=1 turns the Electron host binary into a plain Node
     // runtime for the detached worker; the worker clears it before relaunching
-    // the IDE.
+    // the IDE. Default to the parent env so the worker inherits PATH for its
+    // pkill/taskkill/sqlite3/python3 subprocesses.
     const child = (params.spawn ?? nodeSpawn)(params.nodeExecPath ?? process.execPath, [workerPath, payloadPath], {
       detached: true,
       stdio: 'ignore',
-      env: { ...params.env, ELECTRON_RUN_AS_NODE: '1' },
+      env: { ...(params.env ?? process.env), ELECTRON_RUN_AS_NODE: '1' },
     });
     child.unref?.();
   } catch {
+    await cleanupFiles(fsDep, [payloadPath, workerPath]);
     return { launched: false, reason: 'worker_spawn_failed' };
   }
 
@@ -574,5 +628,29 @@ export async function performStandaloneIdeSwitch(params: StandaloneSwitchParams)
   } catch {
     // Ignored: worker forces the IDE exit if quit never happens.
   }
-  return { launched: true };
+
+  const waitForResultMs =
+    params.waitForResultMs ??
+    payload.minSettleMs + payload.waitTimeoutMs + payload.graceKillTimeoutMs + payload.forceKillTimeoutMs + RESULT_WAIT_MARGIN_MS;
+  if (waitForResultMs <= 0) {
+    return { launched: true, backupPath };
+  }
+  const delay = params.delay ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  const deadline = Date.now() + waitForResultMs;
+  while (Date.now() < deadline) {
+    await delay(RESULT_POLL_INTERVAL_MS);
+    try {
+      const raw = await fsDep.readFile(resultPath, 'utf8');
+      const parsed = JSON.parse(raw) as { ok?: boolean; stage?: string };
+      // Consumed: the result file is transient scratch, not a kept artifact.
+      await cleanupFiles(fsDep, [resultPath]);
+      if (parsed.ok) {
+        return { launched: true, backupPath };
+      }
+      return { launched: false, reason: parsed.stage ?? 'worker_error', backupPath };
+    } catch {
+      // Result not written yet: keep polling until the deadline.
+    }
+  }
+  return { launched: false, reason: 'switch_result_timeout', backupPath };
 }

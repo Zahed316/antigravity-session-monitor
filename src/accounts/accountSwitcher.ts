@@ -44,7 +44,7 @@ export interface AccountSwitchResult {
 
 export type PerformStandaloneIdeSwitchFn = (
   params: StandaloneSwitchParams,
-) => Promise<{ launched: boolean; reason?: string }> | { launched: boolean; reason?: string };
+) => Promise<{ launched: boolean; reason?: string; backupPath?: string }> | { launched: boolean; reason?: string; backupPath?: string };
 
 export interface AccountSwitcherDeps {
   vault: SwitcherVault;
@@ -57,6 +57,10 @@ export interface AccountSwitcherDeps {
   /** Confirmation prompt; when absent the switch proceeds (caller owns prompting). */
   confirmSwitch?: (targetEmail: string) => Promise<boolean> | boolean;
   performStandaloneIdeSwitch?: PerformStandaloneIdeSwitchFn;
+  /** Asks the standalone IDE to quit after the worker is launched (e.g. the `workbench.action.quit` command). */
+  quitIde?: () => Promise<void> | void;
+  /** Parent environment passed to the detached switch worker (defaults to process.env). */
+  env?: NodeJS.ProcessEnv;
   /**
    * Verifies the OS keyring write actually took effect for the target (re-read
    * the keyring, or observe that GetUserStatus reports the target email).
@@ -83,6 +87,8 @@ export class AccountSwitcher {
   private readonly globalStorageDir: string | undefined;
   private readonly ideInfo: StandaloneIdeInfo | undefined;
   private readonly platform: NodeJS.Platform | undefined;
+  private readonly quitIde: (() => Promise<void> | void) | undefined;
+  private readonly env: NodeJS.ProcessEnv | undefined;
 
   constructor(deps: AccountSwitcherDeps) {
     this.vault = deps.vault;
@@ -98,6 +104,8 @@ export class AccountSwitcher {
     this.globalStorageDir = deps.globalStorageDir;
     this.ideInfo = deps.ideInfo;
     this.platform = deps.platform;
+    this.quitIde = deps.quitIde;
+    this.env = deps.env;
   }
 
   /**
@@ -141,11 +149,16 @@ export class AccountSwitcher {
         globalStorageDir: this.globalStorageDir ?? '',
         ideInfo: this.ideInfo,
         platform: this.platform,
+        env: this.env,
+        quitIde: this.quitIde,
       });
+      const backupHint = outcome.backupPath ? ` (backup at ${outcome.backupPath})` : '';
       if (!outcome.launched) {
-        return { ok: false, mode: 'failed', message: outcome.reason ?? 'standalone_switch_failed' };
+        // Real worker outcome (wal_timeout / bak_copy_failed / write_failed /
+        // switch_result_timeout): never report an optimistic success.
+        return { ok: false, mode: 'failed', message: `${outcome.reason ?? 'standalone_switch_failed'}${backupHint}` };
       }
-      return { ok: true, mode: 'standalone-restart' };
+      return { ok: true, mode: 'standalone-restart', message: `standalone_switch_launched${backupHint}` };
     }
 
     // VS Code / Cursor host.
@@ -161,6 +174,10 @@ export class AccountSwitcher {
     // (self-healing) instead of clobbering a working entry with a bad payload.
     if (capabilities.osKeyringSupported && this.verifyKeyringSync !== null) {
       // Preserve the currently working credential before overwriting the keyring.
+      // Note the unavoidable verify-after-write window: the keyring holds the
+      // unverified payload from the applyToOsKeyring call until verification
+      // completes; a failed verification is healed by the official login
+      // fallback below, which rewrites the entry through the official client.
       const activeEmail = this.getActiveEmail?.() ?? null;
       if (activeEmail && normalizeEmail(activeEmail) !== email) {
         try {

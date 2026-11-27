@@ -131,12 +131,12 @@ function newTargetKeys(): Array<{ key: string; valueB64: string }> {
   ];
 }
 
-function runWorker(tempDir: string, payload: Record<string, unknown>): { status: number; result: Record<string, unknown> | null } {
+function runWorker(tempDir: string, payload: Record<string, unknown>, env?: NodeJS.ProcessEnv): { status: number; result: Record<string, unknown> | null } {
   const workerPath = path.join(tempDir, '.switch-worker.js');
   fs.writeFileSync(workerPath, buildStandaloneSwitchWorkerScript(), 'utf8');
   const payloadPath = path.join(tempDir, '.switch-payload.json');
   fs.writeFileSync(payloadPath, JSON.stringify(payload), 'utf8');
-  const run = spawnSync(process.execPath, [workerPath, payloadPath], { timeout: 30_000 });
+  const run = spawnSync(process.execPath, [workerPath, payloadPath], { timeout: 30_000, env });
   let result: Record<string, unknown> | null = null;
   try {
     result = JSON.parse(fs.readFileSync(path.join(tempDir, '.switch-result.json'), 'utf8')) as Record<string, unknown>;
@@ -466,13 +466,14 @@ test('performStandaloneIdeSwitch writes payload + worker, spawns detached node, 
     globalStorageDir: dir,
     ideInfo,
     timeouts: { settleMs: 0 },
+    waitForResultMs: 0,
     spawn: recorder.spawn,
     quitIde: async () => {
       quitCalls.push('quit');
     },
   });
 
-  assert.deepEqual(outcome, { launched: true });
+  assert.deepEqual(outcome, { launched: true, backupPath: `${ideInfo.stateDbPath}.bak` });
   assert.equal(recorder.calls.length, 1);
   const call = recorder.calls[0]!;
   assert.equal(call.file, process.execPath, 'spawned via the host node executable');
@@ -519,6 +520,8 @@ test('performStandaloneIdeSwitch reports worker_spawn_failed without quitting th
   });
   assert.deepEqual(outcome, { launched: false, reason: 'worker_spawn_failed' });
   assert.equal(quitCalls.length, 0, 'never quits the IDE when the worker could not start');
+  assert.equal(fs.existsSync(path.join(dir, '.switch-payload.json')), false, 'payload (access token) purged on spawn failure');
+  assert.equal(fs.existsSync(path.join(dir, '.switch-worker.js')), false, 'worker purged on spawn failure');
 });
 
 test('performStandaloneIdeSwitch skips profileUrl when the vault state has none', async () => {
@@ -535,10 +538,170 @@ test('performStandaloneIdeSwitch skips profileUrl when the vault state has none'
       executablePath: '/usr/bin/antigravity',
     },
     timeouts: { settleMs: 0 },
+    waitForResultMs: 0,
     spawn: recorder.spawn,
   });
   const payload = JSON.parse(fs.readFileSync(recorder.calls[0]!.args[1]!, 'utf8')) as { keys: Array<{ key: string }> };
   assert.deepEqual(payload.keys.map((k) => k.key), [OAUTH_TOKEN_STATE_KEY, USER_STATUS_STATE_KEY, ONBOARDING_STATE_KEY]);
+});
+
+test('performStandaloneIdeSwitch purges stale scratch files at entry and writes the payload with mode 0600', async () => {
+  const dir = makeTempDir();
+  const stalePayload = path.join(dir, '.switch-payload.json');
+  const staleWorker = path.join(dir, '.switch-worker.js');
+  const staleResult = path.join(dir, '.switch-result.json');
+  fs.writeFileSync(stalePayload, '{"stale":"old-token"}');
+  fs.writeFileSync(staleWorker, 'process.exit(1);');
+  fs.writeFileSync(staleResult, '{"ok":false,"stage":"stale"}');
+  const recorder = makeSpawnRecorder();
+  const outcome = await performStandaloneIdeSwitch({
+    targetEmail: B_EMAIL,
+    ideState: { oauthToken: makeJwt(B_EMAIL) },
+    globalStorageDir: dir,
+    ideInfo: {
+      dataPath: '/data',
+      stateDbPath: '/data/User/globalStorage/state.vscdb',
+      processName: 'antigravity',
+      executablePath: '/usr/bin/antigravity',
+    },
+    timeouts: { settleMs: 0 },
+    waitForResultMs: 0,
+    spawn: recorder.spawn,
+  });
+  assert.equal(outcome.launched, true);
+  assert.equal(fs.existsSync(staleResult), false, 'stale result file removed at entry');
+  const fresh = JSON.parse(fs.readFileSync(stalePayload, 'utf8')) as { stale?: string; stateDbPath?: string };
+  assert.equal(fresh.stale, undefined, 'stale payload replaced by the fresh one');
+  assert.equal(fresh.stateDbPath, '/data/User/globalStorage/state.vscdb');
+  // eslint-disable-next-line no-bitwise
+  assert.equal(fs.statSync(stalePayload).mode & 0o777, 0o600, 'payload carries the access token: 0600');
+});
+
+test('performStandaloneIdeSwitch reports the real worker outcome (success) and purges scratch files', async () => {
+  const dir = makeTempDir();
+  const dbPath = path.join(dir, 'state.vscdb');
+  await makeStateDb(dbPath, baseFixtureRows());
+  const outcome = await performStandaloneIdeSwitch({
+    targetEmail: B_EMAIL,
+    ideState: { oauthToken: makeJwt(B_EMAIL), profileUrl: 'https://b.example/pic.png' },
+    globalStorageDir: dir,
+    ideInfo: {
+      dataPath: dir,
+      stateDbPath: dbPath,
+      processName: 'antigravity',
+      executablePath: '/nonexistent/antigravity',
+    },
+    timeouts: { settleMs: 10, waitMs: 50, graceKillMs: 50, forceKillMs: 50 },
+    waitForResultMs: 10_000,
+    // default spawn: a real detached node process runs the real worker script
+  });
+  assert.deepEqual(outcome, { launched: true, backupPath: `${dbPath}.bak` }, 'the REAL worker result is surfaced');
+  const rows = await readDbRows(dbPath);
+  const entry = decodeUnifiedStateEntry(rows.get(OAUTH_TOKEN_STATE_KEY)!.toString('binary'));
+  assert.ok(entry);
+  assert.equal(decodeOAuthInfo(entry!.payload)!.email, B_EMAIL);
+  assert.equal(fs.existsSync(path.join(dir, '.switch-payload.json')), false, 'payload (access token) purged on success');
+  assert.equal(fs.existsSync(path.join(dir, '.switch-result.json')), false, 'result file deleted after being read');
+});
+
+test('worker restores the .bak copy on write_failed and purges the payload', async () => {
+  const dir = makeTempDir();
+  const dbPath = path.join(dir, 'state.vscdb');
+  const sqlite = (await import('node:sqlite')) as typeof nodeSqlite;
+  const db = new sqlite.DatabaseSync(dbPath);
+  try {
+    // No ItemTable: every write backend fails, forcing the restore branch.
+    db.exec('CREATE TABLE Other (x TEXT)');
+  } finally {
+    db.close();
+  }
+  const { status, result } = runWorker(dir, {
+    stateDbPath: dbPath,
+    keys: newTargetKeys(),
+    relaunch: { file: '/nonexistent/antigravity', args: [] },
+    processName: 'antigravity',
+    platform: process.platform,
+    minSettleMs: 10,
+    waitTimeoutMs: 50,
+    graceKillTimeoutMs: 50,
+    forceKillTimeoutMs: 50,
+    killEnabled: false,
+    resultPath: path.join(dir, '.switch-result.json'),
+  });
+  assert.equal(status, 1);
+  assert.equal(result?.ok, false);
+  assert.equal(result?.stage, 'write_failed');
+  assert.equal(result?.restored, true, '.bak restored after write/verify failure');
+  const restoredDb = new sqlite.DatabaseSync(dbPath, { readOnly: true });
+  try {
+    const tables = restoredDb.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as Array<{ name: string }>;
+    assert.deepEqual(tables.map((t) => t.name), ['Other'], 'restored DB matches the pre-switch original');
+  } finally {
+    restoredDb.close();
+  }
+  assert.equal(fs.existsSync(path.join(dir, '.switch-payload.json')), false, 'payload purged on the failure path too');
+});
+
+test('worker kill escalation runs the injected kill command (term then force) before aborting', async () => {
+  const dir = makeTempDir();
+  const dbPath = path.join(dir, 'state.vscdb');
+  await makeStateDb(dbPath, baseFixtureRows());
+  fs.writeFileSync(`${dbPath}-wal`, Buffer.from([1, 2, 3]), 'binary'); // sidecar never clears
+  const killTrace = path.join(dir, 'kill-trace.txt');
+  const { status, result } = runWorker(
+    dir,
+    {
+      stateDbPath: dbPath,
+      keys: newTargetKeys(),
+      relaunch: { file: '/nonexistent/antigravity', args: [] },
+      processName: 'antigravity',
+      platform: process.platform,
+      minSettleMs: 10,
+      waitTimeoutMs: 60,
+      graceKillTimeoutMs: 60,
+      forceKillTimeoutMs: 60,
+      killEnabled: true,
+      killCommand: { file: '/bin/sh', args: ['-c', 'echo "$1" >> "$GW_KILL_TRACE"', 'sh'] },
+      resultPath: path.join(dir, '.switch-result.json'),
+    },
+    { ...process.env, GW_KILL_TRACE: killTrace },
+  );
+  assert.equal(status, 1);
+  assert.equal(result?.stage, 'wal_timeout');
+  assert.equal(fs.existsSync(`${dbPath}.bak`), false, 'no .bak before the sidecars clear');
+  assert.equal(fs.readFileSync(killTrace, 'utf8'), 'term\nforce\n', 'graceful kill then force kill, in order');
+});
+
+test('worker relaunches the IDE with ELECTRON_RUN_AS_NODE deleted from the environment', async () => {
+  const dir = makeTempDir();
+  const dbPath = path.join(dir, 'state.vscdb');
+  await makeStateDb(dbPath, baseFixtureRows());
+  const envTrace = path.join(dir, 'env-trace.txt');
+  const relaunchScript = path.join(dir, 'relaunch.sh');
+  fs.writeFileSync(relaunchScript, `#!/bin/sh\nenv > '${envTrace}'\n`, { mode: 0o755 });
+  const { status, result } = runWorker(
+    dir,
+    {
+      stateDbPath: dbPath,
+      keys: newTargetKeys(),
+      relaunch: { file: relaunchScript, args: [] },
+      processName: 'antigravity',
+      platform: process.platform,
+      minSettleMs: 10,
+      waitTimeoutMs: 50,
+      graceKillTimeoutMs: 50,
+      forceKillTimeoutMs: 50,
+      killEnabled: false,
+      resultPath: path.join(dir, '.switch-result.json'),
+    },
+    // Simulate the production spawn contract: the worker itself runs Electron-as-node.
+    { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
+  );
+  assert.equal(status, 0);
+  assert.equal(result?.ok, true);
+  const envText = fs.readFileSync(envTrace, 'utf8');
+  assert.equal(/^ELECTRON_RUN_AS_NODE=/m.test(envText), false, 'ELECTRON_RUN_AS_NODE deleted for the relaunched IDE');
+  assert.ok(/^PATH=/m.test(envText), 'relaunched IDE keeps a usable PATH');
 });
 
 // ---------- AccountSwitcher routing ----------
@@ -548,6 +711,7 @@ interface SwitcherHarness {
   storeCalls: string[];
   hubCalls: string[];
   performCalls: StandaloneSwitchParams[];
+  quitCalls: string[];
   switcher: AccountSwitcher;
 }
 
@@ -566,19 +730,21 @@ function makeSwitcherHarness(overrides: {
   isStandaloneIde?: boolean;
   confirmSwitch?: (email: string) => Promise<boolean> | boolean;
   verifyKeyringSync?: () => Promise<boolean> | boolean;
-  performStandaloneIdeSwitch?: (params: StandaloneSwitchParams) => Promise<{ launched: boolean; reason?: string }>;
+  performStandaloneIdeSwitch?: (params: StandaloneSwitchParams) => Promise<{ launched: boolean; reason?: string; backupPath?: string }>;
   activeEmail?: string | null;
 } = {}): SwitcherHarness {
   const vaultCalls: string[] = [];
   const storeCalls: string[] = [];
   const hubCalls: string[] = [];
   const performCalls: StandaloneSwitchParams[] = [];
+  const quitCalls: string[] = [];
   const endpoint = overrides.endpoint === undefined ? ENDPOINT : overrides.endpoint;
   const harness: SwitcherHarness = {
     vaultCalls,
     storeCalls,
     hubCalls,
     performCalls,
+    quitCalls,
     switcher: new AccountSwitcher({
       vault: {
         getCredential: async (email: string) => {
@@ -627,11 +793,16 @@ function makeSwitcherHarness(overrides: {
         overrides.performStandaloneIdeSwitch ??
         (async (params: StandaloneSwitchParams) => {
           performCalls.push(params);
+          await params.quitIde?.();
           return { launched: true };
         }),
       verifyKeyringSync: overrides.verifyKeyringSync,
       getActiveEmail: () => overrides.activeEmail ?? null,
       globalStorageDir: '/tmp/gw-global',
+      quitIde: async () => {
+        quitCalls.push('quitIde');
+      },
+      env: { GW_TEST_PARENT_ENV: 'parent-env' },
     }),
   };
   return harness;
@@ -648,13 +819,31 @@ test('routing 1: standalone IDE + valid vault + confirmation -> performStandalon
     },
   });
   const res = await h.switcher.switchToAccount(` ${B_EMAIL.toUpperCase()} `);
-  assert.deepEqual(res, { ok: true, mode: 'standalone-restart' });
+  assert.deepEqual(res, { ok: true, mode: 'standalone-restart', message: 'standalone_switch_launched' });
   assert.deepEqual(confirmCalls, [B_EMAIL]);
   assert.equal(h.performCalls.length, 1);
   assert.equal(h.performCalls[0]!.targetEmail, B_EMAIL);
   assert.equal(h.performCalls[0]!.ideState.oauthToken, makeJwt(B_EMAIL));
+  assert.equal(typeof h.performCalls[0]!.quitIde, 'function', 'quitIde passed through to the worker launcher');
+  assert.equal(h.performCalls[0]!.env?.GW_TEST_PARENT_ENV, 'parent-env', 'env passed through to the worker launcher');
+  assert.deepEqual(h.quitCalls, ['quitIde'], 'the passed quitIde is the one invoked');
   assert.deepEqual(h.hubCalls, [], 'no hub RPC on the standalone path');
   assert.deepEqual(h.storeCalls, [], 'no status change on the standalone path');
+});
+
+test('routing 1: a failed standalone worker outcome surfaces as a failed switch (no optimistic ok)', async () => {
+  const h = makeSwitcherHarness({
+    isStandaloneIde: true,
+    record: validRecordFor(B_EMAIL),
+    confirmSwitch: async () => true,
+    performStandaloneIdeSwitch: async () => ({ launched: false, reason: 'wal_timeout', backupPath: '/data/User/globalStorage/state.vscdb.bak' }),
+  });
+  const res = await h.switcher.switchToAccount(B_EMAIL);
+  assert.deepEqual(res, {
+    ok: false,
+    mode: 'failed',
+    message: 'wal_timeout (backup at /data/User/globalStorage/state.vscdb.bak)',
+  });
 });
 
 test('routing 1: standalone IDE switch cancelled by the user', async () => {

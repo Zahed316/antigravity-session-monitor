@@ -6,9 +6,11 @@
  *
  * Field maps are derived from observed standalone-IDE entries and are NOT
  * verified against a live Antigravity capture on this host (see
- * task-7-report residual risks). Every consumer therefore treats encoded
- * values as unverified until the IDE re-reads them after relaunch, and the
- * switch worker restores the `.bak` copy when the IDE-side state breaks.
+ * task-7-report residual risks). Containment is worker-side only: the switch
+ * worker byte-verifies every write and restores its `.bak` copy when the
+ * worker's own write/verify fails. IDE-side rejection of a wrongly-encoded
+ * value is NOT covered by any automatic restore — recovery requires a manual
+ * `.bak` restore or an official re-login.
  */
 
 const WIRE_VARINT = 0;
