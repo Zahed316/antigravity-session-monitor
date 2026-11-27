@@ -670,6 +670,8 @@ export async function performStandaloneIdeSwitch(params: StandaloneSwitchParams)
     await fsDep.writeFile(payloadPath, JSON.stringify(payload), { encoding: 'utf8', mode: 0o600 });
     await fsDep.writeFile(workerPath, buildStandaloneSwitchWorkerScript(), 'utf8');
   } catch {
+    // A partial write may have left the token-bearing payload behind.
+    await cleanupFiles(fsDep, [payloadPath, workerPath, resultPath]);
     return { launched: false, reason: 'worker_files_write_failed' };
   }
 

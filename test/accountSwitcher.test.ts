@@ -625,6 +625,34 @@ test('performStandaloneIdeSwitch purges stale scratch files at entry and writes 
   assert.equal(fs.existsSync(staleWorker), false, 'worker purged before returning');
 });
 
+test('performStandaloneIdeSwitch purges the token payload when the worker write fails', async () => {
+  const dir = makeTempDir();
+  const recFs = makeRecordingFs();
+  let calls = 0;
+  // Payload writes fine; the worker write (second writeFile) throws.
+  const flakyFs = {
+    ...recFs.fs,
+    writeFile: async (file: fs.PathLike, data: string, opts?: { encoding?: BufferEncoding; mode?: number }) => {
+      if (++calls === 2) throw new Error('disk full');
+      await recFs.fs.writeFile(file, data, opts);
+    },
+  };
+  const recorder = makeSpawnRecorder();
+  const outcome = await performStandaloneIdeSwitch({
+    targetEmail: B_EMAIL,
+    ideState: { oauthToken: makeJwt(B_EMAIL) },
+    globalStorageDir: dir,
+    ideInfo: baseIdeInfo(dir),
+    fs: flakyFs as unknown as NonNullable<StandaloneSwitchParams['fs']>,
+    timeouts: { settleMs: 0 },
+    waitForResultMs: 0,
+    spawn: recorder.spawn,
+  });
+  assert.equal(outcome.launched, false);
+  assert.equal(outcome.reason, 'worker_files_write_failed');
+  assert.equal(fs.existsSync(path.join(dir, '.switch-payload.json')), false, 'token payload purged on the write-failure path');
+});
+
 test('performStandaloneIdeSwitch reports the real worker outcome (success), deletes the .bak, and purges scratch files', async () => {
   const dir = makeTempDir();
   const dbPath = path.join(dir, 'state.vscdb');
