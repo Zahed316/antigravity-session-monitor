@@ -13,6 +13,7 @@ import {
   type TokenBreakdownGroup,
 } from '../types.ts';
 import { inferModelPool } from '../core/modelResolver.ts';
+import type { AccountIdentity } from '../types.ts';
 import type { HubEndpoint } from './hubDiscovery.ts';
 
 const DEFAULT_TIMEOUT_MS = 4000;
@@ -368,6 +369,76 @@ export function extractModelCatalogFromUserStatus(raw: unknown): ModelCatalogEnt
 }
 
 /**
+ * Formats a raw tier/plan code (g1Tier, plan) into a display label.
+ */
+function formatTierLabel(raw: unknown): string | undefined {
+  if (typeof raw !== 'string' || raw.trim() === '') {
+    return undefined;
+  }
+  const code = raw.trim().toUpperCase();
+  if (code === 'ULTRA') return 'Google AI Ultra';
+  if (code === 'PRO') return 'Google AI Pro';
+  if (code === 'FREE') return 'Google AI Free';
+  return raw.trim();
+}
+
+/**
+ * Extracts AccountIdentity from a GetUserStatus response payload.
+ * Returns null when no email is present (unauthenticated or malformed payload).
+ */
+export function extractUserIdentityFromUserStatus(raw: unknown): AccountIdentity | null {
+  if (!raw || typeof raw !== 'object') {
+    return null;
+  }
+
+  const root = raw as Record<string, unknown>;
+  const status = (root.userStatus ?? root) as Record<string, unknown>;
+
+  const email = typeof status.email === 'string' ? status.email.trim().toLowerCase() : '';
+  if (!email) {
+    return null;
+  }
+
+  const displayName = typeof status.displayName === 'string' ? status.displayName.trim() : '';
+  const profilePictureUrl =
+    typeof status.profilePictureUrl === 'string'
+      ? status.profilePictureUrl.trim()
+      : typeof status.profile_picture_url === 'string'
+        ? status.profile_picture_url.trim()
+        : '';
+
+  const identity: AccountIdentity = { email };
+  if (displayName) {
+    identity.displayName = displayName;
+  }
+
+  const tierLabel = formatTierLabel(status.g1Tier);
+  const planLabel = formatTierLabel(status.plan);
+  if (tierLabel) {
+    identity.tier = tierLabel;
+  }
+  if (typeof status.plan === 'string' && status.plan.trim() !== '') {
+    identity.plan = status.plan.trim();
+  }
+  // plan-only payloads still surface a tier label (e.g. plan: 'ultra')
+  if (!tierLabel && planLabel) {
+    identity.tier = planLabel;
+  }
+
+  if (typeof status.isPro === 'boolean') {
+    identity.isPro = status.isPro;
+  } else if (identity.tier && /ultra|pro/i.test(identity.tier)) {
+    identity.isPro = true;
+  }
+
+  if (profilePictureUrl) {
+    identity.profilePictureUrl = profilePictureUrl;
+  }
+
+  return identity;
+}
+
+/**
  * Connect-RPC client for interacting with `agy --hub` language server endpoints.
  */
 export class HubClient {
@@ -702,6 +773,23 @@ export class HubClient {
       return cached ? cached.data : [];
     } catch {
       return cached ? cached.data : [];
+    }
+  }
+
+  /**
+   * Fetches the account identity from GetUserStatus. Returns null when offline or unauthenticated.
+   */
+  async fetchUserIdentity(endpoint: HubEndpoint): Promise<AccountIdentity | null> {
+    try {
+      const res = await this.postRpc(endpoint, 'GetUserStatus', {
+        metadata: { ideName: 'antigravity', extensionName: 'antigravity', locale: 'en' },
+      });
+      if (res && res.statusCode === 200 && res.data) {
+        return extractUserIdentityFromUserStatus(res.data);
+      }
+      return null;
+    } catch {
+      return null;
     }
   }
 

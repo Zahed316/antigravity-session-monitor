@@ -50,6 +50,15 @@ export interface ModelCatalogEntry {
   poolKey: PoolKey;
 }
 
+export interface AccountIdentity {
+  email: string;
+  displayName?: string;
+  tier?: string;
+  plan?: string;
+  isPro?: boolean;
+  profilePictureUrl?: string;
+}
+
 export interface QuotaWindow {
   window: '5h' | 'weekly';
   bucketId?: string;
@@ -236,6 +245,8 @@ export interface SessionNode {
   dataSource: 'sqlite' | 'rpc' | 'hybrid';
 }
 
+export type HubSource = 'exports' | 'process' | 'wsl-host' | 'daemon-file';
+
 export interface MonitorState {
   scope: ScopeMode;
   workspacePaths: string[];
@@ -252,7 +263,7 @@ export interface MonitorState {
   modelCatalog?: ModelCatalogEntry[];
   hubStatus: 'connected' | 'offline' | 'discovering';
   hubPort: number | null;
-  hubSource: 'exports' | 'process' | 'wsl-host' | null;
+  hubSource: HubSource | null;
   sqliteBackend: 'node:sqlite' | 'sqlite3-cli' | 'python3' | 'unavailable';
   lastUpdatedAt: number;
   isRefreshing: boolean;

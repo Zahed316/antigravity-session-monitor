@@ -1,5 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import {
   discoverHubEndpoints,
   parseProcessCandidates,
@@ -185,3 +188,85 @@ test('csrfToken is never exposed in endpoint string representations or logging h
   // Ensure we don't accidentally leak tokens in log formatters or error helpers
   assert.ok(typeof endpoint.csrfToken === 'string');
 });
+
+function makeTmpRoot(): string {
+  return fs.mkdtempSync(path.join(os.tmpdir(), 'agy-daemon-test-'));
+}
+
+test('discoverHubEndpoints reads daemon/hub_*.json from antigravityRoot and deduplicates against process endpoints', async () => {
+  const root = makeTmpRoot();
+  const daemonDir = path.join(root, 'daemon');
+  fs.mkdirSync(daemonDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(daemonDir, 'hub_42100.json'),
+    JSON.stringify({ csrfToken: 'daemon-token-42100', httpsPort: 42101, httpPort: 42100, pid: 1234 }),
+  );
+
+  const deps: HubDiscoveryDeps = {
+    antigravityRoot: root,
+    readdir: async (dir) => fs.readdirSync(dir),
+    stat: async (p) => fs.statSync(p),
+    readFile: async (p) => fs.readFileSync(p, 'utf8'),
+    execFileAsync: async () => ({
+      stdout:
+        '101 /bin/agy --hub --hub-port=42100 --app_data_dir=antigravity --csrf_token=proc-dup-token\n' +
+        '102 /bin/agy --hub --hub-port=42200 --app_data_dir=antigravity --csrf_token=proc-only-token',
+      stderr: '',
+    }),
+  };
+
+  try {
+    const endpoints = await discoverHubEndpoints(deps);
+    const daemonEp = endpoints.find((e) => e.source === 'daemon-file');
+
+    assert.ok(daemonEp, 'expected a daemon-file endpoint');
+    assert.equal(daemonEp!.port, 42100);
+    assert.equal(daemonEp!.csrfToken, 'daemon-token-42100');
+    assert.equal(daemonEp!.pid, 1234);
+    assert.equal(daemonEp!.httpsPort, 42101);
+    assert.equal(daemonEp!.host, '127.0.0.1');
+
+    // Deduplication: port 42100 must appear once, daemon-file wins over process on conflict
+    const at42100 = endpoints.filter((e) => e.port === 42100);
+    assert.equal(at42100.length, 1, 'port 42100 should be deduplicated');
+    assert.equal(at42100[0].source, 'daemon-file', 'daemon-file should win over process on port conflict');
+    assert.ok(endpoints.some((e) => e.port === 42200 && e.source === 'process'), 'process-only endpoint kept');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('discoverHubEndpoints checks fallback daemon dirs and tolerates invalid JSON', async () => {
+  const home = makeTmpRoot();
+  const geminiAntigravityDaemon = path.join(home, '.gemini/antigravity/daemon');
+  fs.mkdirSync(geminiAntigravityDaemon, { recursive: true });
+  fs.writeFileSync(
+    path.join(geminiAntigravityDaemon, 'hub_43000.json'),
+    JSON.stringify({ csrfToken: 'tok-43000', httpPort: 43000, pid: 77 }),
+  );
+  const geminiDaemon = path.join(home, '.gemini/daemon');
+  fs.mkdirSync(geminiDaemon, { recursive: true });
+  fs.writeFileSync(path.join(geminiDaemon, 'hub_43100.json'), '{ not valid json');
+  fs.writeFileSync(path.join(geminiDaemon, 'unrelated.txt'), 'noise');
+
+  const deps: HubDiscoveryDeps = {
+    antigravityRoot: '',
+    homeDir: home,
+    readdir: async (dir) => fs.readdirSync(dir),
+    stat: async (p) => fs.statSync(p),
+    readFile: async (p) => fs.readFileSync(p, 'utf8'),
+    execFileAsync: async () => ({ stdout: '', stderr: '' }),
+  };
+
+  try {
+    const endpoints = await discoverHubEndpoints(deps);
+    const byPort = new Map(endpoints.map((e) => [e.port, e]));
+    assert.equal(byPort.get(43000)?.source, 'daemon-file');
+    assert.equal(byPort.get(43000)?.csrfToken, 'tok-43000');
+    assert.equal(byPort.get(43000)?.pid, 77);
+    assert.equal(byPort.get(43100), undefined, 'invalid JSON must be ignored');
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+

@@ -1,5 +1,7 @@
 import { execFile } from 'node:child_process';
 import fs from 'node:fs/promises';
+import { homedir } from 'node:os';
+import path from 'node:path';
 import { promisify } from 'node:util';
 
 const execFileAsync = promisify(execFile);
@@ -8,7 +10,9 @@ export interface HubEndpoint {
   port: number;
   csrfToken: string;
   host: string;
-  source: 'exports' | 'process' | 'wsl-host';
+  source: 'exports' | 'process' | 'wsl-host' | 'daemon-file';
+  pid?: number;
+  httpsPort?: number;
 }
 
 export interface HubDiscoveryDeps {
@@ -21,6 +25,10 @@ export interface HubDiscoveryDeps {
   procVersionText?: string;
   resolvConfText?: string;
   readFile?: (path: string, encoding: string) => Promise<string>;
+  readdir?: (path: string) => Promise<string[]>;
+  stat?: (path: string) => Promise<{ isFile(): boolean }>;
+  antigravityRoot?: string;
+  homeDir?: string;
 }
 
 interface ProcessMatch {
@@ -237,7 +245,13 @@ export async function discoverHubEndpoints(deps: HubDiscoveryDeps = {}): Promise
     });
   }
 
-  // 2. Platform process scanner
+  // 2. Daemon hub_<port>.json files (authoritative: carries pid/httpsPort, wins dedup over process scan)
+  const daemonEndpoints = await discoverDaemonHubEndpoints(deps);
+  for (const ep of daemonEndpoints) {
+    addEndpoint(ep);
+  }
+
+  // 3. Platform process scanner
   const platform = deps.platform ?? process.platform;
   const runner = deps.execFileAsync ?? (execFileAsync as (file: string, args: string[]) => Promise<{ stdout: string; stderr: string }>);
   const workspacePaths = deps.workspacePaths ?? [];
@@ -264,7 +278,7 @@ export async function discoverHubEndpoints(deps: HubDiscoveryDeps = {}): Promise
     // Process scanning failed or command unavailable, proceed with existing endpoints
   }
 
-  // 3. WSL detection & /etc/resolv.conf nameserver fallback
+  // 4. WSL detection & /etc/resolv.conf nameserver fallback
   const isWsl =
     Boolean(deps.env?.WSL_DISTRO_NAME ?? process.env.WSL_DISTRO_NAME) ||
     Boolean(deps.resolvConfText) ||
@@ -302,5 +316,61 @@ export async function discoverHubEndpoints(deps: HubDiscoveryDeps = {}): Promise
     }
   }
 
+  return endpoints;
+}
+
+function daemonHubDirs(deps: HubDiscoveryDeps): string[] {
+  const home = deps.homeDir ?? homedir();
+  const roots =
+    deps.antigravityRoot !== undefined && deps.antigravityRoot !== ''
+      ? [deps.antigravityRoot, path.join(home, '.gemini/antigravity'), path.join(home, '.gemini')]
+      : [path.join(home, '.gemini/antigravity'), path.join(home, '.gemini')];
+  return roots.map((r) => path.join(r, 'daemon'));
+}
+
+async function discoverDaemonHubEndpoints(deps: HubDiscoveryDeps): Promise<HubEndpoint[]> {
+  const readdir = deps.readdir ?? ((p: string) => fs.readdir(p));
+  const stat = deps.stat ?? ((p: string) => fs.stat(p));
+  const readFile = deps.readFile ?? ((p: string, enc: string) => fs.readFile(p, enc as 'utf8'));
+  const endpoints: HubEndpoint[] = [];
+
+  for (const dir of daemonHubDirs(deps)) {
+    let entries: string[];
+    try {
+      entries = await readdir(dir);
+    } catch {
+      continue;
+    }
+
+    for (const entry of entries) {
+      const match = entry.match(/^hub_(\d+)\.json$/);
+      if (!match) continue;
+      const filePort = parseInt(match[1], 10);
+      if (Number.isNaN(filePort) || filePort <= 0 || filePort > 65535) continue;
+
+      const filePath = path.join(dir, entry);
+      try {
+        const st = await stat(filePath);
+        if (!st.isFile()) continue;
+        const text = await readFile(filePath, 'utf8');
+        const parsed = JSON.parse(text) as Record<string, unknown>;
+        const csrfToken = typeof parsed.csrfToken === 'string' && parsed.csrfToken.trim() !== '' ? parsed.csrfToken.trim() : '';
+        if (!csrfToken) continue;
+        const httpsPort = typeof parsed.httpsPort === 'number' ? parsed.httpsPort : undefined;
+        const pid = typeof parsed.pid === 'number' ? parsed.pid : undefined;
+        const httpPort = typeof parsed.httpPort === 'number' ? parsed.httpPort : filePort;
+        endpoints.push({
+          port: httpPort,
+          csrfToken,
+          host: '127.0.0.1',
+          source: 'daemon-file',
+          pid,
+          httpsPort,
+        });
+      } catch {
+        // Invalid JSON, missing csrfToken, or unreadable file: skip
+      }
+    }
+  }
   return endpoints;
 }

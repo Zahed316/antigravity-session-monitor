@@ -11,6 +11,7 @@ import {
   normalizeQuotaFromSummary,
   normalizeQuotaFromUserStatus,
   extractModelCatalogFromUserStatus,
+  extractUserIdentityFromUserStatus,
 } from '../src/rpc/hubClient.ts';
 import type { HubEndpoint } from '../src/rpc/hubDiscovery.ts';
 import { DEFAULT_CONTEXT_LIMIT } from '../src/types.ts';
@@ -750,3 +751,58 @@ test('a reported 0% keeps 0% even when resetTime has passed', () => {
   assert.strictEqual(snap.pools.nonGoogle.fiveHour?.isExhausted, true);
   assert.strictEqual(snap.pools.nonGoogle.fiveHour?.isReady, false);
 });
+
+test('extractUserIdentityFromUserStatus normalizes email and formats tiers', () => {
+  const identity = extractUserIdentityFromUserStatus({
+    userStatus: { email: '  User@Example.COM ', g1Tier: 'ULTRA', plan: 'PRO', isPro: true, profilePictureUrl: 'https://example.com/pic.png' },
+  });
+  assert.ok(identity);
+  assert.equal(identity!.email, 'user@example.com');
+  assert.equal(identity!.tier, 'Google AI Ultra');
+  assert.equal(identity!.plan, 'PRO');
+  assert.equal(identity!.isPro, true);
+  assert.equal(identity!.profilePictureUrl, 'https://example.com/pic.png');
+});
+
+test('extractUserIdentityFromUserStatus formats PRO / FREE tiers and plan aliases', () => {
+  const pro = extractUserIdentityFromUserStatus({ email: 'a@b.co', g1Tier: 'PRO' });
+  assert.equal(pro!.tier, 'Google AI Pro');
+  const free = extractUserIdentityFromUserStatus({ email: 'a@b.co', g1Tier: 'FREE' });
+  assert.equal(free!.tier, 'Google AI Free');
+  const planOnly = extractUserIdentityFromUserStatus({ email: 'a@b.co', plan: 'ultra', profile_picture_url: 'https://example.com/alias.png' });
+  assert.equal(planOnly!.tier, 'Google AI Ultra');
+  assert.equal(planOnly!.profilePictureUrl, 'https://example.com/alias.png');
+});
+
+test('extractUserIdentityFromUserStatus returns null when email missing or raw invalid', () => {
+  assert.equal(extractUserIdentityFromUserStatus({ displayName: 'No Email' }), null);
+  assert.equal(extractUserIdentityFromUserStatus(null), null);
+  assert.equal(extractUserIdentityFromUserStatus(undefined), null);
+  assert.equal(extractUserIdentityFromUserStatus('not-an-object'), null);
+  assert.equal(extractUserIdentityFromUserStatus(42), null);
+});
+
+test('HubClient.fetchUserIdentity extracts identity from GetUserStatus RPC', async () => {
+  const server = http.createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ userStatus: { email: 'User@Example.com', displayName: 'Test' } }));
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address() as import('node:net').AddressInfo;
+
+  try {
+    const client = new HubClient();
+    const endpoint: HubEndpoint = {
+      port: address.port,
+      csrfToken: 'csrf',
+      host: '127.0.0.1',
+      source: 'process',
+    };
+    const identity = await client.fetchUserIdentity(endpoint);
+    assert.ok(identity, 'expected identity from live GetUserStatus RPC');
+    assert.equal(identity!.email, 'user@example.com');
+  } finally {
+    server.close();
+  }
+});
+
