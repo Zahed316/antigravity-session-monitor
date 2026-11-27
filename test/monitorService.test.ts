@@ -1,6 +1,9 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import os from 'node:os';
 import { MonitorService, type MonitorServiceDeps } from '../src/monitorService.ts';
+import { QuotaAlertService } from '../src/accounts/quotaAlertService.ts';
+import type { QuotaAlertEvent } from '../src/accounts/quotaAlertService.ts';
 import type {
   CallUsagePoint,
   MonitorConfig,
@@ -978,6 +981,253 @@ describe('MonitorService Orchestrator', () => {
     const recovered = service.getState().quota;
     assert.ok(!recovered.isStale, 'a recovered hub clears the stale flag');
     assert.strictEqual(recovered.pools.gemini.fiveHour?.remainingPct, 40, 'recovered numbers are current');
+    service.dispose();
+  });
+
+  it('14. per-account lastGoodQuota isolation: switching from Account A to B then hub offline never serves A\'s cached numbers under B', async () => {
+    let email: string | null = 'A@Example.com';
+    let online = true;
+    let geminiPct = 85;
+    const mockLocalReader: any = {
+      read: async () => ({ summaries: [], callsById: new Map(), lastConversationId: null }),
+      flushCache: async () => {},
+      clearMemoryCache: () => {},
+    };
+    const mockHubClient: any = {
+      fetchQuota: async () => {
+        const q = createMockQuota(online ? 'online' : 'offline');
+        if (online) {
+          q.pools.gemini.fiveHour!.remainingPct = geminiPct;
+          q.pools.gemini.fiveHour!.remainingFraction = geminiPct / 100;
+        }
+        return q;
+      },
+      fetchUserIdentity: async () => (email ? { email } : null),
+      fetchTrajectories: async () => new Map(),
+      fetchGeneratorMetadata: async () => [],
+    };
+    const upserted: string[] = [];
+    const accountStore: any = {
+      upsertSeenAccount: async (identity: { email: string }) => {
+        upserted.push(identity.email);
+        return {
+          email: identity.email.toLowerCase(),
+          firstSeenAt: '2026-11-27T00:00:00Z',
+          lastSeenAt: '2026-11-27T00:00:00Z',
+          status: 'active',
+        };
+      },
+      listAccounts: () => [],
+      saveSnapshot: async () => {},
+      getSnapshot: () => null,
+    };
+
+    const service = new MonitorService({
+      localReader: mockLocalReader,
+      hubClient: mockHubClient,
+      discoverEndpoints: async () => [{ port: 1, csrfToken: 't', host: '127.0.0.1', source: 'process' }],
+      workspacePaths: ['/w'],
+      config: { ...DEFAULT_CONFIG },
+      accountStore,
+    });
+
+    // Poll 1: Account A online at 85%.
+    await service.refreshQuotaNow();
+    assert.strictEqual(service.getState().activeAccount?.email, 'a@example.com', 'active account upserted');
+    assert.strictEqual(service.getState().quota.pools.gemini.fiveHour?.remainingPct, 85);
+
+    // Poll 2: hub now serves Account B at 60%.
+    email = 'b@example.com';
+    geminiPct = 60;
+    await service.refreshQuotaNow();
+    assert.strictEqual(service.getState().quota.pools.gemini.fiveHour?.remainingPct, 60);
+
+    // Poll 3: hub goes offline while on Account B. B must serve only B's own last good
+    // snapshot (60, stale) — never Account A's cached 85.
+    online = false;
+    await service.refreshQuotaNow();
+    const stale = service.getState().quota;
+    assert.strictEqual(stale.status, 'online', 'B keeps its own last good snapshot');
+    assert.strictEqual(stale.isStale, true);
+    assert.strictEqual(
+      stale.pools.gemini.fiveHour?.remainingPct,
+      60,
+      'B does NOT inherit Account A\'s 85%',
+    );
+
+    const snaps = service.getState().accountSnapshots ?? {};
+    assert.strictEqual(snaps['a@example.com']?.pools.gemini.fiveHour?.remainingPct, 85, 'A snapshot retained');
+    assert.strictEqual(snaps['b@example.com']?.pools.gemini.fiveHour?.remainingPct, 60, 'B snapshot recorded');
+    assert.deepStrictEqual(
+      upserted.map((e) => e.toLowerCase()),
+      ['a@example.com', 'b@example.com'],
+      'each observed account upserted once per transition',
+    );
+
+    service.dispose();
+  });
+
+  it('15. auto-capture fires on active email transition, is idempotent, and history receives a lowercased email', async () => {
+    let email: string | null = null;
+    const captures: string[] = [];
+    const historyEmails: string[] = [];
+    const mockLocalReader: any = {
+      read: async () => ({ summaries: [], callsById: new Map(), lastConversationId: null }),
+      flushCache: async () => {},
+      clearMemoryCache: () => {},
+    };
+    const mockHubClient: any = {
+      fetchQuota: async () => createMockQuota('online'),
+      fetchUserIdentity: async () => (email ? { email } : null),
+      fetchTrajectories: async () => new Map(),
+      fetchGeneratorMetadata: async () => [],
+    };
+    const vaultService: any = {
+      captureActiveCredential: async (e: string) => {
+        captures.push(e);
+        return { captured: true };
+      },
+    };
+    const historyStore: any = {
+      recordSnapshot: async (e: string) => {
+        historyEmails.push(e);
+      },
+      getHistory: () => [],
+    };
+    const baseDeps: MonitorServiceDeps = {
+      localReader: mockLocalReader,
+      hubClient: mockHubClient,
+      discoverEndpoints: async () => [{ port: 1, csrfToken: 't', host: '127.0.0.1', source: 'process' }],
+      workspacePaths: ['/w'],
+    };
+
+    const service = new MonitorService({
+      ...baseDeps,
+      config: { ...DEFAULT_CONFIG, autoCaptureVault: true },
+      vaultService,
+      historyStore,
+    });
+
+    // Transition null -> a@example.com triggers capture with the normalized email.
+    email = 'A@Example.com';
+    await service.refreshQuotaNow();
+    assert.deepStrictEqual(captures, ['a@example.com'], 'captured once with normalized email');
+    assert.deepStrictEqual(historyEmails, ['a@example.com'], 'history email is canonical lowercase');
+
+    // Unchanged email: no duplicate capture.
+    await service.refreshQuotaNow();
+    assert.strictEqual(captures.length, 1, 'no capture when the email is unchanged');
+
+    // Transition a@example.com -> b@example.com triggers a second capture.
+    email = 'b@example.com';
+    await service.refreshQuotaNow();
+    assert.deepStrictEqual(captures, ['a@example.com', 'b@example.com'], 'captured on email transition');
+
+    service.dispose();
+
+    // autoCaptureVault disabled: no capture at all.
+    const disabled = new MonitorService({
+      ...baseDeps,
+      config: { ...DEFAULT_CONFIG, autoCaptureVault: false },
+      vaultService,
+      historyStore,
+    });
+    email = 'c@example.com';
+    await disabled.refreshQuotaNow();
+    assert.strictEqual(captures.length, 2, 'no capture when autoCaptureVault is false');
+    disabled.dispose();
+
+    // Vault unavailable: the poll succeeds and nothing captures.
+    const noVault = new MonitorService({ ...baseDeps, config: { ...DEFAULT_CONFIG }, historyStore });
+    email = 'd@example.com';
+    await noVault.refreshQuotaNow();
+    assert.strictEqual(captures.length, 2, 'never captures when the vault is unavailable');
+    assert.strictEqual(noVault.getState().quota.status, 'online');
+    noVault.dispose();
+  });
+
+  it('16. QuotaAlertService is evaluated per poll and emitted through onQuotaAlerts below lowQuotaThresholdPct', async () => {
+    let geminiPct = 85;
+    const emitted: QuotaAlertEvent[][] = [];
+    const mockLocalReader: any = {
+      read: async () => ({ summaries: [], callsById: new Map(), lastConversationId: null }),
+      flushCache: async () => {},
+      clearMemoryCache: () => {},
+    };
+    const mockHubClient: any = {
+      fetchQuota: async () => {
+        const q = createMockQuota('online');
+        q.pools.gemini.fiveHour!.remainingPct = geminiPct;
+        q.pools.gemini.fiveHour!.remainingFraction = geminiPct / 100;
+        return q;
+      },
+      fetchUserIdentity: async () => ({ email: 'a@example.com' }),
+      fetchTrajectories: async () => new Map(),
+      fetchGeneratorMetadata: async () => [],
+    };
+
+    const service = new MonitorService({
+      localReader: mockLocalReader,
+      hubClient: mockHubClient,
+      discoverEndpoints: async () => [{ port: 1, csrfToken: 't', host: '127.0.0.1', source: 'process' }],
+      workspacePaths: ['/w'],
+      config: { ...DEFAULT_CONFIG, lowQuotaThresholdPct: 20 },
+      alertService: new QuotaAlertService(),
+      onQuotaAlerts: (events) => emitted.push(events),
+    });
+
+    await service.refreshQuotaNow();
+    assert.strictEqual(emitted.length, 1, 'alerts evaluated on the first poll');
+    assert.strictEqual(emitted[0]?.length, 0, 'no alert while quota is above the threshold');
+
+    geminiPct = 10;
+    await service.refreshQuotaNow();
+    assert.strictEqual(emitted.length, 2, 'alert evaluated on every poll');
+    const lows = (emitted[1] ?? []).filter((e) => e.kind === 'low');
+    assert.strictEqual(lows.length, 1, 'low alert fired below threshold');
+    assert.strictEqual(lows[0].email, 'a@example.com');
+    assert.ok(
+      lows[0].pools.some((p) => p.poolKey === 'gemini' && p.remainingPct === 10),
+      'low alert carries the gemini pool at 10%',
+    );
+
+    service.dispose();
+  });
+
+  it('17. diagnostics surface host info and hub pid/port/source', async () => {
+    const mockLocalReader: any = {
+      read: async () => ({ summaries: [], callsById: new Map(), lastConversationId: null }),
+      flushCache: async () => {},
+      clearMemoryCache: () => {},
+    };
+    const mockHubClient: any = {
+      fetchQuota: async () => createMockQuota('online'),
+      fetchUserIdentity: async () => ({ email: 'a@example.com' }),
+      fetchTrajectories: async () => new Map(),
+      fetchGeneratorMetadata: async () => [],
+    };
+
+    const service = new MonitorService({
+      localReader: mockLocalReader,
+      hubClient: mockHubClient,
+      discoverEndpoints: async () => [
+        { port: 41001, csrfToken: 't', host: '127.0.0.1', source: 'daemon-file', pid: 4242 },
+      ],
+      workspacePaths: ['/w'],
+      config: { ...DEFAULT_CONFIG },
+      hostDiagnostics: { hostEditor: 'vscode', isStandaloneIde: false },
+    });
+
+    await service.refreshQuotaNow();
+    const d = service.getState().diagnostics!;
+    assert.strictEqual(d.hostEditor, 'vscode');
+    assert.strictEqual(d.isStandaloneIde, false);
+    assert.strictEqual(d.platform, os.platform());
+    assert.strictEqual(d.hubPid, 4242, 'hub pid recorded from the winning endpoint');
+    assert.strictEqual(d.hubPort, 41001);
+    assert.strictEqual(d.hubSource, 'daemon-file');
+    assert.strictEqual(d.osKeyringBackend, 'none', 'no vault injected: keyring backend degrades to none');
+
     service.dispose();
   });
 

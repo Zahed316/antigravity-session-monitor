@@ -8,11 +8,17 @@ import { buildSessionTree } from './core/sessionTree.ts';
 import { resolveActiveSession } from './core/sessionResolver.ts';
 import { buildModelCatalogIndex } from './core/modelResolver.ts';
 import { selectFreshQuota } from './core/quotaFreshness.ts';
+import type { AccountStore } from './accounts/accountStore.ts';
+import type { QuotaAlertEvent, QuotaAlertService } from './accounts/quotaAlertService.ts';
+import type { QuotaHistoryStore } from './accounts/quotaHistoryStore.ts';
+import type { TokenVaultService } from './accounts/tokenVaultService.ts';
 import {
   DEFAULT_CONFIG,
+  type AccountIdentity,
   type CallUsagePoint,
   type ModelCatalogEntry,
   type MonitorConfig,
+  type MonitorDiagnostics,
   type MonitorState,
   type PoolKey,
   type QuotaPool,
@@ -23,6 +29,11 @@ import {
 
 const WATCH_DEBOUNCE_MS = 500;
 const MAX_IDLE_SUBAGENT_METADATA_FETCH = 25;
+const ANONYMOUS_ACCOUNT_KEY = '__anonymous__';
+
+function normalizeEmail(email: string): string {
+  return email.trim().toLowerCase();
+}
 
 export interface MonitorServiceDeps {
   localReader: LocalTelemetryReader;
@@ -37,6 +48,13 @@ export interface MonitorServiceDeps {
   onPersistPinnedId?: (id: string | null) => void | Promise<void>;
   onPersistScope?: (scope: ScopeMode) => void | Promise<void>;
   onDidUpdateState?: (state: MonitorState) => void;
+  // Optional multi-account hooks (Task 8): every dep degrades gracefully when absent.
+  accountStore?: AccountStore;
+  historyStore?: QuotaHistoryStore;
+  alertService?: QuotaAlertService;
+  vaultService?: TokenVaultService;
+  onQuotaAlerts?: (events: QuotaAlertEvent[]) => void;
+  hostDiagnostics?: { hostEditor: string; isStandaloneIde: boolean };
   // Test injection hooks
   timerFactory?: {
     setTimeout: (fn: () => void, ms?: number) => any;
@@ -101,6 +119,10 @@ function createInitialState(
     isRefreshing: false,
     lastError: null,
     warnings: [],
+    activeAccount: null,
+    accounts: [],
+    accountSnapshots: {},
+    accountHistory: [],
   };
 }
 
@@ -121,6 +143,13 @@ export class MonitorService {
   private readonly onPersistScope?: (scope: ScopeMode) => void | Promise<void>;
   private readonly onDidUpdateState?: (state: MonitorState) => void;
 
+  private readonly accountStore?: AccountStore;
+  private readonly historyStore?: QuotaHistoryStore;
+  private readonly alertService?: QuotaAlertService;
+  private readonly vaultService?: TokenVaultService;
+  private readonly onQuotaAlerts?: (events: QuotaAlertEvent[]) => void;
+  private readonly diagnostics: MonitorDiagnostics;
+
   private readonly timerFactory: NonNullable<MonitorServiceDeps['timerFactory']>;
   private readonly watchFactory?: MonitorServiceDeps['watchFactory'];
   private readonly now: () => number;
@@ -135,7 +164,11 @@ export class MonitorService {
   private watchDebounceTimer: any = null;
   private discoveredEndpoints: HubEndpoint[] = [];
   private quotaEndpoint: HubEndpoint | null = null;
-  private lastGoodQuota: QuotaSnapshot | null = null;
+  // Last good snapshot per account (normalized email, or '__anonymous__'), so one
+  // account's cached numbers are never served under another (Review Focus #1).
+  private lastGoodQuotaByAccount = new Map<string, QuotaSnapshot>();
+  private activeAccountKey = ANONYMOUS_ACCOUNT_KEY;
+  private lastCapturedEmail: string | null = null;
   private quotaSeq = 0;
   private quotaInFlightPromise: Promise<void> | null = null;
   private watchers: Array<{ close(): void }> = [];
@@ -153,7 +186,7 @@ export class MonitorService {
     this.hubClient = deps.hubClient;
     this.discoverEndpoints = deps.discoverEndpoints;
     this.workspacePaths = [...deps.workspacePaths];
-    this.config = deps.config ? { ...deps.config } : { ...DEFAULT_CONFIG };
+    this.config = deps.config ? { ...DEFAULT_CONFIG, ...deps.config } : { ...DEFAULT_CONFIG };
     this.pinnedSessionId = deps.pinnedSessionId ?? null;
     this.scope = deps.scope ?? this.config.defaultScope ?? 'current';
 
@@ -168,6 +201,22 @@ export class MonitorService {
     this.onPersistScope = deps.onPersistScope;
     this.onDidUpdateState = deps.onDidUpdateState;
 
+    this.accountStore = deps.accountStore;
+    this.historyStore = deps.historyStore;
+    this.alertService = deps.alertService;
+    this.vaultService = deps.vaultService;
+    this.onQuotaAlerts = deps.onQuotaAlerts;
+    this.diagnostics = {
+      hostEditor: deps.hostDiagnostics?.hostEditor ?? 'unknown',
+      isStandaloneIde: deps.hostDiagnostics?.isStandaloneIde ?? false,
+      platform: os.platform(),
+      osKeyringSupported: false,
+      osKeyringBackend: 'none',
+      hubPid: null,
+      hubPort: null,
+      hubSource: null,
+    };
+
     this.timerFactory = deps.timerFactory ?? {
       setTimeout: (fn, ms) => setTimeout(fn, ms),
       clearTimeout: (id) => clearTimeout(id),
@@ -179,6 +228,7 @@ export class MonitorService {
 
     this.state = createInitialState(this.scope, this.workspacePaths, this.sqliteBackend, this.now());
     this.state.pinnedSessionId = this.pinnedSessionId;
+    this.state.diagnostics = { ...this.diagnostics };
   }
 
   public async start(): Promise<void> {
@@ -186,6 +236,18 @@ export class MonitorService {
       return;
     }
     this.started = true;
+    if (this.vaultService) {
+      void this.vaultService
+        .getCapabilities()
+        .then((caps) => {
+          this.diagnostics.osKeyringSupported = caps.osKeyringSupported;
+          this.diagnostics.osKeyringBackend = caps.osKeyringBackend;
+          this.state.diagnostics = { ...this.diagnostics };
+        })
+        .catch(() => {
+          // Capabilities probe failure degrades to the defaults; nothing sensitive to log.
+        });
+    }
     this.initWatchers();
     this.resetPollingTimer();
     this.resetQuotaPollingTimer();
@@ -209,7 +271,7 @@ export class MonitorService {
   }
 
   public updateConfig(config: MonitorConfig): void {
-    this.config = { ...config };
+    this.config = { ...DEFAULT_CONFIG, ...config };
     this.resetPollingTimer();
     this.resetQuotaPollingTimer();
   }
@@ -380,22 +442,124 @@ export class MonitorService {
     this.quotaSeq++;
     if (winner && winner.snapshot.status === 'online') {
       this.quotaEndpoint = winner.endpoint;
-      this.lastGoodQuota = winner.snapshot;
       this.state.quota = winner.snapshot;
       this.state.hubStatus = 'connected';
       this.state.hubPort = winner.endpoint.port;
       this.state.hubSource = winner.endpoint.source;
       this.state.lastUpdatedAt = this.now();
+      this.diagnostics.hubPid = winner.endpoint.pid ?? null;
+      this.diagnostics.hubPort = winner.endpoint.port;
+      this.diagnostics.hubSource = winner.endpoint.source;
+      this.state.diagnostics = { ...this.diagnostics };
+      await this.handleAccountPoll(winner.endpoint, winner.snapshot);
     } else {
       this.quotaEndpoint = null;
-      if (this.lastGoodQuota) {
+      // Only the current account's cached snapshot is kept stale; another account's
+      // numbers must never surface here (Review Focus #1).
+      const lastGood = this.lastGoodQuotaByAccount.get(this.activeAccountKey);
+      if (lastGood) {
         // structuredClone: the published stale snapshot must not share pools with the cache.
-        this.state.quota = { ...structuredClone(this.lastGoodQuota), isStale: true };
+        this.state.quota = { ...structuredClone(lastGood), isStale: true };
+      } else {
+        this.state.quota = buildOfflineQuota(this.now());
       }
+      this.evaluateAndEmitAlerts();
     }
 
     // Emitted on every path so the UI still hears about all-offline and no-endpoint polls.
     this.onDidUpdateState?.(this.state);
+  }
+
+  /** Resolves the active identity for an online poll and drives account/history/alert/vault hooks. */
+  private async handleAccountPoll(endpoint: HubEndpoint, snapshot: QuotaSnapshot): Promise<void> {
+    let identity: AccountIdentity | null = null;
+    if (typeof this.hubClient.fetchUserIdentity === 'function') {
+      try {
+        identity = await this.hubClient.fetchUserIdentity(endpoint);
+      } catch {
+        identity = null;
+      }
+    }
+    const email = identity?.email ? normalizeEmail(identity.email) : null;
+    this.activeAccountKey = email ?? ANONYMOUS_ACCOUNT_KEY;
+    this.lastGoodQuotaByAccount.set(this.activeAccountKey, snapshot);
+    if (email) {
+      this.state.accountSnapshots = { ...this.state.accountSnapshots, [email]: snapshot };
+    }
+
+    if (identity && email) {
+      if (this.accountStore) {
+        try {
+          this.state.activeAccount = await this.accountStore.upsertSeenAccount(identity, true);
+          this.state.accounts = this.accountStore.listAccounts();
+          await this.accountStore.saveSnapshot(email, snapshot);
+        } catch {
+          // Registry failures must not take down quota reporting.
+        }
+      } else {
+        // No store injected: surface the observed identity without persistence.
+        const seenAt = new Date(this.now()).toISOString();
+        this.state.activeAccount = {
+          ...identity,
+          email,
+          firstSeenAt: seenAt,
+          lastSeenAt: seenAt,
+          status: 'active',
+        };
+      }
+
+      // Auto-capture only on an email transition, and never without a vault.
+      const autoCapture = this.config.autoCaptureVault ?? DEFAULT_CONFIG.autoCaptureVault!;
+      if (this.vaultService && autoCapture && this.lastCapturedEmail !== email) {
+        this.lastCapturedEmail = email;
+        try {
+          await this.vaultService.captureActiveCredential(email);
+        } catch {
+          // Capture failures are non-fatal and never logged with credential material.
+        }
+      }
+
+      if (this.historyStore) {
+        try {
+          // The history store does not normalize emails: pass the canonical lowercase form.
+          await this.historyStore.recordSnapshot(email, snapshot, this.now());
+          this.state.accountHistory = this.historyStore.getHistory();
+        } catch {
+          // History failures are non-fatal.
+        }
+      }
+    }
+
+    this.evaluateAndEmitAlerts();
+  }
+
+  private evaluateAndEmitAlerts(): void {
+    if (!this.alertService || this.activeAccountKey === ANONYMOUS_ACCOUNT_KEY) {
+      return;
+    }
+    try {
+      const email = this.activeAccountKey;
+      const events = this.alertService.evaluate({
+        email,
+        snapshot: this.state.quota,
+        alternatives: (this.state.accounts ?? []).map((account) => ({
+          account,
+          snapshot:
+            account.email === email
+              ? this.state.quota
+              : (this.accountStore?.getSnapshot(account.email, false, this.now()) ?? null),
+        })),
+        config: {
+          enableLowQuotaAlerts: this.config.enableLowQuotaAlerts ?? DEFAULT_CONFIG.enableLowQuotaAlerts!,
+          lowQuotaThresholdPct: this.config.lowQuotaThresholdPct ?? DEFAULT_CONFIG.lowQuotaThresholdPct!,
+          notifyQuotaReset: this.config.notifyQuotaReset ?? DEFAULT_CONFIG.notifyQuotaReset!,
+        },
+        nowMs: this.now(),
+      });
+      this.onQuotaAlerts?.(events);
+    } catch {
+      // Alert evaluation must never break the quota poll.
+    }
   }
 
   private initWatchers(): void {
@@ -663,6 +827,11 @@ export class MonitorService {
         isRefreshing: false,
         lastError: null,
         warnings: [],
+        activeAccount: this.state.activeAccount,
+        accounts: this.state.accounts,
+        accountSnapshots: this.state.accountSnapshots,
+        accountHistory: this.state.accountHistory,
+        diagnostics: { ...this.diagnostics },
       };
 
       this.onDidUpdateState?.(this.state);

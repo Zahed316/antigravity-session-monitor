@@ -179,6 +179,33 @@
           "type": "string",
           "default": "",
           "description": "Optional override directory for Antigravity local data (defaults to ~/.gemini/antigravity)."
+        },
+        "antigravityMonitor.enableLowQuotaAlerts": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show low-quota and exhausted-pool alerts for the active account's quota pools."
+        },
+        "antigravityMonitor.lowQuotaThresholdPct": {
+          "type": "number",
+          "default": 20,
+          "minimum": 5,
+          "maximum": 50,
+          "description": "Remaining-percent threshold below which a low-quota alert fires (5-50)."
+        },
+        "antigravityMonitor.notifyQuotaReset": {
+          "type": "boolean",
+          "default": true,
+          "description": "Notify when a flagged low-quota or exhausted window resets."
+        },
+        "antigravityMonitor.quotaAlertBackground": {
+          "type": "boolean",
+          "default": true,
+          "description": "Tint the Status Bar quota badge warning/error while any pool is at or below the low-quota threshold."
+        },
+        "antigravityMonitor.autoCaptureVault": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically capture the active account credential into the encrypted vault (SecretStorage) when a new account email is observed."
         }
       }
     }

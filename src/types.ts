@@ -1,3 +1,5 @@
+import type { DailyPoolQuotaRecord } from './accounts/quotaHistoryStore.ts';
+
 export const DEFAULT_CONTEXT_LIMIT = 256_000;
 
 export type ScopeMode = 'current' | 'all';
@@ -12,6 +14,13 @@ export interface MonitorConfig {
   contextCriticalPct: number;
   defaultScope: ScopeMode;
   dataRootOverride: string;
+  // Optional so hosts building partial configs (and existing tests) keep type-checking;
+  // DEFAULT_CONFIG supplies the runtime defaults.
+  enableLowQuotaAlerts?: boolean;
+  lowQuotaThresholdPct?: number;
+  notifyQuotaReset?: boolean;
+  quotaAlertBackground?: boolean;
+  autoCaptureVault?: boolean;
 }
 
 export const DEFAULT_CONFIG: MonitorConfig = {
@@ -24,6 +33,11 @@ export const DEFAULT_CONFIG: MonitorConfig = {
   contextCriticalPct: 90,
   defaultScope: 'current',
   dataRootOverride: '',
+  enableLowQuotaAlerts: true,
+  lowQuotaThresholdPct: 20,
+  notifyQuotaReset: true,
+  quotaAlertBackground: true,
+  autoCaptureVault: true,
 };
 
 export type PoolKey = 'gemini' | 'nonGoogle';
@@ -258,6 +272,17 @@ export interface SessionNode {
 
 export type HubSource = 'exports' | 'process' | 'wsl-host' | 'daemon-file';
 
+export interface MonitorDiagnostics {
+  hostEditor: string;
+  isStandaloneIde: boolean;
+  platform: NodeJS.Platform;
+  osKeyringSupported: boolean;
+  osKeyringBackend: string;
+  hubPid: number | null;
+  hubPort: number | null;
+  hubSource: string | null;
+}
+
 export interface MonitorState {
   scope: ScopeMode;
   workspacePaths: string[];
@@ -280,4 +305,10 @@ export interface MonitorState {
   isRefreshing: boolean;
   lastError: string | null;
   warnings: string[];
+  // Multi-account state (Task 8); optional so existing MonitorState literals keep type-checking.
+  activeAccount?: ManagedAccount | null;
+  accounts?: ManagedAccount[];
+  accountSnapshots?: Record<string, QuotaSnapshot | null>;
+  accountHistory?: DailyPoolQuotaRecord[];
+  diagnostics?: MonitorDiagnostics;
 }
