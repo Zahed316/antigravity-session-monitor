@@ -59,6 +59,17 @@ export interface AccountIdentity {
   profilePictureUrl?: string;
 }
 
+export type AccountAuthStatus = 'active' | 'saved' | 'needs_reauth';
+
+export interface ManagedAccount extends AccountIdentity {
+  label?: string;
+  group?: string;
+  colorTag?: string;
+  firstSeenAt: string;
+  lastSeenAt: string;
+  status: AccountAuthStatus;
+}
+
 export interface QuotaWindow {
   window: '5h' | 'weekly';
   bucketId?: string;
