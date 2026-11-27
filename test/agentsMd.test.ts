@@ -14,6 +14,8 @@ describe('AGENTS.md', () => {
       ['read-only telemetry', /read-only/],
       ['erasableSyntaxOnly', /npm run check/],
       ['import extensions', /npm test/],
+      ['erasableSyntaxOnly is machine-enforced', /TS1294/],
+      ['missing import extension is machine-enforced', /ERR_MODULE_NOT_FOUND/],
       ['build on wiring change', /npm run build/],
     ];
     for (const [name, re] of rules) {
