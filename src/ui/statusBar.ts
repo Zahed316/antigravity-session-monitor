@@ -1,11 +1,9 @@
 import type {
-  ModelTokenEstimate,
   MonitorConfig,
   MonitorState,
   PoolKey,
   QuotaWindow,
   SessionNode,
-  WindowTokenEstimate,
 } from '../types.ts';
 
 export interface StatusBarItemLike {
@@ -113,21 +111,6 @@ export function formatResetDateTime(resetTime: string | null): string | null {
   const hours = pad(d.getHours());
   const mins = pad(d.getMinutes());
   return `${month} ${day}, ${hours}:${mins}`;
-}
-
-export function formatWindowEstimateBrief(est: WindowTokenEstimate | null | undefined): string {
-  if (!est) return '—';
-  if (est.status === 'calibrated' && est.estimatedTotalTokens !== null) {
-    const totalStr = `~${formatCompactTokens(est.estimatedTotalTokens)} tok`;
-    if (est.estimatedBilledTokens !== null) {
-      return `${totalStr} (~${formatCompactTokens(est.estimatedBilledTokens)} fresh+out)`;
-    }
-    return totalStr;
-  }
-  if (est.windowUsedTotal > 0) {
-    return `Calibrating (${formatCompactTokens(est.windowUsedTotal)} used)`;
-  }
-  return 'Calibrating…';
 }
 
 function summarizeSubagentModels(root: SessionNode): string {
@@ -269,31 +252,6 @@ export function buildStatusBarViewModel(state: MonitorState, config: MonitorConf
       const modelSummary = summarizeSubagentModels(active);
       const runStr = active.runningSubagentCount > 0 ? ` (${active.runningSubagentCount} running)` : '';
       lines.push(`**Subagents:** ${active.subagentCount}${runStr}${modelSummary ? ` — ${modelSummary}` : ''}`);
-    }
-
-    const activeEst: ModelTokenEstimate | undefined = state.modelEstimates?.find(
-      (e) => e.modelLabel === active.model,
-    );
-    if (activeEst) {
-      const hasCalibrated =
-        (activeEst.fiveHour?.status === 'calibrated' && activeEst.fiveHour.estimatedTotalTokens !== null) ||
-        (activeEst.weekly?.status === 'calibrated' && activeEst.weekly.estimatedTotalTokens !== null);
-
-      if (hasCalibrated) {
-        const parts: string[] = [];
-        if (activeEst.fiveHour) parts.push(`5h: ${formatWindowEstimateBrief(activeEst.fiveHour)}`);
-        if (activeEst.weekly) parts.push(`Wk: ${formatWindowEstimateBrief(activeEst.weekly)}`);
-        if (parts.length > 0) {
-          lines.push(`**Est. Left:** ${parts.join(' · ')}`);
-        }
-      } else {
-        const usedTotal =
-          Math.max(activeEst.fiveHour?.windowUsedTotal ?? 0, activeEst.weekly?.windowUsedTotal ?? 0) ||
-          (active.rolledUp.fresh + active.rolledUp.cacheRead + active.rolledUp.output);
-        const usedBilled = Math.max(activeEst.fiveHour?.windowUsedBilled ?? 0, activeEst.weekly?.windowUsedBilled ?? 0);
-        const billedStr = usedBilled > 0 ? ` (~${formatCompactTokens(usedBilled)} fresh+out)` : '';
-        lines.push(`**Active model tokens:** ${formatCompactTokens(usedTotal)}${billedStr} (calibrating)`);
-      }
     }
   } else {
     lines.push('$(pulse) *No active workspace session*');

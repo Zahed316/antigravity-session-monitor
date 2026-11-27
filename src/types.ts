@@ -29,7 +29,7 @@ export const DEFAULT_CONFIG: MonitorConfig = {
 export type PoolKey = 'gemini' | 'nonGoogle';
 
 export type PanelTabId = 'overview' | 'details';
-export type OverviewSectionId = 'quota' | 'forecast' | 'sessions' | 'unattached';
+export type OverviewSectionId = 'quota' | 'sessions' | 'unattached';
 export type DetailsSectionId = 'sessionSummary' | 'breakdown' | 'subagents' | 'contextChart';
 export type PanelSectionId = OverviewSectionId | DetailsSectionId;
 
@@ -48,24 +48,6 @@ export interface ModelCatalogEntry {
   modelId: string;
   label: string;
   poolKey: PoolKey;
-}
-
-export interface WindowTokenEstimate {
-  status: 'calibrated' | 'calibrating';
-  estimatedTotalTokens: number | null;
-  estimatedBilledTokens: number | null;
-  tokensPerPctTotal: number | null;
-  tokensPerPctBilled: number | null;
-  windowUsedTotal: number;
-  windowUsedBilled: number;
-  sampleCount: number;
-}
-
-export interface ModelTokenEstimate {
-  modelLabel: string;
-  poolKey: PoolKey;
-  fiveHour: WindowTokenEstimate | null;
-  weekly: WindowTokenEstimate | null;
 }
 
 export interface QuotaWindow {
@@ -268,7 +250,6 @@ export interface MonitorState {
   artifactHintId: string | null;
   quota: QuotaSnapshot;
   modelCatalog?: ModelCatalogEntry[];
-  modelEstimates?: ModelTokenEstimate[];
   hubStatus: 'connected' | 'offline' | 'discovering';
   hubPort: number | null;
   hubSource: 'exports' | 'process' | 'wsl-host' | null;

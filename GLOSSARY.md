@@ -8,11 +8,17 @@ A conversation with an AI model, as recorded by Antigravity. The root of a tree 
 
 ## Subagent
 
-An agent spawned by a session to do work in the background: research, tests, edits. In the data it has the same shape as a session, but it is owned by the session that spawned it. Not a kind of session — a different role. The UI calls an individual one a *subagent*; a user asking about "agents" may mean subagents, models from the forecast, or both.
+An agent spawned by a session to do work in the background: research, tests, edits. In the data it has the same shape as a session, but it is owned by the session that spawned it. Not a kind of session — a different role. The UI calls an individual one a *subagent*.
 
 ## Unattached subagent
 
 A subagent whose spawning session cannot be determined, usually because the parent record is gone or predates the current data layout. It still has its own usage and status, so it is listed separately rather than discarded or invented into a parent.
+
+## Account
+
+A Google identity (identified by email) with a plan tier and optional local metadata such as a label, group, and color tag. Each account owns independent **Quota pools**, **Snapshots**, and daily quota history.
+
+_Avoid_: Profile, user, token
 
 ## Quota pool
 
@@ -24,7 +30,7 @@ One allowance span inside a quota pool, either five-hour or weekly. A window is 
 
 ## Snapshot
 
-One reading of quota from one place at one moment. A snapshot is *fresh* when its windows have rolled recently, *stale* when it is a previous good reading kept because the current fetch failed, and *offline* when no reading succeeded.
+One reading of quota for an **Account** from one place at one moment. A snapshot is *fresh* when its windows were read live and have rolled recently, *stale* when an older reading is kept because the current fetch failed or an inactive account's reset time has already passed without a live re-check (never assumed 100%), and *offline* when no reading succeeded.
 
 ## Hub
 

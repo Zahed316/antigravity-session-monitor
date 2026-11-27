@@ -10,7 +10,6 @@ import {
   type SessionMetrics,
   type SessionNode,
   type PanelLayoutState,
-  type ModelTokenEstimate,
 } from '../src/types.ts';
 import {
   formatCompactTokens,
@@ -189,7 +188,6 @@ function createState(partial: Partial<MonitorState> = {}): MonitorState {
     lastError: partial.lastError ?? null,
     warnings: partial.warnings ?? [],
     modelCatalog: partial.modelCatalog,
-    modelEstimates: partial.modelEstimates,
   };
 }
 
@@ -347,7 +345,8 @@ test('status bar and panel render 0% for an exhausted window even with a stray f
 });
 
 test('panel notes stale quota with the last successful fetch above the grid', () => {
-  const fetchedAt = new Date('2026-11-26T10:00:00Z').getTime();
+  // An hour ago: inside the <12h stale window, so the rendered time stays date-independent.
+  const fetchedAt = Date.now() - 3_600_000;
   const state = createState({ quota: createQuota({ isStale: true, fetchedAt }) });
   const html = renderBottomPanelHtml(state, 'n', 'csp');
   const lastFetched = new Date(fetchedAt).toLocaleTimeString();
@@ -408,23 +407,6 @@ test('buildStatusBarViewModel: minimal tooltip includes model, subagent model su
 
   const state = createState({
     activeSession: parent,
-    modelEstimates: [
-      {
-        modelLabel: 'Claude Opus 4.6 (Thinking)',
-        poolKey: 'nonGoogle',
-        fiveHour: {
-          status: 'calibrated',
-          estimatedTotalTokens: 250_000,
-          estimatedBilledTokens: 90_000,
-          tokensPerPctTotal: 5_000,
-          tokensPerPctBilled: 1_800,
-          windowUsedTotal: 31_000,
-          windowUsedBilled: 11_000,
-          sampleCount: 3,
-        },
-        weekly: null,
-      },
-    ],
     quota: createQuota({
       pools: {
         gemini: {
@@ -465,7 +447,6 @@ test('buildStatusBarViewModel: minimal tooltip includes model, subagent model su
   assert.match(vm.tooltipMarkdown, /\*\*Session:\*\*/);
   assert.match(vm.tooltipMarkdown, /\*\*Model:\*\* Claude Opus 4\.6 \(Thinking\)/);
   assert.match(vm.tooltipMarkdown, /\*\*Subagents:\*\* 1 \(1 running\) — 1× Gemini 3\.8 Flash/);
-  assert.match(vm.tooltipMarkdown, /\*\*Est\. Left:\*\*/);
   assert.match(vm.tooltipMarkdown, /\| Pool \| 5-Hour \| Weekly \|/);
   assert.match(vm.tooltipMarkdown, /Ready/);
   assert.match(vm.tooltipMarkdown, /\*Click for sessions & overview\*/);
@@ -821,26 +802,10 @@ test('renderBottomPanelHtml: strict CSP, XSS safety, quota strip, tree, detail c
 
   const state = createState({
     roots: [session],
+    unattachedSubagents: [createNode({ id: 'loose-1', isSubagent: true, parentId: null, title: 'Loose Subagent' })],
     selectedSession: session,
     selectedSessionId: session.id,
     pinMissing: true,
-    modelEstimates: [
-      {
-        modelLabel: 'Claude Opus 4.6 (Thinking)',
-        poolKey: 'nonGoogle',
-        fiveHour: {
-          status: 'calibrated',
-          estimatedTotalTokens: 200_000,
-          estimatedBilledTokens: 80_000,
-          tokensPerPctTotal: 5_000,
-          tokensPerPctBilled: 2_000,
-          windowUsedTotal: 31_000,
-          windowUsedBilled: 11_000,
-          sampleCount: 2,
-        },
-        weekly: null,
-      },
-    ],
   });
 
   const html = renderBottomPanelHtml(state, nonce, cspSource, {
@@ -866,12 +831,13 @@ test('renderBottomPanelHtml: strict CSP, XSS safety, quota strip, tree, detail c
   assert.match(html, /Gemini/);
   assert.match(html, /Non-Google/);
 
-  // 5. Overview shows Model Usage Forecast + expanded subagent model pill + CSP-safe bars & ctx-meter
-  assert.match(html, /Model Usage Forecast/);
-  assert.match(html, /Claude Opus 4\.6 \(Thinking\)/);
+  // 5. Overview shows quota, sessions, and unattached sections without a forecast + CSP-safe bars & ctx-meter
+  assert.ok(!html.includes('Model Usage Forecast'), 'forecast section removed');
+  assert.match(html, /data-section-id="quota"/);
+  assert.match(html, /data-section-id="sessions"/);
+  assert.match(html, /data-section-id="unattached"/);
   assert.match(html, /Gemini 3\.8 Flash/);
-  assert.match(html, /bar-fill ok p-85/);
-  assert.match(html, /bar-fill ok p-40/);
+  assert.match(html, /bar-fill ok p-85/);  assert.match(html, /bar-fill ok p-40/);
   assert.match(html, /class="ctx-meter /);
   assert.match(html, /class="ctx-meter-fill /);
   assert.match(html, /class="ctx-meter-text">/);
@@ -880,23 +846,19 @@ test('renderBottomPanelHtml: strict CSP, XSS safety, quota strip, tree, detail c
   // 6. Help buttons, explanation boxes, and next reset date/time display
   assert.match(html, /class="help-btn"/);
   assert.match(html, /data-help-id="quota-pools"/);
-  assert.match(html, /data-help-id="model-forecast"/);
   assert.match(html, /data-help-id="sessions"/);
   assert.match(html, /id="help-box-quota-pools"/);
-  assert.match(html, /id="help-box-model-forecast"/);
-  assert.match(html, /~116M tok/);
-  assert.match(html, /~11\.3M fresh\+out/);
-  assert.match(html, /Calibrating \(waiting drop\)/);
+  assert.ok(!html.includes('model-forecast'), 'forecast help entry removed');
   assert.match(html, /q-reset-time/);
   assert.match(html, /Next reset/);
 
   // Open help in Overview tab renders active button and visible help box
   const openHelpOverview = renderBottomPanelHtml(state, nonce, cspSource, {
     activeTab: 'overview',
-    openHelpIds: ['model-forecast'],
+    openHelpIds: ['quota-pools'],
   });
-  assert.match(openHelpOverview, /<button class="help-btn active" data-action="toggleHelp" data-help-id="model-forecast"/);
-  assert.match(openHelpOverview, /<div id="help-box-model-forecast" class="help-box">/);
+  assert.match(openHelpOverview, /<button class="help-btn active" data-action="toggleHelp" data-help-id="quota-pools"/);
+  assert.match(openHelpOverview, /<div id="help-box-quota-pools" class="help-box">/);
 
   // 7. Details tab renders SVG Chart with compaction marker & subagents table & breakdown open state
   const detailsHtml = renderBottomPanelHtml(state, nonce, cspSource, {
@@ -934,8 +896,8 @@ function manyRoots(count: number, prefix = 'Root'): SessionNode[] {
 }
 
 function sectionHtml(bodyHtml: string, id: string): string {
-  // Anchor on the outer card tag. `data-section-id` also appears in each header, and the
-  // forecast body renders its own nested .section-card, so delimit by card boundaries only.
+  // Anchor on the outer card tag. `data-section-id` also appears in each header, so delimit by
+  // card boundaries only.
   const at = bodyHtml.indexOf(`data-section-id="${id}" data-tab-id="`);
   assert.notEqual(at, -1, `section ${id} renders`);
   const cardStart = bodyHtml.lastIndexOf('<div class="section-card', at);
@@ -1009,41 +971,6 @@ test('renderBottomPanelBodyHtml: unattached subagents cap independently of the s
   assert.match(sectionHtml(unattachedOnly, 'unattached'), />Less</);
 });
 
-function manyEstimates(count: number): ModelTokenEstimate[] {
-  return Array.from({ length: count }, (_, i) => ({
-    modelLabel: `Model ${i + 1}`,
-    poolKey: 'gemini' as const,
-    fiveHour: {
-      status: 'calibrated' as const,
-      estimatedTotalTokens: 100_000 - i * 1000,
-      estimatedBilledTokens: 50_000 - i * 500,
-      tokensPerPctTotal: 5_000,
-      tokensPerPctBilled: 2_500,
-      windowUsedTotal: 10_000,
-      windowUsedBilled: 5_000,
-      sampleCount: 3,
-    },
-    weekly: null,
-  }));
-}
-
-test('renderBottomPanelBodyHtml: forecast caps at 5 models with a More toggle', () => {
-  const estimates = manyEstimates(8);
-  const state = createState({ modelEstimates: estimates });
-
-  const collapsed = sectionHtml(renderBottomPanelBodyHtml(state), 'forecast');
-  assert.equal((collapsed.match(/<tr>/g) ?? []).length, 6, 'header row plus 5 model rows');
-  assert.match(collapsed, /data-action="toggleListExpand" data-list="forecast"/);
-  assert.match(collapsed, />More \(8\)</);
-  assert.ok(collapsed.includes('Model 5'), 'top 5 kept');
-  assert.ok(!collapsed.includes('Model 6'), '6th model hidden when collapsed');
-
-  const expanded = sectionHtml(renderBottomPanelBodyHtml(state, { expandedLists: ['forecast'] }), 'forecast');
-  assert.equal((expanded.match(/<tr>/g) ?? []).length, 9, 'header row plus all 8 model rows');
-  assert.match(expanded, />Less</);
-  assert.ok(expanded.includes('Model 8'), 'last model visible when expanded');
-});
-
 test('renderBottomPanelBodyHtml: a pinned session outside the newest 5 stays visible', () => {
   const roots = manyRoots(8);
   // Pin the oldest: it is not in the newest 5 and would normally be sliced away.
@@ -1062,7 +989,7 @@ test('renderBottomPanelBodyHtml: a pinned session outside the newest 5 stays vis
 
 test('sanitizePanelLayout: default overview order puts sessions immediately after quota', () => {
   const order = sanitizePanelLayout().sectionOrder.overview;
-  assert.deepEqual(order, ['quota', 'sessions', 'forecast', 'unattached']);
+  assert.deepEqual(order, ['quota', 'sessions', 'unattached']);
   assert.equal(order.indexOf('sessions'), order.indexOf('quota') + 1);
 });
 
@@ -1107,7 +1034,7 @@ test('BottomPanelController: settings button and layout reset reach their callba
     onOpenSettings: () => {
       settingsOpened++;
     },
-    initialLayout: { sectionOrder: { overview: ['sessions', 'quota', 'forecast', 'unattached'] } } as any,
+    initialLayout: { sectionOrder: { overview: ['sessions', 'quota', 'unattached'] } } as any,
     onLayoutChange: (layout) => {
       savedLayout = layout;
     },
@@ -1119,15 +1046,15 @@ test('BottomPanelController: settings button and layout reset reach their callba
   assert.equal(settingsOpened, 1, 'settings message reaches the extension');
 
   // A dragged order must survive until an explicit reset.
-  assert.deepEqual(ctrl.getLayout().sectionOrder.overview, ['sessions', 'quota', 'forecast', 'unattached']);
+  assert.deepEqual(ctrl.getLayout().sectionOrder.overview, ['sessions', 'quota', 'unattached']);
 
   ctrl.resetLayout();
   assert.deepEqual(
     ctrl.getLayout().sectionOrder.overview,
-    ['quota', 'sessions', 'forecast', 'unattached'],
+    ['quota', 'sessions', 'unattached'],
     'reset restores the default order',
   );
-  assert.deepEqual(savedLayout!.sectionOrder.overview, ['quota', 'sessions', 'forecast', 'unattached'], 'reset is persisted');
+  assert.deepEqual(savedLayout!.sectionOrder.overview, ['quota', 'sessions', 'unattached'], 'reset is persisted');
 });
 
 test('BottomPanelController: becoming visible refreshes an out-of-date quota instead of repainting it', () => {
@@ -1289,13 +1216,13 @@ test('BottomPanelController: gates setHtml and postMessage on view.visible, rend
   assert.equal(selectedIds[0], 'target-123');
 
   // Inbound toggleHelp toggles openHelpIds and posts targeted updateState
-  messageListener!({ type: 'toggleHelp', helpId: 'model-forecast', open: true });
-  assert.deepEqual(Array.from(ctrl.getUiState().openHelpIds ?? []), ['model-forecast']);
-  assert.ok(postedMessages[postedMessages.length - 1].bodyHtml.includes('id="help-box-model-forecast" class="help-box"'));
+  messageListener!({ type: 'toggleHelp', helpId: 'quota-pools', open: true });
+  assert.deepEqual(Array.from(ctrl.getUiState().openHelpIds ?? []), ['quota-pools']);
+  assert.ok(postedMessages[postedMessages.length - 1].bodyHtml.includes('id="help-box-quota-pools" class="help-box"'));
 
-  messageListener!({ type: 'toggleHelp', helpId: 'model-forecast', open: false });
+  messageListener!({ type: 'toggleHelp', helpId: 'quota-pools', open: false });
   assert.deepEqual(Array.from(ctrl.getUiState().openHelpIds ?? []), []);
-  assert.ok(postedMessages[postedMessages.length - 1].bodyHtml.includes('id="help-box-model-forecast" class="help-box hidden"'));
+  assert.ok(postedMessages[postedMessages.length - 1].bodyHtml.includes('id="help-box-quota-pools" class="help-box hidden"'));
 
   ctrl.dispose();
 });
@@ -1353,8 +1280,8 @@ test('BottomPanelController: collapse/expand and reorder tabs and sections with 
   assert.match(lastHtml2, /is-collapsed" data-section-id="quota"/);
 
   // Reorder overview sections
-  handler({ type: 'reorderSections', tab: 'overview', order: ['sessions', 'forecast', 'quota', 'unattached'] });
-  assert.deepEqual(savedLayout.sectionOrder.overview, ['sessions', 'forecast', 'quota', 'unattached']);
+  handler({ type: 'reorderSections', tab: 'overview', order: ['sessions', 'unattached', 'quota'] });
+  assert.deepEqual(savedLayout.sectionOrder.overview, ['sessions', 'unattached', 'quota']);
   const lastHtml3 = postedMessages[postedMessages.length - 1].bodyHtml as string;
   assert.ok(lastHtml3.indexOf('data-section-id="sessions"') < lastHtml3.indexOf('data-section-id="quota"'));
 

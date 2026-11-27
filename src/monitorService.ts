@@ -6,8 +6,7 @@ import type { HubClient } from './rpc/hubClient.ts';
 import type { HubDiscoveryDeps, HubEndpoint } from './rpc/hubDiscovery.ts';
 import { buildSessionTree } from './core/sessionTree.ts';
 import { resolveActiveSession } from './core/sessionResolver.ts';
-import { buildModelCatalogIndex, inferModelPool } from './core/modelResolver.ts';
-import { QuotaEstimator } from './core/quotaEstimator.ts';
+import { buildModelCatalogIndex } from './core/modelResolver.ts';
 import { selectFreshQuota } from './core/quotaFreshness.ts';
 import {
   DEFAULT_CONFIG,
@@ -34,7 +33,6 @@ export interface MonitorServiceDeps {
   pinnedSessionId?: string | null;
   scope?: ScopeMode;
   antigravityRoot?: string;
-  quotaCalibrationPath?: string;
   sqliteBackend?: 'node:sqlite' | 'sqlite3-cli' | 'python3' | 'unavailable';
   onPersistPinnedId?: (id: string | null) => void | Promise<void>;
   onPersistScope?: (scope: ScopeMode) => void | Promise<void>;
@@ -95,7 +93,6 @@ function createInitialState(
     artifactHintId: null,
     quota: buildOfflineQuota(nowMs),
     modelCatalog: [],
-    modelEstimates: [],
     hubStatus: 'discovering',
     hubPort: null,
     hubSource: null,
@@ -150,7 +147,6 @@ export class MonitorService {
   private readonly cachedRpcCalls = new Map<string, CallUsagePoint[]>();
   private modelCatalog: ModelCatalogEntry[] = [];
   private modelCatalogIndex = new Map<string, ModelCatalogEntry>();
-  private readonly quotaEstimator: QuotaEstimator;
 
   constructor(deps: MonitorServiceDeps) {
     this.localReader = deps.localReader;
@@ -181,11 +177,6 @@ export class MonitorService {
     this.watchFactory = deps.watchFactory;
     this.now = deps.now ?? (() => Date.now());
 
-    this.quotaEstimator = new QuotaEstimator({
-      storagePath: deps.quotaCalibrationPath,
-      poolResolver: (label) => inferModelPool(label, this.modelCatalogIndex),
-    });
-
     this.state = createInitialState(this.scope, this.workspacePaths, this.sqliteBackend, this.now());
     this.state.pinnedSessionId = this.pinnedSessionId;
   }
@@ -195,7 +186,6 @@ export class MonitorService {
       return;
     }
     this.started = true;
-    await this.quotaEstimator.load();
     this.initWatchers();
     this.resetPollingTimer();
     this.resetQuotaPollingTimer();
@@ -646,12 +636,6 @@ export class MonitorService {
         selectedSession.isSelected = true;
       }
 
-      const modelEstimates = this.quotaEstimator.observe({
-        quota: quotaSnapshot,
-        nodes: [...finalTree.roots, ...finalTree.unattachedSubagents],
-        nowMs: now,
-      });
-
       const readerBackend = (this.localReader as any)?.sqliteBackend;
       const backend = readerBackend ?? this.sqliteBackend;
 
@@ -671,7 +655,6 @@ export class MonitorService {
         // and hub fields; splicing this cycle's pre-await capture back would revert them.
         quota: this.quotaSeq !== quotaSeqAtCapture ? this.state.quota : quotaSnapshot,
         modelCatalog: this.modelCatalog,
-        modelEstimates,
         hubStatus: this.quotaSeq !== quotaSeqAtCapture ? this.state.hubStatus : hubStatus,
         hubPort: this.quotaSeq !== quotaSeqAtCapture ? this.state.hubPort : (activeEndpoint?.port ?? null),
         hubSource: this.quotaSeq !== quotaSeqAtCapture ? this.state.hubSource : (activeEndpoint?.source ?? null),
@@ -760,6 +743,5 @@ export class MonitorService {
 
     this.cachedRpcCalls.clear();
     void this.localReader.flushCache();
-    void this.quotaEstimator.flush();
   }
 }

@@ -1,17 +1,14 @@
 import type {
   CallUsagePoint,
   DetailsSectionId,
-  ModelTokenEstimate,
   MonitorState,
   OverviewSectionId,
   PanelLayoutState,
   PanelSectionId,
   PanelTabId,
-  PoolKey,
   QuotaPool,
   QuotaWindow,
   SessionNode,
-  WindowTokenEstimate,
 } from '../types.ts';
 import {
   formatCompactTokens,
@@ -63,31 +60,6 @@ const SECTION_HELP: Record<string, HelpDefinition> = {
       {
         term: 'Independent Model Pools',
         desc: 'Gemini, Argon, and Claude & GPT have separate quotas; using one pool does not drain the others.',
-      },
-    ],
-  },
-  'model-forecast': {
-    title: 'How to Read Model Usage Forecast',
-    items: [
-      {
-        term: '~116M tok (Total Tokens Left)',
-        desc: 'Estimated total tokens remaining in this window, including conversation history and cached project files.',
-      },
-      {
-        term: '~11.3M fresh+out (New Work Left)',
-        desc: 'Estimated new prompt instructions + AI response tokens remaining. Because cached context reads are much cheaper, this number tells you how much actual new coding or prompt work you can do.',
-      },
-      {
-        term: '5-Hour Left vs Weekly Left',
-        desc: 'Estimated tokens remaining before hitting your rolling 5-hour limit versus your 7-day weekly ceiling.',
-      },
-      {
-        term: 'Calibrating (waiting drop)',
-        desc: 'Waiting for a small drop (e.g. 1%) in your quota percentage to measure the exact token burn rate for this model. Once observed, estimates appear automatically.',
-      },
-      {
-        term: 'Calibrating (X used)',
-        desc: 'Telemetry has recorded X tokens used in this window; estimates will unlock as soon as the next quota drop is detected.',
       },
     ],
   },
@@ -334,101 +306,8 @@ function renderQuotaCard(pool: QuotaPool | undefined, fallbackTitle: string): st
   `;
 }
 
-function formatEstimateCell(est: WindowTokenEstimate | null): string {
-  if (!est) {
-    return '<span class="muted">—</span>';
-  }
-  if (est.status === 'calibrated' && est.estimatedTotalTokens !== null) {
-    const total = formatCompactTokens(est.estimatedTotalTokens);
-    const billed = est.estimatedBilledTokens !== null ? formatCompactTokens(est.estimatedBilledTokens) : null;
-    return `
-      <div class="est-main">~${total} <span class="est-unit">tok</span></div>
-      ${billed ? `<div class="est-sub">~${billed} fresh+out</div>` : ''}
-    `;
-  }
-  const used = est.windowUsedTotal > 0 ? `${formatCompactTokens(est.windowUsedTotal)} used` : 'waiting drop';
-  return `<span class="est-cal">Calibrating <span class="muted">(${escapeHtml(used)})</span></span>`;
-}
-
-function poolDisplayLabel(poolKey: PoolKey): string {
-  if (poolKey === 'gemini') return 'Gemini';
-  return 'Claude & GPT';
-}
-
 // Shortcut: fixed preview size, no per-list config; make it a setting if users ask.
 const LIST_PREVIEW_LIMIT = 5;
-
-function renderModelForecastSection(
-  estimates: ModelTokenEstimate[] | undefined,
-  isHelpOpen = false,
-  expandedListSet?: ReadonlySet<string>,
-): string {
-  if (!estimates || estimates.length === 0) {
-    return `
-      <div class="section-card">
-        <div class="section-header">
-          <div class="section-header-left">
-            <h3>Model Usage Forecast</h3>
-            <span class="section-hint">Calibrates automatically from quota % drops</span>
-          </div>
-          ${renderHelpButton('model-forecast', 'Model Usage Forecast', isHelpOpen)}
-        </div>
-        ${renderHelpBox('model-forecast', isHelpOpen)}
-        <div class="empty-inline">No active model telemetry yet in this window.</div>
-      </div>
-    `;
-  }
-
-  // Already ordered calibrated-first then by token volume, so the first rows are the most used.
-  const isExpanded = expandedListSet?.has('forecast') === true;
-  const visibleEstimates = isExpanded ? estimates : estimates.slice(0, LIST_PREVIEW_LIMIT);
-  const forecastToggle =
-    estimates.length > LIST_PREVIEW_LIMIT
-      ? `<button class="btn-ghost list-toggle" data-action="toggleListExpand" data-list="forecast">${
-          isExpanded ? 'Less' : escapeHtml(`More (${estimates.length})`)
-        }</button>`
-      : '';
-
-  const rows = visibleEstimates
-    .map(
-      (item) => `
-      <tr>
-        <td><span class="model-pill">${escapeHtml(item.modelLabel)}</span></td>
-        <td><span class="pool-tag">${escapeHtml(poolDisplayLabel(item.poolKey))}</span></td>
-        <td>${formatEstimateCell(item.fiveHour)}</td>
-        <td>${formatEstimateCell(item.weekly)}</td>
-      </tr>
-    `,
-    )
-    .join('');
-
-  return `
-    <div class="section-card">
-      <div class="section-header">
-        <div class="section-header-left">
-          <h3>Model Usage Forecast <span class="muted">(Est. Tokens Left)</span></h3>
-          <span class="section-hint">Calibrates from observed % drop ÷ tokens used</span>
-        </div>
-        ${renderHelpButton('model-forecast', 'Model Usage Forecast', isHelpOpen)}
-      </div>
-      ${renderHelpBox('model-forecast', isHelpOpen)}
-      <div class="table-wrap">
-        <table class="clean-table">
-          <thead>
-            <tr>
-              <th>Model</th>
-              <th>Pool</th>
-              <th>5-Hour Left</th>
-              <th>Weekly Left</th>
-            </tr>
-          </thead>
-          <tbody>${rows}</tbody>
-        </table>
-      </div>
-      ${forecastToggle}
-    </div>
-  `;
-}
 
 function renderSvgChart(calls: CallUsagePoint[]): string {
   if (calls.length === 0) {
@@ -551,7 +430,7 @@ export function renderBottomPanelBodyHtml(state: MonitorState, uiState?: PanelUi
   const layout: PanelLayoutState = uiState?.layout ?? {
     tabOrder: ['overview', 'details'],
     sectionOrder: {
-      overview: ['quota', 'sessions', 'forecast', 'unattached'],
+      overview: ['quota', 'sessions', 'unattached'],
       details: ['sessionSummary', 'breakdown', 'subagents', 'contextChart'],
     },
     collapsedTabs: [],
@@ -929,14 +808,6 @@ export function renderBottomPanelBodyHtml(state: MonitorState, uiState?: PanelUi
       extraClass: 'quota-pools-section',
       bodyHtml: quotaContentHtml,
     }),
-    forecast: renderSectionWindow({
-      id: 'forecast',
-      tab: 'overview',
-      title: 'Model Usage Forecast',
-      hint: 'Estimated remaining tokens per model',
-      helpId: 'model-forecast',
-      bodyHtml: renderModelForecastSection(state.modelEstimates, isHelpOpen('model-forecast'), expandedListSet),
-    }),
     sessions: renderSectionWindow({
       id: 'sessions',
       tab: 'overview',
@@ -1304,11 +1175,6 @@ export function renderBottomPanelHtml(
     .clickable-row { cursor: pointer; }
     .clickable-row:hover { background: var(--hover-bg); }
 
-    .est-main { font-weight: 600; }
-    .est-unit { font-weight: 400; color: var(--muted-fg); }
-    .est-sub { font-size: 0.88em; color: var(--muted-fg); }
-    .est-cal { font-size: 0.92em; color: var(--muted-fg); }
-
     .model-pill {
       display: inline-block;
       padding: 2px 7px;
@@ -1322,10 +1188,6 @@ export function renderBottomPanelHtml(
       overflow: hidden;
       text-overflow: ellipsis;
       vertical-align: middle;
-    }
-    .pool-tag {
-      font-size: 0.88em;
-      color: var(--muted-fg);
     }
 
     .session-list {

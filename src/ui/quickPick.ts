@@ -63,7 +63,7 @@ export function buildQuickPickItems(state: MonitorState): QuickPickEntry[] {
   // 0. Open Monitor Panel entry
   items.push({
     label: '$(layout-panel) Open Monitor Panel',
-    description: 'Overview, model forecasts, subagents & context charts',
+    description: 'Overview, subagents & context charts',
     action: 'openPanel',
     alwaysShow: true,
   });

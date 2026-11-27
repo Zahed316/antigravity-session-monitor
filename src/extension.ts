@@ -91,7 +91,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     // Directory creation safe ignore
   }
   const cacheFilePath = path.join(context.globalStorageUri.fsPath, 'cache.json');
-  const quotaCalibrationPath = path.join(context.globalStorageUri.fsPath, 'quota-calibration.json');
 
   let workspaceStateDbPath: string | undefined;
   if (context.storageUri) {
@@ -167,7 +166,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     pinnedSessionId: initialPinnedId,
     scope: initialScope,
     antigravityRoot,
-    quotaCalibrationPath,
     sqliteBackend: sqliteClient.backend,
     onPersistPinnedId: async (id) => {
       await context.workspaceState.update('antigravityMonitor.pinnedSessionId', id);
