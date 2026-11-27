@@ -69,7 +69,7 @@ function pickBestAlternative(
 }
 
 export class QuotaAlertService {
-  /** Alert keys `${email}:${poolKey}:${window}:${resetTime}` that already fired this session. */
+  /** Alert keys `${email}:${poolKey}:${window}:${resetTime}:${kind}` that already fired this session. */
   private readonly alerted = new Set<string>();
   /** Tuples `${email}:${poolKey}:${window}` that hit low/exhausted, mapped to the resetTime seen then. */
   private readonly flagged = new Map<string, string | null>();
@@ -96,19 +96,19 @@ export class QuotaAlertService {
     const events: QuotaAlertEvent[] = [];
     if (config.enableLowQuotaAlerts) {
       if (lows.length > 0) {
-        events.push({ kind: 'low', email: params.email, pools: lows });
+        events.push({ kind: 'low', email, pools: lows });
       }
       if (exhaustions.length > 0) {
         events.push({
           kind: 'exhausted',
-          email: params.email,
+          email,
           pools: exhaustions,
           bestAlternative: pickBestAlternative(params.alternatives),
         });
       }
     }
     if (config.notifyQuotaReset && resets.length > 0) {
-      events.push({ kind: 'reset', email: params.email, pools: resets });
+      events.push({ kind: 'reset', email, pools: resets });
     }
     return events;
   }
@@ -124,28 +124,53 @@ export class QuotaAlertService {
   ): void {
     const { config } = params;
     // Reset detection compares against the resetTime seen when the tuple dropped below
-    // threshold, so the flag key deliberately excludes resetTime.
+    // threshold, so the flag key deliberately excludes resetTime and kind.
     const flagKey = `${email}:${poolKey}:${window.window}`;
+    const alertedKey = (resetTime: string | null, kind: 'low' | 'exhausted') => `${flagKey}:${resetTime}:${kind}`;
+    const clearAlerted = (resetTime: string | null) => {
+      this.alerted.delete(alertedKey(resetTime, 'low'));
+      this.alerted.delete(alertedKey(resetTime, 'exhausted'));
+    };
+    const entry = { poolKey, window: window.window, remainingPct: window.remainingPct, resetTime: window.resetTime };
     const flaggedResetTime = this.flagged.get(flagKey);
     if (flaggedResetTime !== undefined) {
-      if (window.resetTime !== flaggedResetTime || window.remainingPct > config.lowQuotaThresholdPct) {
-        resets.push({ poolKey, window: window.window, remainingPct: window.remainingPct, resetTime: window.resetTime });
+      if (window.remainingPct > config.lowQuotaThresholdPct) {
+        resets.push(entry);
         this.flagged.delete(flagKey);
-        // Clearing the alert key lets a re-drop within the same window alert again.
-        this.alerted.delete(`${flagKey}:${flaggedResetTime}`);
+        // Clearing the alert keys lets a re-drop within the same window alert again.
+        clearAlerted(flaggedResetTime);
+        return;
+      }
+      if (window.resetTime !== flaggedResetTime) {
+        if (window.remainingPct <= 0) {
+          // Rolled forward while still exhausted: no reset event; re-arm under the new
+          // resetTime so the next poll can emit a fresh exhausted alert.
+          this.flagged.set(flagKey, window.resetTime);
+        } else {
+          resets.push(entry);
+          this.flagged.delete(flagKey);
+        }
+        clearAlerted(flaggedResetTime);
+        return;
+      }
+      // Same window period, still below threshold: escalate low -> exhausted exactly once.
+      if (window.remainingPct <= 0 && !this.alerted.has(alertedKey(flaggedResetTime, 'exhausted'))) {
+        this.alerted.add(alertedKey(flaggedResetTime, 'exhausted'));
+        exhaustions.push(entry);
       }
       return;
     }
-    if (!config.enableLowQuotaAlerts || this.alerted.has(`${flagKey}:${window.resetTime}`)) {
+    if (window.remainingPct > config.lowQuotaThresholdPct) {
       return;
     }
-    if (window.remainingPct > 0 && window.remainingPct > config.lowQuotaThresholdPct) {
-      return;
-    }
-    this.alerted.add(`${flagKey}:${window.resetTime}`);
+    // Flag even when low alerts are off so reset detection works with only notifyQuotaReset.
     this.flagged.set(flagKey, window.resetTime);
-    const entry = { poolKey, window: window.window, remainingPct: window.remainingPct, resetTime: window.resetTime };
-    if (window.remainingPct <= 0) {
+    const kind = window.remainingPct <= 0 ? 'exhausted' : 'low';
+    if (!config.enableLowQuotaAlerts || this.alerted.has(alertedKey(window.resetTime, kind))) {
+      return;
+    }
+    this.alerted.add(alertedKey(window.resetTime, kind));
+    if (kind === 'exhausted') {
       exhaustions.push(entry);
     } else {
       lows.push(entry);

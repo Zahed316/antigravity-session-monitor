@@ -177,18 +177,71 @@ test('reset notifications are gated by notifyQuotaReset', () => {
   );
 });
 
-test('low and exhausted alerts are gated by enableLowQuotaAlerts', () => {
+test('low escalates to exhausted at the same resetTime; exhausted carries bestAlternative; repeats deduped', () => {
+  const service = new QuotaAlertService();
+  const low = evaluate(service, 'dev@example.com', snapshot({ gemini: makePool(15, 90, 'T1') }));
+  assert.equal(low.length, 1);
+  assert.equal(low[0].kind, 'low');
+
+  const alternatives = [
+    { account: account('rich@example.com'), snapshot: snapshot({ gemini: makePool(60, 100) }) },
+  ];
+  const exhausted = evaluate(
+    service,
+    'dev@example.com',
+    snapshot({ gemini: makePool(0, 90, 'T1') }),
+    alternatives,
+  );
+  assert.equal(exhausted.length, 1);
+  assert.equal(exhausted[0].kind, 'exhausted');
+  assert.deepEqual(exhausted[0].bestAlternative, { email: 'rich@example.com', minRemainingPct: 60 });
+
+  // Same kind again: deduped.
+  assert.deepEqual(
+    evaluate(service, 'dev@example.com', snapshot({ gemini: makePool(0, 90, 'T1') }), alternatives),
+    [],
+  );
+});
+
+test('no reset event when a flagged tuple rolls forward while still exhausted', () => {
+  const service = new QuotaAlertService();
+  assert.equal(evaluate(service, 'dev@example.com', snapshot({ gemini: makePool(0, 50, 'T1') })).length, 1);
+
+  // resetTime rolls but quota is still 0%: no reset.
+  assert.deepEqual(evaluate(service, 'dev@example.com', snapshot({ gemini: makePool(0, 50, 'T2') })), []);
+
+  // Next poll under the new resetTime emits a fresh exhausted alert, exactly once.
+  const again = evaluate(service, 'dev@example.com', snapshot({ gemini: makePool(0, 50, 'T2') }));
+  assert.equal(again.length, 1);
+  assert.equal(again[0].kind, 'exhausted');
+  assert.deepEqual(evaluate(service, 'dev@example.com', snapshot({ gemini: makePool(0, 50, 'T2') })), []);
+});
+
+// Old resetTime keys are cleared when a reset fires; a rolled-away key only lingers until
+// the eventual reset, so growth stays bounded per (tuple, resetTime).
+test('low and exhausted alerts are gated by enableLowQuotaAlerts, but resets are not', () => {
   const service = new QuotaAlertService();
   const config = { ...CONFIG, enableLowQuotaAlerts: false };
   assert.deepEqual(
     evaluate(service, 'dev@example.com', snapshot({ gemini: makePool(10, 0) }), [], config),
     [],
   );
-  // No alerts were raised, so nothing is flagged: no reset on recovery either.
-  assert.deepEqual(
-    evaluate(service, 'dev@example.com', snapshot({ gemini: makePool(80, 80) }), [], config),
-    [],
-  );
+  // The drop was still tracked, so genuine recovery emits a reset.
+  const recovered = evaluate(service, 'dev@example.com', snapshot({ gemini: makePool(80, 80) }), [], config);
+  assert.equal(recovered.length, 1);
+  assert.equal(recovered[0].kind, 'reset');
+});
+
+test('emitted event email is normalized', () => {
+  const service = new QuotaAlertService();
+  const low = evaluate(service, '  DEV@Example.COM ', snapshot({ gemini: makePool(15, 90) }));
+  assert.equal(low[0].email, 'dev@example.com');
+
+  const service2 = new QuotaAlertService();
+  const reset = evaluate(service2, '  DEV@Example.COM ', snapshot({ gemini: makePool(10, 90) }));
+  assert.equal(reset[0].email, 'dev@example.com');
+  const recovered = evaluate(service2, 'DEV@example.com', snapshot({ gemini: makePool(80, 90) }));
+  assert.equal(recovered[0].email, 'dev@example.com');
 });
 
 test('missing pools, missing windows, offline and stale snapshots are no-data, never 0%', () => {
