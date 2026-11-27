@@ -1,5 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import {
   DEFAULT_CONFIG,
   DEFAULT_CONTEXT_LIMIT,
@@ -19,9 +22,11 @@ import {
   formatResetDateTime,
   buildStatusBarViewModel,
   createStatusBarController,
+  resolveActiveAccountView,
   type StatusBarVscodeLike,
   type StatusBarItemLike,
 } from '../src/ui/statusBar.ts';
+import { AccountStore } from '../src/accounts/accountStore.ts';
 import {
   buildQuickPickItems,
   showSessionQuickPick,
@@ -1596,6 +1601,51 @@ test('renderBottomPanelBodyHtml: Quota Matrix shows Reset passed · stale for ex
   assert.match(matrix, /Reset passed · stale/);
   assert.ok(!matrix.includes('100%'), 'stale windows never render as 100%');
   assert.match(matrix, /other@example\.com/);
+});
+
+test('Quota Matrix: anonymous-bucket poll keeps the previous account windows stale, never a fresh percentage', () => {
+  const { state, active, saved } = createAccountsState();
+  // Latest poll failed the identity fetch: no attributed snapshot for the labeled account,
+  // so resolveActiveAccountView (the header's authority) reports 'unknown'.
+  state.accountSnapshots = {};
+  assert.equal(resolveActiveAccountView(state).kind, 'unknown');
+
+  const expired = createQuota();
+  expired.pools.gemini.fiveHour = {
+    window: '5h',
+    remainingPct: 100,
+    remainingFraction: 1,
+    resetTime: new Date(Date.now() - 3_600_000).toISOString(),
+    isReady: true,
+    isExhausted: false,
+  };
+  // buildMatrixSnapshots derives isActive from resolveActiveAccountView: identity unknown
+  // means the labeled account is stored inactive, so AccountStore marks it stale.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gw-matrix-'));
+  const map = new Map<string, unknown>();
+  const store = new AccountStore({
+    globalState: {
+      get: (key: string) => map.get(key),
+      update: async (key: string, value: unknown) => {
+        if (value === undefined) map.delete(key);
+        else map.set(key, value);
+      },
+    } as never,
+    globalStorageUri: dir,
+  });
+  void store.saveSnapshot('dev@example.com', expired);
+  const matrixSnapshots = {
+    'dev@example.com': store.getSnapshot('dev@example.com', /* isActive */ false),
+    'other@example.com': null,
+  };
+
+  const html = renderBottomPanelBodyHtml(state, { activeTab: 'accounts', matrixSnapshots });
+  const matrix = html.slice(
+    html.indexOf('Multi-Account Quota Matrix'),
+    html.indexOf('30-Day Quota History'),
+  );
+  assert.match(matrix, /Reset passed · stale/);
+  assert.ok(!matrix.includes('100%'), 'expired snapshot of an identity-unknown account never renders fresh');
 });
 
 test('renderBottomPanelBodyHtml: Accounts tab renders history backups and diagnostics card', () => {

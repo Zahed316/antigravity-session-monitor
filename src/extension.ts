@@ -10,7 +10,7 @@ import { HubClient } from './rpc/hubClient.ts';
 import { HubAuthClient } from './rpc/hubAuth.ts';
 import { discoverHubEndpoints, type HubEndpoint } from './rpc/hubDiscovery.ts';
 import { extractArtifactCascadeId } from './core/sessionResolver.ts';
-import { createStatusBarController, type StatusBarController } from './ui/statusBar.ts';
+import { createStatusBarController, resolveActiveAccountView, type StatusBarController } from './ui/statusBar.ts';
 import { showSessionQuickPick } from './ui/quickPick.ts';
 import { createBottomPanelProvider, type AccountEditField } from './ui/bottomPanelProvider.ts';
 import { MonitorService } from './monitorService.ts';
@@ -356,7 +356,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     );
   }
 
-  // Register all 6 commands
+  // Register all 12 commands
   context.subscriptions.push(
     vscode.commands.registerCommand('antigravityMonitor.openQuickPick', async () => {
       if (!monitorService) {
@@ -448,10 +448,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   /** Per-Account snapshots (AccountStore applies reset-time staleness for inactive ones). */
   function buildMatrixSnapshots(): Record<string, QuotaSnapshot | null> {
-    const activeEmail = monitorService?.getState().activeAccount?.email ?? null;
+    const state = monitorService?.getState();
+    // The activeAccount label can be stale on an anonymous-bucket poll (carry-forward #1):
+    // only skip staleness for the row the header already trusts, so an expired snapshot
+    // attributed to a non-authoritative account still renders its stale badge.
+    const view = state ? resolveActiveAccountView(state) : { kind: 'none' as const };
+    const verifiedActiveEmail = view.kind === 'known' ? view.email : null;
     const out: Record<string, QuotaSnapshot | null> = {};
     for (const account of accountStore.listAccounts()) {
-      out[account.email] = accountStore.getSnapshot(account.email, account.email === activeEmail);
+      out[account.email] = accountStore.getSnapshot(account.email, account.email === verifiedActiveEmail);
     }
     return out;
   }

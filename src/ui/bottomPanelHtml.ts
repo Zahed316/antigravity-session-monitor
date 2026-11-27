@@ -1979,8 +1979,24 @@ export function renderBottomPanelHtml(
         const root = document.getElementById('panel-root');
         if (root && typeof message.bodyHtml === 'string') {
           const prevScroll = window.scrollY;
+          // innerHTML replacement destroys the focused element: remember the search input
+          // (and caret) so typing keeps working across re-renders.
+          const prevActive = document.activeElement instanceof HTMLInputElement ? document.activeElement : null;
+          const prevSelection =
+            prevActive && prevActive.getAttribute('data-action') === 'accountSearch'
+              ? { start: prevActive.selectionStart, end: prevActive.selectionEnd }
+              : null;
           root.innerHTML = message.bodyHtml;
           window.scrollTo(0, prevScroll);
+          if (prevSelection) {
+            const search = root.querySelector<HTMLInputElement>(
+              'input[data-action="accountSearch"]',
+            );
+            if (search) {
+              search.focus();
+              search.setSelectionRange(prevSelection.start, prevSelection.end);
+            }
+          }
         }
       }
     });
