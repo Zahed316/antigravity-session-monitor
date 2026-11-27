@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# sdd-verify: run the full session gate (check, test, build) and report each result.
+# No `set -e` on purpose: a failing command must be reported with its output,
+# not abort the script before it can print FAIL.
+set -uo pipefail
+# Repo root is informational only (locating scripts/); npm deliberately runs in
+# the caller's cwd so stub package.json files (e.g. in tests) are honoured.
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+
+run() {
+  local name="$1"; shift
+  local out
+  if out=$("$@" 2>&1); then
+    printf 'PASS %s\n' "$name"
+  else
+    printf 'FAIL %s\n' "$name"
+    printf '%s\n' "$out" | tail -n 20
+    exit 1
+  fi
+}
+
+run "npm run check" npm run check
+run "npm test" npm test
+run "npm run build" npm run build
+printf 'OK\n'
