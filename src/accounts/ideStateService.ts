@@ -184,6 +184,7 @@ export async function readStandaloneIdeAuthState(
  * Payload contract:
  * {
  *   stateDbPath: string,
+ *   dataPath: string,
  *   keys: [{ key: string, valueB64: string }],
  *   relaunch: { file: string, args: string[] },
  *   processName: string, platform: string,
@@ -240,14 +241,69 @@ function killProcess(payload, force) {
       return;
     }
     if (payload.platform === 'win32') {
+      // M2 residual: without a Windows command-line reader there is no safe
+      // narrow match, so the image-name taskkill stays and may hit every
+      // Antigravity process of the user.
       cp.execFileSync('taskkill', force ? ['/F', '/IM', payload.processName + '.exe'] : ['/IM', payload.processName + '.exe'], { stdio: 'ignore', timeout: 8000 });
-    } else {
-      // -x: exact image-name match only, so this worker is never its own victim.
-      cp.execFileSync('pkill', [force ? '-9' : '-TERM', '-x', payload.processName], { stdio: 'ignore', timeout: 8000 });
+      return;
+    }
+    // M2 narrow kill: only processes whose command line binds the target data
+    // dir (--user-data-dir/--app-data-dir). If none match, nothing is killed
+    // and the switch fails closed with wal_timeout instead of killing every
+    // Antigravity process of the user.
+    const pids = findOwningPids(payload);
+    for (let i = 0; i < pids.length; i++) {
+      try { process.kill(pids[i], force ? 'SIGKILL' : 'SIGTERM'); } catch (_) { /* already gone */ }
     }
   } catch (_) {
     // No matching process or missing tool: nothing to kill.
   }
+}
+
+function escapeRe(s) {
+  // Note: the character class avoids a dollar-sign-followed-by-brace sequence —
+  // this code lives inside a String.raw template where that would start an
+  // interpolation.
+  return s.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, '\\$&');
+}
+
+function argsMatchDataDir(args, dataPath) {
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if ((a === '--user-data-dir' || a === '--app-data-dir') && args[i + 1] === dataPath) return true;
+    if (a === '--user-data-dir=' + dataPath || a === '--app-data-dir=' + dataPath) return true;
+  }
+  return false;
+}
+
+function findOwningPids(payload) {
+  const pids = [];
+  if (payload.platform === 'linux') {
+    let entries = [];
+    try { entries = fs.readdirSync('/proc'); } catch (_) { return pids; }
+    for (const entry of entries) {
+      const pid = parseInt(entry, 10);
+      if (!pid || pid === process.pid) continue;
+      let raw = '';
+      try { raw = fs.readFileSync('/proc/' + pid + '/cmdline', 'utf8'); } catch (_) { continue; }
+      if (argsMatchDataDir(raw.split('\0').filter(Boolean), payload.dataPath)) pids.push(pid);
+    }
+    return pids;
+  }
+  // macOS: no /proc; parse ps command strings. The regex form keeps data
+  // dirs containing spaces (e.g. "Application Support") matchable.
+  let out = '';
+  try { out = cp.execFileSync('ps', ['-axo', 'pid=,command='], { encoding: 'utf8', timeout: 8000 }); } catch (_) { return pids; }
+  const re = new RegExp('(^|\\s)--(?:user-data-dir|app-data-dir)(?:=|\\s+)' + escapeRe(payload.dataPath) + '(\\s|$)');
+  const lines = out.split('\n');
+  for (let i = 0; i < lines.length; i++) {
+    const m = lines[i].match(/^\s*(\d+)\s+(.*)$/);
+    if (!m) continue;
+    const pid = parseInt(m[1], 10);
+    if (!pid || pid === process.pid) continue;
+    if (re.test(m[2])) pids.push(pid);
+  }
+  return pids;
 }
 
 function waitIdeExit(payload) {
@@ -273,6 +329,11 @@ function waitIdeExit(payload) {
 function copyBackup(dbPath) {
   const bakPath = dbPath + '.bak';
   fs.copyFileSync(dbPath, bakPath);
+  try {
+    // I6: the .bak is a full auth-bearing DB copy — restrict it to the owner
+    // immediately (POSIX only; Windows mode is not meaningful).
+    if (process.platform !== 'win32') fs.chmodSync(bakPath, 0o600);
+  } catch (_) { /* mode hardening is best effort */ }
   const dbBuf = fs.readFileSync(dbPath);
   const bakBuf = fs.readFileSync(bakPath);
   // Byte-length + content hash: a truncated or torn copy must abort the switch.
@@ -398,8 +459,11 @@ function run(payload, payloadPath) {
   }
   const failStage = applyWrites(payload.stateDbPath, payload, payloadPath);
   if (failStage) {
-    try { fs.copyFileSync(bakPath, payload.stateDbPath); } catch (_) { /* best effort restore */ }
-    return { ok: false, stage: failStage, restored: true };
+    // I5: report the restore truthfully — a failed restore copy must never be
+    // labeled restored:true while the DB may hold partially written auth keys.
+    let restored = false;
+    try { fs.copyFileSync(bakPath, payload.stateDbPath); restored = true; } catch (_) { /* restore failed: reported below */ }
+    return { ok: false, stage: failStage, restored: restored };
   }
   return { ok: true, stage: 'done', relaunched: relaunchIde(payload), backupPath: bakPath };
 }
@@ -442,6 +506,8 @@ export interface StandaloneSwitchRelaunch {
 
 export interface StandaloneSwitchPayload {
   stateDbPath: string;
+  /** The IDE user-data dir, used by the worker's narrow kill match (M2). */
+  dataPath: string;
   keys: StandaloneSwitchPayloadKey[];
   relaunch: StandaloneSwitchRelaunch;
   processName: string;
@@ -489,7 +555,7 @@ export interface StandaloneSwitchParams {
 export interface StandaloneSwitchOutcome {
   launched: boolean;
   reason?: string;
-  /** Path of the safety backup copy, for user-visible recovery instructions. */
+  /** Path of the safety backup copy on failure paths, for user-visible recovery instructions. */
   backupPath?: string;
 }
 
@@ -578,6 +644,7 @@ export async function performStandaloneIdeSwitch(params: StandaloneSwitchParams)
   const backupPath = `${ideInfo.stateDbPath}.bak`;
   const payload: StandaloneSwitchPayload = {
     stateDbPath: ideInfo.stateDbPath,
+    dataPath: ideInfo.dataPath,
     keys: buildSwitchKeys(params.targetEmail, params.ideState),
     relaunch: buildRelaunch(ideInfo, platform),
     processName: ideInfo.processName,
@@ -633,6 +700,10 @@ export async function performStandaloneIdeSwitch(params: StandaloneSwitchParams)
     params.waitForResultMs ??
     payload.minSettleMs + payload.waitTimeoutMs + payload.graceKillTimeoutMs + payload.forceKillTimeoutMs + RESULT_WAIT_MARGIN_MS;
   if (waitForResultMs <= 0) {
+    // Fire-and-forget callers still must not leave the token-bearing payload,
+    // the worker script, or the result scratch file behind (I4): the worker's
+    // own "delete on every exit path" cannot cover a worker that never exits.
+    await cleanupFiles(fsDep, [payloadPath, workerPath, resultPath]);
     return { launched: true, backupPath };
   }
   const delay = params.delay ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
@@ -641,16 +712,48 @@ export async function performStandaloneIdeSwitch(params: StandaloneSwitchParams)
     await delay(RESULT_POLL_INTERVAL_MS);
     try {
       const raw = await fsDep.readFile(resultPath, 'utf8');
-      const parsed = JSON.parse(raw) as { ok?: boolean; stage?: string };
+      const parsed = JSON.parse(raw) as { ok?: boolean; stage?: string; restored?: boolean };
       // Consumed: the result file is transient scratch, not a kept artifact.
       await cleanupFiles(fsDep, [resultPath]);
       if (parsed.ok) {
-        return { launched: true, backupPath };
+        // Verified successful switch: delete the auth-bearing .bak now (I6);
+        // it is kept on every failure path as the recovery artifact.
+        await cleanupFiles(fsDep, [backupPath, resultPath]);
+        return { launched: true };
       }
-      return { launched: false, reason: parsed.stage ?? 'worker_error', backupPath };
+      const stage = parsed.stage ?? 'worker_error';
+      return {
+        launched: false,
+        // I5: a worker that could not restore the .bak is surfaced distinctly
+        // (via the switcher's message) so the UI can demand a manual restore.
+        reason: parsed.restored === false ? `${stage}_restore_failed` : stage,
+        backupPath,
+      };
     } catch {
       // Result not written yet: keep polling until the deadline.
     }
   }
+  // The worker never exited in time: its "delete on every exit path" cannot
+  // run, so purge the token-bearing payload, the worker script, and the
+  // result scratch file here (I4).
+  await cleanupFiles(fsDep, [payloadPath, workerPath, resultPath]);
   return { launched: false, reason: 'switch_result_timeout', backupPath };
+}
+
+/**
+ * User-facing recovery hint for a failed switch, derived from the switcher's
+ * result message (I5): when the worker could not restore the `.bak`
+ * (`_restore_failed` reason suffix), the user must restore it manually; when
+ * the restore succeeded, say so instead of demanding a manual restore.
+ */
+export function switchFailureRecoveryHint(message: string | undefined): string {
+  const bakPath = message ? /backup at ([^)]+\.bak)/.exec(message)?.[1] : undefined;
+  if (bakPath) {
+    return message!.includes('_restore_failed')
+      ? ` Restore ${bakPath} manually before using Antigravity.`
+      : ' Your original database was restored.';
+  }
+  return message && message.includes('.bak')
+    ? ''
+    : ' If the IDE does not start, restore the state.vscdb.bak backup.';
 }

@@ -34,8 +34,10 @@ function utcDayBucket(ms: number): string {
 }
 
 function csvCell(value: string): string {
+  // M5: neutralize spreadsheet formula prefixes — label/group are free user text.
+  const neutralized = /^[=+\-@\t]/.test(value) ? `'${value}` : value;
   // Quote only when needed, doubling embedded quotes per RFC 4180.
-  return /[",\r\n]/.test(value) ? `"${value.replace(/"/g, '""')}"` : value;
+  return /[",\r\n]/.test(neutralized) ? `"${neutralized.replace(/"/g, '""')}"` : neutralized;
 }
 
 export class QuotaHistoryStore {

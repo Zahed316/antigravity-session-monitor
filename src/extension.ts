@@ -22,7 +22,9 @@ import { AccountSwitcher } from './accounts/accountSwitcher.ts';
 import {
   isAntigravityStandaloneIde,
   resolveStandaloneIdeInfo,
+  switchFailureRecoveryHint,
 } from './accounts/ideStateService.ts';
+import { purgeRemovedAccountCredential } from './accounts/vaultPurge.ts';
 import { createKeyringVerifier, createTokenVaultDeps } from './accounts/vaultWiring.ts';
 import { DEFAULT_CONFIG, type MonitorConfig, type QuotaSnapshot, type ScopeMode } from './types.ts';
 
@@ -483,11 +485,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           );
         }
       } else {
-        // Never report success on failure; surface the reason and the .bak recovery hint.
-        const bakHint =
-          result.message && result.message.includes('.bak')
-            ? ''
-            : ' If the IDE does not start, restore the state.vscdb.bak backup.';
+        // Never report success on failure; surface the reason and the real
+        // recovery state: a restored .bak is NOT a manual-restore instruction (I5).
+        const bakHint = switchFailureRecoveryHint(result.message);
         vscode.window.showErrorMessage(
           `GravityWatch: switch to ${email} failed${result.message ? ` (${result.message})` : ''}.${bakHint}`,
         );
@@ -578,7 +578,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     const activeEmail = monitorService?.getState().activeAccount?.email ?? null;
     const result = await accountStore.removeAccount(normalized, activeEmail);
     if (result.removed) {
-      vscode.window.showInformationMessage(`GravityWatch: removed ${normalized}.`);
+      // C4: the vault credential and index entry must not outlive the removed
+      // Account. Best effort: a purge failure never undoes the removal but is
+      // surfaced in the confirmation message instead of being swallowed.
+      const purgeNote = await purgeRemovedAccountCredential(vaultService, normalized);
+      vscode.window.showInformationMessage(`GravityWatch: removed ${normalized}.${purgeNote}`);
       publishAccounts();
     } else if (result.reason === 'active_account') {
       vscode.window.showWarningMessage(
@@ -590,7 +594,20 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   }
 
   async function handleReauthAccount(email: string): Promise<void> {
-    const result = await switcher.reauthAccount(email);
+    // M3: re-auth logs the current session out — validate against the registry
+    // and require the same modal confirmation as removeAccount.
+    const normalized = email.trim().toLowerCase();
+    if (!accountStore.listAccounts().some((a) => a.email === normalized)) {
+      vscode.window.showWarningMessage(`GravityWatch: Account ${normalized} is not a known Account.`);
+      return;
+    }
+    const confirm = await vscode.window.showWarningMessage(
+      `Sign out and re-authenticate the Account ${normalized}? The current session will be logged out.`,
+      { modal: true },
+      'Re-authenticate',
+    );
+    if (confirm !== 'Re-authenticate') return;
+    const result = await switcher.reauthAccount(normalized);
     if (result.ok) {
       vscode.window.showInformationMessage(`GravityWatch: re-auth started for ${email}.`);
       await monitorService?.refreshQuotaNow();

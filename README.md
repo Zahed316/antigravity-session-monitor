@@ -79,7 +79,7 @@ All commands live under the **Antigravity Monitor** category and are available f
 | `antigravityMonitor.lowQuotaThresholdPct` | number | `20` | Remaining-percent threshold below which a low-quota alert fires (5–50). |
 | `antigravityMonitor.notifyQuotaReset` | boolean | `true` | Notify when a flagged low-quota or exhausted window resets. |
 | `antigravityMonitor.quotaAlertBackground` | boolean | `true` | Tint the Status Bar quota badge warning/error while any pool is at or below the low-quota threshold. |
-| `antigravityMonitor.autoCaptureVault` | boolean | `true` | Automatically capture the active Account credential into the encrypted vault (SecretStorage) when a new Account email is observed. |
+| `antigravityMonitor.autoCaptureVault` | boolean | `false` | Opt-in: automatically capture the active Account credential into the encrypted vault (SecretStorage) when a new Account email is observed. Off by default per the opt-in vault policy — enable it, or use the manual **Save Current Account** action. |
 
 ## Privacy: how it works
 

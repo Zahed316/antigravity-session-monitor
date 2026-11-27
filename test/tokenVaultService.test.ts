@@ -252,12 +252,14 @@ test('getCredential returns null without purging for an unknown email', async ()
 
 // ---------- capabilities ----------
 
-test('capabilities: win32 reports the PowerShell CredMan backend', async () => {
+test('capabilities: win32 reports none until a CredMan reader exists (M1)', async () => {
   const h = makeService({ platform: 'win32', readIdeState: null });
   const caps = await h.service.getCapabilities();
   assert.equal(caps.secretStorageAvailable, true);
-  assert.equal(caps.osKeyringSupported, true);
-  assert.equal(caps.osKeyringBackend, 'wincred');
+  // No CredMan reader exists, so a written keyring entry can never be
+  // verified for switching: the capability must not claim wincred (M1).
+  assert.equal(caps.osKeyringSupported, false);
+  assert.equal(caps.osKeyringBackend, 'none');
   assert.equal(caps.standaloneDbSupported, false);
 });
 
@@ -304,7 +306,7 @@ test('capabilities: standaloneDbSupported reflects an injected standalone DB rea
 
 // ---------- OS keyring adapters ----------
 
-test('win32 apply passes the secret via env/stdin, never via argv', async () => {
+test('win32 keyring apply is gated off until a CredMan reader exists (M1)', async () => {
   const h = makeService({ platform: 'win32', readIdeState: null });
   // Seed the vault directly so adapter tests do not depend on readIdeState.
   const secretJson = JSON.stringify({ email: A_EMAIL, access_token: 'SECRET-TOKEN-123' });
@@ -318,14 +320,8 @@ test('win32 apply passes the secret via env/stdin, never via argv', async () => 
   h.secrets.seed(TOKEN_VAULT_INDEX_KEY, JSON.stringify([A_EMAIL]));
 
   const result = await h.service.applyToOsKeyring(A_EMAIL);
-  assert.deepEqual(result, { applied: true });
-  assert.equal(h.execCalls.length, 1);
-  const call = h.execCalls[0]!;
-  assert.equal(call.file, 'powershell.exe');
-  const joinedArgs = call.args.join(' ');
-  assert.ok(!joinedArgs.includes('SECRET-TOKEN-123'), 'secret never in argv');
-  assert.ok(!joinedArgs.includes('a@example.com'), 'username kept out of argv too');
-  assert.equal(call.options?.env?.GW_VAULT_SECRET, secretJson, 'canonical raw payload passed via env, not the base64 blob');
+  assert.deepEqual(result, { applied: false, reason: 'keyring_unsupported' });
+  assert.equal(h.execCalls.length, 0, 'no CredMan write is attempted while the capability is switched off');
 });
 
 test('darwin apply uses security add-generic-password with stdin secret', async () => {

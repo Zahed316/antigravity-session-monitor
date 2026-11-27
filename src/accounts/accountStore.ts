@@ -1,6 +1,7 @@
 import nodeFs from 'node:fs/promises';
 import nodePath from 'node:path';
 
+import { EMAIL_RE } from './tokenVaultService.ts';
 import type { AccountAuthStatus, AccountIdentity, ManagedAccount, QuotaSnapshot } from '../types.ts';
 
 export const ACCOUNTS_STATE_KEY = 'antigravityMonitor.accounts.v1';
@@ -106,6 +107,16 @@ export class AccountStore {
         status: isActive ? 'active' : 'saved',
       };
       this.accounts.push(account);
+    }
+    if (isActive) {
+      // C3: only one Account may carry 'active'. Callers (monitorService) always
+      // pass isActive: true for the currently-seen identity, so demote any OTHER
+      // account still marked active — persisted in this same write.
+      for (const other of this.accounts) {
+        if (other !== account && other.status === 'active') {
+          other.status = 'saved';
+        }
+      }
     }
     await this.persistAccounts();
     return account;
@@ -229,7 +240,9 @@ export class AccountStore {
     let skipped = 0;
     for (const entry of parsed.accounts) {
       const email = typeof entry?.email === 'string' ? normalizeEmail(entry.email) : '';
-      if (!email) {
+      // M4: only real addresses may become SecretStorage key suffixes; a crafted
+      // backup must never seed path-like or lookalike "emails".
+      if (!email || EMAIL_RE.exec(email)?.[0] !== email) {
         skipped += 1;
         continue;
       }

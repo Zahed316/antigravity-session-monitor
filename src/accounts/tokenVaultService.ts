@@ -59,7 +59,9 @@ function normalizeEmail(email: string): string {
   return email.trim().toLowerCase();
 }
 
-const EMAIL_RE = /[\w.+-]+@[\w-]+(?:\.[\w-]+)+/;
+// Exported for reuse by the AccountStore backup-import validator (M4) — one
+// spelling of "valid email" across the accounts modules.
+export const EMAIL_RE = /[\w.+-]+@[\w-]+(?:\.[\w-]+)+/;
 
 function b64urlDecode(segment: string): string | null {
   try {
@@ -305,8 +307,12 @@ export class TokenVaultService {
   async getCapabilities(): Promise<VaultCapabilities> {
     let backend: VaultCapabilities['osKeyringBackend'] = 'none';
     if (this.platform === 'win32') {
-      // PowerShell + Advapi32 CredMan ships with every supported Windows host.
-      backend = 'wincred';
+      // M1: a CredMan WRITER exists, but there is no CredMan reader, so a
+      // written keyring entry could never be verified for switching. Report
+      // the capability that applies to SWITCHING until a reader lands — the
+      // diagnostics card must not claim wincred while the switch path
+      // distrusts it.
+      backend = 'none';
     } else if (this.platform === 'darwin') {
       backend = (await this.resolveWhich('security')) ? 'macos-keychain' : 'none';
     } else if (this.platform === 'linux') {

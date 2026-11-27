@@ -236,3 +236,15 @@ test('unknown emails export with empty label and group', async () => {
   const csv = store.exportCsv(new Map(), 30, NOW);
   assert.match(csv.split('\n')[1] ?? '', /^2026-01-15,ghost@example\.com,,,gemini,70,50,/);
 });
+
+test('exportCsv neutralizes spreadsheet formula prefixes in label and group (M5)', async () => {
+  const { store } = await makeStore();
+  await store.recordSnapshot('dev@example.com', onlineSnapshot({ gemini: makePool(70, 50) }), NOW);
+  const accounts = new Map<string, ManagedAccount>([
+    ['dev@example.com', account({ label: '=1+1', group: '+danger' })],
+  ]);
+  const lines = store.exportCsv(accounts, 30, NOW).split('\n');
+  const cells = (lines[1] ?? '').split(',');
+  assert.equal(cells[2], "'=1+1", 'formula-prefixed label neutralized with a leading quote');
+  assert.equal(cells[3], "'+danger", 'formula-prefixed group neutralized with a leading quote');
+});

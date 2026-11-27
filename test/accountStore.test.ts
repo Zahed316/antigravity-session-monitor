@@ -4,7 +4,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
-import { AccountStore, SNAPSHOT_FILE_NAME } from '../src/accounts/accountStore.ts';
+import { AccountStore, BACKUP_SCHEMA, SNAPSHOT_FILE_NAME } from '../src/accounts/accountStore.ts';
 import type { AccountIdentity, QuotaSnapshot, QuotaWindow } from '../src/types.ts';
 
 function fakeGlobalState() {
@@ -223,4 +223,31 @@ test('export -> import round-trip restores accounts and skips invalid entries', 
   assert.equal(target.store.listAccounts().find((a) => a.email === 'dev@example.com')?.label, 'Local');
 
   await assert.rejects(() => target.store.importBackupJson('{"schema":"other.v9"}'));
+});
+
+test('upsertSeenAccount demotes any other active row so exactly one Account stays active (C3)', async () => {
+  const { store } = await makeStore();
+  const a = await store.upsertSeenAccount(identity({ email: 'a@example.com' }), true, '2026-11-27T10:00:00.000Z');
+  assert.equal(a.status, 'active');
+  const b = await store.upsertSeenAccount(identity({ email: 'b@example.com' }), true, '2026-11-27T10:01:00.000Z');
+  assert.equal(b.status, 'active');
+  const accounts = store.listAccounts();
+  assert.equal(accounts.filter((x) => x.status === 'active').length, 1, 'exactly one active Account after the second upsert');
+  assert.equal(accounts.find((x) => x.email === 'a@example.com')?.status, 'saved', 'previous active demoted to saved');
+  assert.equal(accounts.find((x) => x.email === 'b@example.com')?.status, 'active');
+});
+
+test('importBackupJson skips rows whose email is not a valid address (M4)', async () => {
+  const { store } = await makeStore();
+  const json = JSON.stringify({
+    schema: BACKUP_SCHEMA,
+    accounts: [
+      { email: '../../x', displayName: 'Traversal' },
+      { email: 'valid@example.com', displayName: 'Valid' },
+    ],
+  });
+  const result = await store.importBackupJson(json);
+  assert.deepEqual(result, { imported: 1, skipped: 1 }, 'invalid email row skipped and counted');
+  assert.equal(store.listAccounts().some((a) => a.email === '../../x'), false, 'path-like email never seeded');
+  assert.equal(store.listAccounts().some((a) => a.email === 'valid@example.com'), true);
 });

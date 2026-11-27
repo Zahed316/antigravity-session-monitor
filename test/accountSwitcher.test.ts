@@ -1,9 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import fsp from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import type * as nodeSqlite from 'node:sqlite';
 
 import {
@@ -22,6 +23,7 @@ import {
   performStandaloneIdeSwitch,
   buildStandaloneSwitchWorkerScript,
   resolveStandaloneIdeInfo,
+  switchFailureRecoveryHint,
   OAUTH_TOKEN_STATE_KEY,
   USER_STATUS_STATE_KEY,
   ONBOARDING_STATE_KEY,
@@ -144,6 +146,46 @@ function runWorker(tempDir: string, payload: Record<string, unknown>, env?: Node
     result = null;
   }
   return { status: run.status ?? 1, result };
+}
+
+/** Real fs that records what performStandaloneIdeSwitch wrote (files are purged before it returns, I4). */
+function makeRecordingFs(): {
+  fs: NonNullable<StandaloneSwitchParams['fs']>;
+  written: Map<string, { data: string; mode?: number }>;
+} {
+  const written = new Map<string, { data: string; mode?: number }>();
+  const fsLike = {
+    mkdir: (p: fs.PathLike, opts?: { recursive?: boolean }) => fsp.mkdir(p, opts),
+    writeFile: async (file: fs.PathLike, data: string, opts?: { encoding?: BufferEncoding; mode?: number }) => {
+      written.set(String(file), { data, mode: opts?.mode });
+      await fsp.writeFile(file, data, opts);
+    },
+    unlink: (file: fs.PathLike) => fsp.unlink(file),
+    readFile: (file: fs.PathLike, encoding: BufferEncoding) => fsp.readFile(file, encoding),
+  };
+  return { written, fs: fsLike as unknown as NonNullable<StandaloneSwitchParams['fs']> };
+}
+
+function baseIdeInfo(dir: string): StandaloneIdeInfo {
+  return {
+    dataPath: dir,
+    stateDbPath: path.join(dir, 'state.vscdb'),
+    processName: 'antigravity',
+    executablePath: '/nonexistent/antigravity',
+  };
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function processAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 // ---------- protobufSync: wire format ----------
@@ -452,6 +494,7 @@ function makeSpawnRecorder(): {
 test('performStandaloneIdeSwitch writes payload + worker, spawns detached node, then quits the IDE', async () => {
   const dir = makeTempDir();
   const recorder = makeSpawnRecorder();
+  const recFs = makeRecordingFs();
   const quitCalls: string[] = [];
   const ideInfo: StandaloneIdeInfo = {
     dataPath: '/data',
@@ -465,6 +508,7 @@ test('performStandaloneIdeSwitch writes payload + worker, spawns detached node, 
     ideState: { oauthToken: makeJwt(B_EMAIL), profileUrl: 'https://b.example/pic.png' },
     globalStorageDir: dir,
     ideInfo,
+    fs: recFs.fs,
     timeouts: { settleMs: 0 },
     waitForResultMs: 0,
     spawn: recorder.spawn,
@@ -483,8 +527,9 @@ test('performStandaloneIdeSwitch writes payload + worker, spawns detached node, 
   assert.equal(call.options.stdio, 'ignore');
   assert.equal(call.options.env.ELECTRON_RUN_AS_NODE, '1', 'worker runs Electron as plain node');
 
-  const payload = JSON.parse(fs.readFileSync(call.args[1]!, 'utf8')) as Record<string, unknown>;
+  const payload = JSON.parse(recFs.written.get(call.args[1]!)!.data) as Record<string, unknown>;
   assert.equal(payload.stateDbPath, ideInfo.stateDbPath);
+  assert.equal(payload.dataPath, ideInfo.dataPath, 'worker gets the data dir for the narrow kill (M2)');
   assert.equal(payload.processName, 'antigravity');
   const payloadKeys = payload.keys as Array<{ key: string; valueB64: string }>;
   assert.deepEqual(
@@ -500,7 +545,9 @@ test('performStandaloneIdeSwitch writes payload + worker, spawns detached node, 
   assert.equal(info!.accessToken, makeJwt(B_EMAIL));
   assert.equal(info!.email, B_EMAIL);
 
-  assert.ok(fs.existsSync(path.join(dir, '.switch-worker.js')));
+  // I4: the fire-and-forget return leaves no token-bearing payload or worker behind.
+  assert.equal(fs.existsSync(call.args[1]!), false, 'payload (access token) purged before returning');
+  assert.equal(fs.existsSync(call.args[0]!), false, 'worker script purged before returning');
   assert.equal(quitCalls.length, 1, 'IDE quit requested after worker launch');
 });
 
@@ -527,21 +574,18 @@ test('performStandaloneIdeSwitch reports worker_spawn_failed without quitting th
 test('performStandaloneIdeSwitch skips profileUrl when the vault state has none', async () => {
   const dir = makeTempDir();
   const recorder = makeSpawnRecorder();
+  const recFs = makeRecordingFs();
   await performStandaloneIdeSwitch({
     targetEmail: B_EMAIL,
     ideState: { oauthToken: makeJwt(B_EMAIL) },
     globalStorageDir: dir,
-    ideInfo: {
-      dataPath: '/data',
-      stateDbPath: '/data/User/globalStorage/state.vscdb',
-      processName: 'antigravity',
-      executablePath: '/usr/bin/antigravity',
-    },
+    ideInfo: baseIdeInfo('/data'),
+    fs: recFs.fs,
     timeouts: { settleMs: 0 },
     waitForResultMs: 0,
     spawn: recorder.spawn,
   });
-  const payload = JSON.parse(fs.readFileSync(recorder.calls[0]!.args[1]!, 'utf8')) as { keys: Array<{ key: string }> };
+  const payload = JSON.parse(recFs.written.get(recorder.calls[0]!.args[1]!)!.data) as { keys: Array<{ key: string }> };
   assert.deepEqual(payload.keys.map((k) => k.key), [OAUTH_TOKEN_STATE_KEY, USER_STATUS_STATE_KEY, ONBOARDING_STATE_KEY]);
 });
 
@@ -554,6 +598,7 @@ test('performStandaloneIdeSwitch purges stale scratch files at entry and writes 
   fs.writeFileSync(staleWorker, 'process.exit(1);');
   fs.writeFileSync(staleResult, '{"ok":false,"stage":"stale"}');
   const recorder = makeSpawnRecorder();
+  const recFs = makeRecordingFs();
   const outcome = await performStandaloneIdeSwitch({
     targetEmail: B_EMAIL,
     ideState: { oauthToken: makeJwt(B_EMAIL) },
@@ -564,20 +609,23 @@ test('performStandaloneIdeSwitch purges stale scratch files at entry and writes 
       processName: 'antigravity',
       executablePath: '/usr/bin/antigravity',
     },
+    fs: recFs.fs,
     timeouts: { settleMs: 0 },
     waitForResultMs: 0,
     spawn: recorder.spawn,
   });
   assert.equal(outcome.launched, true);
   assert.equal(fs.existsSync(staleResult), false, 'stale result file removed at entry');
-  const fresh = JSON.parse(fs.readFileSync(stalePayload, 'utf8')) as { stale?: string; stateDbPath?: string };
+  const fresh = JSON.parse(recFs.written.get(stalePayload)!.data) as { stale?: string; stateDbPath?: string };
   assert.equal(fresh.stale, undefined, 'stale payload replaced by the fresh one');
   assert.equal(fresh.stateDbPath, '/data/User/globalStorage/state.vscdb');
-  // eslint-disable-next-line no-bitwise
-  assert.equal(fs.statSync(stalePayload).mode & 0o777, 0o600, 'payload carries the access token: 0600');
+  assert.equal(recFs.written.get(stalePayload)!.mode, 0o600, 'payload carries the access token: 0600');
+  // I4: the fire-and-forget return leaves no scratch files behind.
+  assert.equal(fs.existsSync(stalePayload), false, 'payload purged before returning');
+  assert.equal(fs.existsSync(staleWorker), false, 'worker purged before returning');
 });
 
-test('performStandaloneIdeSwitch reports the real worker outcome (success) and purges scratch files', async () => {
+test('performStandaloneIdeSwitch reports the real worker outcome (success), deletes the .bak, and purges scratch files', async () => {
   const dir = makeTempDir();
   const dbPath = path.join(dir, 'state.vscdb');
   await makeStateDb(dbPath, baseFixtureRows());
@@ -585,23 +633,180 @@ test('performStandaloneIdeSwitch reports the real worker outcome (success) and p
     targetEmail: B_EMAIL,
     ideState: { oauthToken: makeJwt(B_EMAIL), profileUrl: 'https://b.example/pic.png' },
     globalStorageDir: dir,
-    ideInfo: {
-      dataPath: dir,
-      stateDbPath: dbPath,
-      processName: 'antigravity',
-      executablePath: '/nonexistent/antigravity',
-    },
+    ideInfo: baseIdeInfo(dir),
     timeouts: { settleMs: 10, waitMs: 50, graceKillMs: 50, forceKillMs: 50 },
     waitForResultMs: 10_000,
     // default spawn: a real detached node process runs the real worker script
   });
-  assert.deepEqual(outcome, { launched: true, backupPath: `${dbPath}.bak` }, 'the REAL worker result is surfaced');
+  assert.deepEqual(outcome, { launched: true }, 'no backupPath on success: the .bak is deleted (I6)');
   const rows = await readDbRows(dbPath);
   const entry = decodeUnifiedStateEntry(rows.get(OAUTH_TOKEN_STATE_KEY)!.toString('binary'));
   assert.ok(entry);
   assert.equal(decodeOAuthInfo(entry!.payload)!.email, B_EMAIL);
   assert.equal(fs.existsSync(path.join(dir, '.switch-payload.json')), false, 'payload (access token) purged on success');
   assert.equal(fs.existsSync(path.join(dir, '.switch-result.json')), false, 'result file deleted after being read');
+  assert.equal(fs.existsSync(`${dbPath}.bak`), false, 'auth-bearing .bak deleted after a verified successful switch (I6)');
+});
+
+test('performStandaloneIdeSwitch purges payload/worker/result on switch_result_timeout (I4)', async () => {
+  const dir = makeTempDir();
+  const dbPath = path.join(dir, 'state.vscdb');
+  await makeStateDb(dbPath, baseFixtureRows());
+  // Sidecar never clears and kill escalation is disabled: the worker stays in
+  // waitIdeExit far longer than the parent is willing to wait.
+  fs.writeFileSync(`${dbPath}-wal`, Buffer.from([1, 2, 3]), 'binary');
+  const outcome = await performStandaloneIdeSwitch({
+    targetEmail: B_EMAIL,
+    ideState: { oauthToken: makeJwt(B_EMAIL) },
+    globalStorageDir: dir,
+    ideInfo: baseIdeInfo(dir),
+    timeouts: { settleMs: 10, waitMs: 2_000, graceKillMs: 100, forceKillMs: 100 },
+    waitForResultMs: 300,
+    // default spawn: real detached worker that never exits within the wait window
+  });
+  assert.equal(outcome.launched, false);
+  assert.equal(outcome.reason, 'switch_result_timeout');
+  assert.equal(fs.existsSync(path.join(dir, '.switch-payload.json')), false, 'token-bearing payload purged on timeout');
+  assert.equal(fs.existsSync(path.join(dir, '.switch-worker.js')), false, 'worker purged on timeout');
+  assert.equal(fs.existsSync(path.join(dir, '.switch-result.json')), false, 'result scratch purged on timeout');
+});
+
+test('worker creates the .bak backup with mode 0600 (I6, POSIX only)', { skip: process.platform === 'win32' }, async () => {
+  const dir = makeTempDir();
+  const dbPath = path.join(dir, 'state.vscdb');
+  await makeStateDb(dbPath, baseFixtureRows());
+  const { result } = runWorker(dir, {
+    stateDbPath: dbPath,
+    dataPath: dir,
+    keys: newTargetKeys(),
+    relaunch: { file: '/nonexistent/antigravity', args: [] },
+    processName: 'antigravity',
+    platform: process.platform,
+    minSettleMs: 10,
+    waitTimeoutMs: 50,
+    graceKillTimeoutMs: 50,
+    forceKillTimeoutMs: 50,
+    killEnabled: false,
+    resultPath: path.join(dir, '.switch-result.json'),
+  });
+  assert.equal(result?.ok, true);
+  // eslint-disable-next-line no-bitwise
+  assert.equal(fs.statSync(`${dbPath}.bak`).mode & 0o777, 0o600, 'auth-bearing .bak restricted to the owner');
+});
+
+test('worker reports restored:false and keeps the .bak when the restore copy fails (I5/I6)', async () => {
+  const dir = makeTempDir();
+  const dbPath = path.join(dir, 'state.vscdb');
+  await makeStateDb(dbPath, baseFixtureRows());
+  fs.chmodSync(dbPath, 0o444); // every write backend fails AND the .bak restore copy fails
+  try {
+    const { result } = runWorker(dir, {
+      stateDbPath: dbPath,
+      dataPath: dir,
+      keys: newTargetKeys(),
+      relaunch: { file: '/nonexistent/antigravity', args: [] },
+      processName: 'antigravity',
+      platform: process.platform,
+      minSettleMs: 10,
+      waitTimeoutMs: 50,
+      graceKillTimeoutMs: 50,
+      forceKillTimeoutMs: 50,
+      killEnabled: false,
+      resultPath: path.join(dir, '.switch-result.json'),
+    });
+    assert.equal(result?.ok, false);
+    assert.equal(result?.stage, 'write_failed');
+    assert.equal(result?.restored, false, 'a failed restore copy is never reported as restored');
+    assert.equal(fs.existsSync(`${dbPath}.bak`), true, '.bak kept as the recovery artifact when the restore failed');
+  } finally {
+    fs.chmodSync(dbPath, 0o644);
+  }
+});
+
+test('performStandaloneIdeSwitch surfaces a failed restore via the _restore_failed reason (I5)', async () => {
+  const dir = makeTempDir();
+  const dbPath = path.join(dir, 'state.vscdb');
+  await makeStateDb(dbPath, baseFixtureRows());
+  fs.chmodSync(dbPath, 0o444);
+  try {
+    const outcome = await performStandaloneIdeSwitch({
+      targetEmail: B_EMAIL,
+      ideState: { oauthToken: makeJwt(B_EMAIL) },
+      globalStorageDir: dir,
+      ideInfo: baseIdeInfo(dir),
+      timeouts: { settleMs: 10, waitMs: 50, graceKillMs: 50, forceKillMs: 50 },
+      waitForResultMs: 10_000,
+    });
+    assert.equal(outcome.launched, false);
+    assert.equal(outcome.reason, 'write_failed_restore_failed');
+    assert.equal(outcome.backupPath, `${dbPath}.bak`);
+    assert.equal(fs.existsSync(`${dbPath}.bak`), true);
+  } finally {
+    fs.chmodSync(dbPath, 0o644);
+  }
+});
+
+test('switchFailureRecoveryHint differentiates restored vs not-restored (I5)', () => {
+  assert.equal(
+    switchFailureRecoveryHint('write_failed (backup at /d/state.vscdb.bak)'),
+    ' Your original database was restored.',
+  );
+  assert.equal(
+    switchFailureRecoveryHint('write_failed_restore_failed (backup at /d/state.vscdb.bak)'),
+    ' Restore /d/state.vscdb.bak manually before using Antigravity.',
+  );
+  assert.equal(
+    switchFailureRecoveryHint('some_other_failure'),
+    ' If the IDE does not start, restore the state.vscdb.bak backup.',
+  );
+});
+
+test('worker kill escalation only kills processes bound to the target data dir (M2, Linux /proc)', { skip: process.platform !== 'linux' }, async () => {
+  const dir = makeTempDir();
+  const dbPath = path.join(dir, 'state.vscdb');
+  await makeStateDb(dbPath, baseFixtureRows());
+  fs.writeFileSync(`${dbPath}-wal`, Buffer.from([1, 2, 3]), 'binary'); // sidecar never clears
+
+  const sleeperPath = path.join(dir, 'sleeper.js');
+  const readyOwner = path.join(dir, 'ready-owner');
+  const readyOther = path.join(dir, 'ready-other');
+  fs.writeFileSync(sleeperPath, "require('fs').writeFileSync(process.argv[3], '1'); setInterval(() => {}, 1000);");
+  const owner = spawn(process.execPath, [sleeperPath, `--user-data-dir=${dir}`, readyOwner], { stdio: 'ignore' });
+  const other = spawn(process.execPath, [sleeperPath, '--user-data-dir=/nonexistent-other-dir', readyOther], { stdio: 'ignore' });
+  try {
+    for (let i = 0; i < 100 && (!fs.existsSync(readyOwner) || !fs.existsSync(readyOther)); i++) {
+      await sleep(20);
+    }
+    assert.ok(fs.existsSync(readyOwner) && fs.existsSync(readyOther), 'both sleeper processes are up');
+
+    const { result } = runWorker(dir, {
+      stateDbPath: dbPath,
+      dataPath: dir,
+      keys: newTargetKeys(),
+      relaunch: { file: '/nonexistent/antigravity', args: [] },
+      processName: 'antigravity',
+      platform: 'linux',
+      minSettleMs: 10,
+      waitTimeoutMs: 60,
+      graceKillTimeoutMs: 60,
+      forceKillTimeoutMs: 60,
+      killEnabled: true,
+      resultPath: path.join(dir, '.switch-result.json'),
+    });
+    assert.equal(result?.stage, 'wal_timeout');
+    await sleep(100);
+    assert.equal(processAlive(owner.pid!), false, 'the IDE instance owning the data dir is killed');
+    assert.equal(processAlive(other.pid!), true, 'an unrelated Antigravity instance survives');
+    assert.ok(result, 'the worker itself was never its own victim');
+  } finally {
+    for (const pid of [owner.pid, other.pid]) {
+      try {
+        if (pid) process.kill(pid, 'SIGKILL');
+      } catch {
+        /* already gone */
+      }
+    }
+  }
 });
 
 test('worker restores the .bak copy on write_failed and purges the payload', async () => {

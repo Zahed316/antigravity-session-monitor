@@ -37,7 +37,9 @@ export const DEFAULT_CONFIG: MonitorConfig = {
   lowQuotaThresholdPct: 20,
   notifyQuotaReset: true,
   quotaAlertBackground: true,
-  autoCaptureVault: true,
+  // ADR 0002: the vault is OPT-IN — credentials are only written after the
+  // user enables this or uses "Save Current Account" explicitly (M6).
+  autoCaptureVault: false,
 };
 
 export type PoolKey = 'gemini' | 'nonGoogle';

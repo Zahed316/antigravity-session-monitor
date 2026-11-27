@@ -264,8 +264,8 @@
         },
         "antigravityMonitor.autoCaptureVault": {
           "type": "boolean",
-          "default": true,
-          "description": "Automatically capture the active account credential into the encrypted vault (SecretStorage) when a new account email is observed."
+          "default": false,
+          "description": "Automatically capture the active account credential into the encrypted vault (SecretStorage) when a new account email is observed. Off by default: the credential vault is opt-in (also available via the manual Save Current Account action)."
         }
       }
     }
