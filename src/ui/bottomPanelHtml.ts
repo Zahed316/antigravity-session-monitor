@@ -312,8 +312,19 @@ function renderAccountsTabHtml(state: MonitorState, uiState: PanelUiState | unde
 
   const savedRows = filtered
     .map((account) => {
-      const badge = ACCOUNT_AUTH_BADGE[account.status];
       const isActive = isActiveEmail(account.email);
+      // C3: `status` lives in shared globalState, so another window observing a
+      // different Account can own the persisted 'active' flag. The row THIS window
+      // observes wins; a foreign 'active' row renders as a plain saved Account.
+      const displayStatus =
+        account.status === 'needs_reauth'
+          ? 'needs_reauth'
+          : isActive
+            ? 'active'
+            : account.status === 'active'
+              ? 'saved'
+              : account.status;
+      const badge = ACCOUNT_AUTH_BADGE[displayStatus];
       const emailAttr = escapeHtml(account.email);
       return `
         <tr>

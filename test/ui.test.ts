@@ -1829,3 +1829,16 @@ test('sanitizePanelLayout: migrates a pre-accounts layout by appending the Accou
   assert.deepEqual(migrated.sectionOrder.details, ['breakdown', 'sessionSummary', 'subagents', 'contextChart']);
   assert.deepEqual(migrated.collapsedTabs, ['details']);
 });
+
+test('renderBottomPanelBodyHtml: a foreign persisted "active" row renders as Saved (C3 multi-window)', () => {
+  // Another window observing a different Account owns the shared globalState
+  // 'active' flag; this window must not badge that row as Active.
+  const foreign = createAccount({ email: 'other@example.com', status: 'active' });
+  const state = createState({ activeAccount: null, accounts: [foreign] });
+  state.accountSnapshots = {};
+  state.diagnostics = createDiagnostics();
+  const html = renderBottomPanelBodyHtml(state, { activeTab: 'accounts', accountSearch: '', accountGroupFilter: '' });
+  const row = savedAccountsSection(html).slice(savedAccountsSection(html).indexOf('other@example.com'));
+  assert.ok(!row.slice(0, 400).includes('>Active<'), 'foreign active row must not be badged Active');
+  assert.match(row.slice(0, 400), />Saved</);
+});

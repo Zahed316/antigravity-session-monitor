@@ -25,6 +25,7 @@ import {
   switchFailureRecoveryHint,
 } from './accounts/ideStateService.ts';
 import { purgeRemovedAccountCredential } from './accounts/vaultPurge.ts';
+import { resolveReauthTarget } from './accounts/reauthTarget.ts';
 import { createKeyringVerifier, createTokenVaultDeps } from './accounts/vaultWiring.ts';
 import { DEFAULT_CONFIG, type MonitorConfig, type QuotaSnapshot, type ScopeMode } from './types.ts';
 
@@ -593,14 +594,19 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }
   }
 
-  async function handleReauthAccount(email: string): Promise<void> {
-    // M3: re-auth logs the current session out — validate against the registry
-    // and require the same modal confirmation as removeAccount.
-    const normalized = email.trim().toLowerCase();
-    if (!accountStore.listAccounts().some((a) => a.email === normalized)) {
-      vscode.window.showWarningMessage(`GravityWatch: Account ${normalized} is not a known Account.`);
+  async function handleReauthAccount(raw: unknown): Promise<void> {
+    // M3: re-auth logs the current session out. The guard is pure and tested in
+    // accounts/reauthTarget.ts; only the modal and the mutation live here.
+    const target = resolveReauthTarget(raw, accountStore.listAccounts());
+    if ('error' in target) {
+      vscode.window.showWarningMessage(
+        target.error === 'invalid_email'
+          ? 'GravityWatch: that is not a valid Account email.'
+          : 'GravityWatch: that Account is not a saved Account.',
+      );
       return;
     }
+    const normalized = target.email;
     const confirm = await vscode.window.showWarningMessage(
       `Sign out and re-authenticate the Account ${normalized}? The current session will be logged out.`,
       { modal: true },
@@ -609,7 +615,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     if (confirm !== 'Re-authenticate') return;
     const result = await switcher.reauthAccount(normalized);
     if (result.ok) {
-      vscode.window.showInformationMessage(`GravityWatch: re-auth started for ${email}.`);
+      vscode.window.showInformationMessage(`GravityWatch: re-auth started for ${normalized}.`);
       await monitorService?.refreshQuotaNow();
     } else {
       vscode.window.showErrorMessage(`GravityWatch: re-auth failed (${result.message ?? 'unknown reason'}).`);
