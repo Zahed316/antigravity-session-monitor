@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - run: npm ci
+      - run: npm run check
+      - name: Test
+        run: |
+          set -o pipefail
+          npm test 2>&1 | tee /tmp/test.log
+          # node --test summary line is "ℹ pass N" (spec reporter) or "# pass N" (TAP).
+          # A zero-match run (glob matched nothing) must fail the job, not pass it.
+          passed=$(grep -E '^(ℹ|#) pass [0-9]+' /tmp/test.log | grep -oE '[0-9]+' | tail -1)
+          echo "passed=$passed"
+          if [ -z "$passed" ] || [ "$passed" -lt 240 ]; then
+            echo "::error::Test run reported ${passed:-no} passing tests; expected at least 240"
+            exit 1
+          fi
+      - run: npm run build
