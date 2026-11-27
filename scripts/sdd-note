@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 # sdd-note: append one line to the active SDD progress ledger and print its path.
+# Ledger resolution: $SDD_LEDGER, else the ledger when exactly one exists,
+# else refuse — a silent write into the wrong plan's ledger is worse than a
+# loud refusal.
 set -uo pipefail
 if [ $# -ne 1 ]; then
   echo 'usage: sdd-note "<text>"' >&2
@@ -9,9 +12,16 @@ repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 if [ -n "${SDD_LEDGER:-}" ]; then
   ledger="$SDD_LEDGER"
 else
-  ledger="$(ls -t "$repo_root"/.superpowers/sdd/*/progress.md 2>/dev/null | head -n 1)"
-  if [ -z "$ledger" ]; then
-    ledger="$repo_root/.superpowers/sdd/plan/progress.md"
+  ledger=""
+  count=0
+  for f in "$repo_root"/.superpowers/sdd/*/progress.md; do
+    [ -f "$f" ] || continue
+    ledger="$f"
+    count=$((count + 1))
+  done
+  if [ "$count" -ne 1 ]; then
+    echo "sdd-note: found $count progress.md ledgers under $repo_root/.superpowers/sdd; set SDD_LEDGER to pick one" >&2
+    exit 1
   fi
 fi
 mkdir -p "$(dirname "$ledger")"
