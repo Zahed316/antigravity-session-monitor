@@ -4,7 +4,9 @@ import {
   DEFAULT_CONFIG,
   DEFAULT_CONTEXT_LIMIT,
   type CallUsagePoint,
+  type ManagedAccount,
   type MonitorConfig,
+  type MonitorDiagnostics,
   type MonitorState,
   type QuotaSnapshot,
   type SessionMetrics,
@@ -188,6 +190,11 @@ function createState(partial: Partial<MonitorState> = {}): MonitorState {
     lastError: partial.lastError ?? null,
     warnings: partial.warnings ?? [],
     modelCatalog: partial.modelCatalog,
+    activeAccount: partial.activeAccount,
+    accounts: partial.accounts,
+    accountSnapshots: partial.accountSnapshots,
+    accountHistory: partial.accountHistory,
+    diagnostics: partial.diagnostics,
   };
 }
 
@@ -1267,9 +1274,9 @@ test('BottomPanelController: collapse/expand and reorder tabs and sections with 
   const handler = messageHandler as ((msg: any) => void) | null;
   assert.ok(handler, 'messageHandler should be registered');
 
-  // Reorder tabs
+  // Reorder tabs ('accounts' is merged back in as the default third tab)
   handler({ type: 'reorderTabs', order: ['details', 'overview'] });
-  assert.deepEqual(savedLayout.tabOrder, ['details', 'overview']);
+  assert.deepEqual(savedLayout.tabOrder, ['details', 'overview', 'accounts']);
   const lastHtml1 = postedMessages[postedMessages.length - 1].bodyHtml as string;
   assert.ok(lastHtml1.indexOf('data-tab-id="details"') < lastHtml1.indexOf('data-tab-id="overview"'));
 
@@ -1295,4 +1302,480 @@ test('BottomPanelController: collapse/expand and reorder tabs and sections with 
 test('formatResetCountdown reports Exhausted for 0% with a passed resetTime, Ready only when quota is actually back', () => {
   assert.strictEqual(formatResetCountdown('2026-11-26T14:15:42Z', false, true), 'Exhausted');
   assert.strictEqual(formatResetCountdown(null, false, true), 'Exhausted');
+});
+
+// ============================================================================
+// 5. Task 9: Multi-account UI (StatusBar, QuickPick, Overview bar, Accounts tab)
+// ============================================================================
+
+function createAccount(partial: Partial<ManagedAccount> = {}): ManagedAccount {
+  const seenAt = partial.firstSeenAt ?? new Date(0).toISOString();
+  return {
+    email: partial.email ?? 'user@example.com',
+    displayName: partial.displayName,
+    tier: partial.tier,
+    plan: partial.plan,
+    isPro: partial.isPro,
+    profilePictureUrl: partial.profilePictureUrl,
+    label: partial.label,
+    group: partial.group,
+    colorTag: partial.colorTag,
+    firstSeenAt: seenAt,
+    lastSeenAt: partial.lastSeenAt ?? seenAt,
+    status: partial.status ?? 'active',
+  };
+}
+
+function createDiagnostics(partial: Partial<MonitorDiagnostics> = {}): MonitorDiagnostics {
+  return {
+    hostEditor: 'Visual Studio Code',
+    isStandaloneIde: false,
+    platform: 'linux',
+    osKeyringSupported: true,
+    osKeyringBackend: 'linux-secret-tool',
+    hubPid: 4242,
+    hubPort: 42100,
+    hubSource: 'exports',
+    ...partial,
+  };
+}
+
+// --- 5a. StatusBar: account tooltip + quotaAlertBackground gating ---
+
+test('buildStatusBarViewModel: tooltip shows the active Account email and plan', () => {
+  const account = createAccount({ email: 'dev@example.com', plan: 'Pro', status: 'active' });
+  const state = createState({ activeAccount: account, accounts: [account] });
+  state.accountSnapshots = { 'dev@example.com': state.quota };
+
+  const vm = buildStatusBarViewModel(state, DEFAULT_CONFIG);
+  assert.match(vm.tooltipMarkdown, /\*\*Account:\*\* dev@example\.com/);
+  assert.match(vm.tooltipMarkdown, /Pro/);
+  assert.ok(!/forecast/i.test(vm.tooltipMarkdown), 'no forecast text in the tooltip');
+});
+
+test('buildStatusBarViewModel: anonymous-bucket quota shows identity unknown, not a stale Account label', () => {
+  // The identity fetch failed on the latest poll: the label in activeAccount is stale and
+  // the quota snapshot came from the '__anonymous__' bucket (see monitorService.ts).
+  const account = createAccount({ email: 'dev@example.com', plan: 'Pro' });
+  const state = createState({ activeAccount: account, accounts: [account] });
+
+  const vm = buildStatusBarViewModel(state, DEFAULT_CONFIG);
+  assert.match(vm.tooltipMarkdown, /identity unknown/i);
+  assert.ok(!vm.tooltipMarkdown.includes('dev@example.com'), 'stale label must not be shown as authoritative');
+});
+
+test('buildStatusBarViewModel: quotaAlertBackground gates warning/error tint at lowQuotaThresholdPct', () => {
+  const state = createState();
+  state.quota.pools.gemini.fiveHour!.remainingPct = 12;
+
+  // Enabled with the default 20% threshold: 12% tints warning.
+  assert.equal(buildStatusBarViewModel(state, DEFAULT_CONFIG).color, 'warning');
+
+  // Custom threshold 10: 12% is above it, no tint.
+  const cfg10: MonitorConfig = { ...DEFAULT_CONFIG, quotaAlertBackground: true, lowQuotaThresholdPct: 10 };
+  assert.equal(buildStatusBarViewModel(state, cfg10).color, 'normal');
+
+  // Disabled: quota never tints the badge.
+  const cfgOff: MonitorConfig = { ...DEFAULT_CONFIG, quotaAlertBackground: false };
+  assert.equal(buildStatusBarViewModel(state, cfgOff).color, 'normal');
+
+  // 0% is always an error tint while the setting is enabled.
+  state.quota.pools.gemini.fiveHour!.remainingPct = 0;
+  state.quota.pools.gemini.fiveHour!.isExhausted = true;
+  assert.equal(buildStatusBarViewModel(state, cfg10).color, 'error');
+});
+
+test('createStatusBarController: low-quota pool tints the background via ThemeColor', () => {
+  const items: any[] = [];
+  class MockStatusBarItem implements StatusBarItemLike {
+    text = '';
+    tooltip: any = '';
+    command?: string;
+    backgroundColor?: any;
+    show() {}
+    hide() {}
+    dispose() {}
+  }
+  class MockMarkdownString {
+    value: string;
+    constructor(val = '') { this.value = val; }
+  }
+  class MockThemeColor {
+    id: string;
+    constructor(id: string) { this.id = id; }
+  }
+  const mockVscode: StatusBarVscodeLike = {
+    window: { createStatusBarItem: () => { const it = new MockStatusBarItem(); items.push(it); return it; } },
+    MarkdownString: MockMarkdownString as any,
+    ThemeColor: MockThemeColor as any,
+  };
+  const ctrl = createStatusBarController(mockVscode, 'cmd.click');
+
+  const state = createState();
+  state.quota.pools.gemini.fiveHour!.remainingPct = 12;
+  ctrl.update(state, DEFAULT_CONFIG);
+  assert.equal(items[0].backgroundColor?.id, 'statusBarItem.warningBackground');
+
+  const off = { ...DEFAULT_CONFIG, quotaAlertBackground: false };
+  ctrl.update(state, off);
+  assert.equal(items[0].backgroundColor, undefined, 'quotaAlertBackground: false removes the tint');
+
+  ctrl.dispose();
+});
+
+// --- 5b. QuickPick: Switch / Manage Accounts entry ---
+
+test('buildQuickPickItems: adds Switch / Manage Accounts while keeping sessions and pin buttons', () => {
+  const state = createState({ pinnedSessionId: 'root-1' });
+  const items = buildQuickPickItems(state);
+
+  const manage = items.find((it) => it.action === 'manageAccounts');
+  assert.ok(manage, 'manage entry present');
+  assert.match(manage.label, /Switch \/ Manage Accounts/);
+
+  // Existing entries stay intact
+  assert.equal(items[0].action, 'openPanel');
+  assert.equal(items[1].action, 'unpin');
+  assert.equal(items[2].action, 'toggleScope');
+
+  const session = items.find((it) => it.action === 'session');
+  assert.ok(session && session.buttons && session.buttons.some((b) => b.id === 'pin'), 'pin buttons intact');
+});
+
+test('showSessionQuickPick: accepting the manage entry calls onManageAccounts', async () => {
+  let acceptedCallback: (() => void) | null = null;
+  const mockQp = {
+    title: '',
+    placeholder: '',
+    items: [] as QuickPickEntry[],
+    selectedItems: [] as QuickPickEntry[],
+    onDidAccept(cb: () => void) { acceptedCallback = cb; return { dispose() {} }; },
+    onDidTriggerItemButton() { return { dispose() {} }; },
+    onDidHide() { return { dispose() {} }; },
+    show() {},
+    hide() {},
+    dispose() {},
+  };
+  const mockVscode: QuickPickVscodeLike = { window: { createQuickPick: () => mockQp as any } };
+
+  let managed = false;
+  await showSessionQuickPick(mockVscode, createState(), {
+    onInspect: () => {},
+    onPin: () => {},
+    onUnpin: () => {},
+    onToggleScope: () => {},
+    onManageAccounts: () => { managed = true; },
+  });
+
+  const manage = mockQp.items.find((it) => it.action === 'manageAccounts');
+  assert.ok(manage);
+  mockQp.selectedItems = [manage];
+  acceptedCallback!();
+  assert.equal(managed, true);
+});
+
+// --- 5c. Overview Active Account bar ---
+
+test('renderBottomPanelBodyHtml: Overview renders Active Account bar without a forecast section', () => {
+  const account = createAccount({ email: 'dev@example.com', plan: 'Pro', status: 'active', group: 'Team A' });
+  const state = createState({ activeAccount: account, accounts: [account] });
+  state.accountSnapshots = { 'dev@example.com': state.quota };
+  state.unattachedSubagents = [createNode({ id: 'loose-1', isSubagent: true, title: 'Loose Subagent' })];
+
+  const html = renderBottomPanelBodyHtml(state, { activeTab: 'overview' });
+  assert.match(html, /dev@example\.com/);
+  assert.match(html, /class="badge plan">Pro</);
+  assert.match(html, /data-action="switchAccount"/);
+  assert.match(html, /data-action="saveCurrentAccount"/);
+  assert.match(html, /data-action="addAccount"/);
+  assert.match(html, /5-Hour \/ Weekly Quota Pools/);
+  assert.match(html, /Sessions \(/);
+  assert.match(html, /Unattached Subagents/);
+  assert.ok(!html.includes('Model Usage Forecast'), 'forecast stays absent');
+});
+
+test('renderBottomPanelBodyHtml: unknown identity renders an explicit identity-unknown bar', () => {
+  const account = createAccount({ email: 'dev@example.com', plan: 'Pro' });
+  const state = createState({ activeAccount: account, accounts: [account] });
+
+  // Scope to the overview tab view: the hidden Accounts tab may legitimately list the
+  // saved registry entries; the bar must not present the stale label as the Account.
+  const html = renderBottomPanelBodyHtml(state, { activeTab: 'overview' });
+  const overview = html.slice(
+    html.indexOf('data-tab-view="overview"'),
+    html.indexOf('data-tab-view="details"'),
+  );
+  assert.match(overview, /Identity unknown/);
+  assert.ok(!overview.includes('dev@example.com'), 'stale label must not be presented as the Account');
+});
+
+// --- 5d. Accounts tab: 4 sections ---
+
+function savedAccountsSection(html: string): string {
+  const start = html.indexOf('Saved Accounts');
+  const end = html.indexOf('Multi-Account Quota Matrix');
+  assert.notEqual(start, -1);
+  assert.notEqual(end, -1);
+  return html.slice(start, end);
+}
+
+function createAccountsState(): { state: MonitorState; active: ManagedAccount; saved: ManagedAccount } {
+  const active = createAccount({ email: 'dev@example.com', label: 'Work', group: 'Team A', plan: 'Pro', status: 'active' });
+  const saved = createAccount({ email: 'other@example.com', label: 'Backup', group: 'Team B', status: 'saved' });
+  const state = createState({ activeAccount: active, accounts: [active, saved] });
+  state.accountSnapshots = { 'dev@example.com': state.quota };
+  state.diagnostics = createDiagnostics();
+  return { state, active, saved };
+}
+
+test('renderBottomPanelBodyHtml: Accounts tab renders Saved Accounts with search, group filter, and row actions', () => {
+  const { state } = createAccountsState();
+  const html = renderBottomPanelBodyHtml(state, {
+    activeTab: 'accounts',
+    accountSearch: '',
+    accountGroupFilter: '',
+    matrixSnapshots: { 'dev@example.com': state.quota, 'other@example.com': state.quota },
+  });
+
+  assert.match(html, /Saved Accounts/);
+  assert.match(html, /data-action="accountSearch"/);
+  assert.match(html, /data-action="accountGroupFilter"/);
+  assert.match(html, /other@example\.com/);
+  assert.match(html, /data-action="switchAccount" data-email="other@example\.com"/);
+  assert.match(html, /data-action="editAccount" data-email="other@example\.com" data-field="label"/);
+  assert.match(html, /data-action="editAccount" data-email="other@example\.com" data-field="group"/);
+  assert.match(html, /data-action="editAccount" data-email="other@example\.com" data-field="colorTag"/);
+  assert.match(html, /data-action="reauthAccount" data-email="other@example\.com"/);
+  assert.match(html, /data-action="removeAccount" data-email="other@example\.com"/);
+  assert.match(html, /data-action="saveCurrentAccount"/);
+});
+
+test('renderBottomPanelBodyHtml: Accounts tab search and group filter narrow the rows', () => {
+  const { state } = createAccountsState();
+  const searched = savedAccountsSection(renderBottomPanelBodyHtml(state, {
+    activeTab: 'accounts',
+    accountSearch: 'other',
+    matrixSnapshots: {},
+  }));
+  assert.ok(searched.includes('other@example.com'));
+  assert.ok(!searched.includes('dev@example.com'), 'search filters the saved rows');
+
+  const grouped = savedAccountsSection(renderBottomPanelBodyHtml(state, {
+    activeTab: 'accounts',
+    accountGroupFilter: 'Team A',
+    matrixSnapshots: {},
+  }));
+  assert.ok(grouped.includes('dev@example.com'));
+  assert.ok(!grouped.includes('other@example.com'), 'group filter filters the saved rows');
+});
+
+test('renderBottomPanelBodyHtml: Quota Matrix shows Reset passed · stale for expired inactive Accounts, never 100%', () => {
+  const { state, saved } = createAccountsState();
+  const expired = createQuota();
+  expired.pools.gemini.fiveHour = {
+    window: '5h',
+    remainingPct: 100,
+    remainingFraction: 1,
+    resetTime: new Date(Date.now() - 3_600_000).toISOString(),
+    isReady: true,
+    isExhausted: false,
+  };
+  const html = renderBottomPanelBodyHtml(state, {
+    activeTab: 'accounts',
+    matrixSnapshots: {
+      'dev@example.com': state.quota,
+      'other@example.com': { ...expired, isStale: true },
+    },
+  });
+
+  const matrix = html.slice(
+    html.indexOf('Multi-Account Quota Matrix'),
+    html.indexOf('30-Day Quota History'),
+  );
+  assert.match(html, /Multi-Account Quota Matrix/);
+  assert.match(matrix, /Reset passed · stale/);
+  assert.ok(!matrix.includes('100%'), 'stale windows never render as 100%');
+  assert.match(matrix, /other@example\.com/);
+});
+
+test('renderBottomPanelBodyHtml: Accounts tab renders history backups and diagnostics card', () => {
+  const { state } = createAccountsState();
+  const html = renderBottomPanelBodyHtml(state, {
+    activeTab: 'accounts',
+    matrixSnapshots: {},
+  });
+
+  assert.match(html, /30-Day Quota History &amp; Backups/);
+  assert.match(html, /data-action="exportHistory" data-format="csv"/);
+  assert.match(html, /data-action="exportHistory" data-format="json"/);
+  assert.match(html, /data-action="exportAccounts"/);
+  assert.match(html, /data-action="importAccounts"/);
+
+  assert.match(html, /Runtime &amp; Hub Diagnostics/);
+  assert.match(html, /Visual Studio Code/);
+  assert.match(html, /linux-secret-tool/);
+  assert.match(html, /4242/);
+  assert.match(html, /42100/);
+  assert.match(html, /data-action="reconnectHub"/);
+  assert.match(html, /data-action="restartBackend"/);
+  assert.match(html, /data-action="inspectBridge"/);
+});
+
+// --- 5e. Controller: inbound actions + layout migration ---
+
+test('BottomPanelController: account, backup, and diagnostics inbound actions reach their callbacks', () => {
+  let msgListener: ((msg: any) => void) | null = null;
+  const mockView: WebviewViewLike = {
+    visible: true,
+    webview: {
+      html: '',
+      postMessage: () => true,
+      onDidReceiveMessage: (cb: (msg: any) => void) => {
+        msgListener = cb;
+        return { dispose() {} };
+      },
+      cspSource: 'vscode-webview:',
+    } as any,
+    onDidChangeVisibility: () => ({ dispose() {} }),
+    onDidDispose: () => ({ dispose() {} }),
+  };
+
+  const calls = {
+    switch: [] as Array<string | undefined>,
+    add: 0,
+    save: 0,
+    edit: [] as Array<{ email: string; field: string }>,
+    remove: [] as string[],
+    reauth: [] as string[],
+    exportHistory: [] as string[],
+    exportAccounts: 0,
+    importAccounts: 0,
+    reconnect: 0,
+    restart: 0,
+    inspect: 0,
+  };
+
+  const ctrl = new BottomPanelController({
+    onSelectSession: () => {},
+    onPinSession: () => {},
+    onUnpinSession: () => {},
+    onToggleScope: () => {},
+    onRefresh: () => {},
+    onOpenSettings: () => {},
+    onSwitchAccount: (email) => calls.switch.push(email),
+    onAddAccount: () => { calls.add++; },
+    onSaveCurrentAccount: () => { calls.save++; },
+    onEditAccount: (email, field) => calls.edit.push({ email, field }),
+    onRemoveAccount: (email) => calls.remove.push(email),
+    onReauthAccount: (email) => calls.reauth.push(email),
+    onExportHistory: (format) => calls.exportHistory.push(format),
+    onExportAccounts: () => { calls.exportAccounts++; },
+    onImportAccounts: () => { calls.importAccounts++; },
+    onReconnectHub: () => { calls.reconnect++; },
+    onRestartBackend: () => { calls.restart++; },
+    onInspectBridge: () => { calls.inspect++; },
+  });
+  ctrl.setView(mockView);
+  ctrl.update(createState());
+  const handler = msgListener!;
+
+  handler({ type: 'switchAccount', email: 'a@x.com' });
+  handler({ type: 'switchAccount' });
+  handler({ type: 'addAccount' });
+  handler({ type: 'saveCurrentAccount' });
+  handler({ type: 'editAccount', email: 'a@x.com', field: 'label' });
+  handler({ type: 'editAccount', email: 'a@x.com', field: 'colorTag' });
+  handler({ type: 'editAccount', email: 'a@x.com', field: 'bogus' });
+  handler({ type: 'removeAccount', email: 'a@x.com' });
+  handler({ type: 'reauthAccount', email: 'a@x.com' });
+  handler({ type: 'exportHistory', format: 'csv' });
+  handler({ type: 'exportHistory', format: 'json' });
+  handler({ type: 'exportHistory', format: 'xml' });
+  handler({ type: 'exportAccounts' });
+  handler({ type: 'importAccounts' });
+  handler({ type: 'reconnectHub' });
+  handler({ type: 'restartBackend' });
+  handler({ type: 'inspectBridge' });
+
+  assert.deepEqual(calls.switch, ['a@x.com', undefined]);
+  assert.equal(calls.add, 1);
+  assert.equal(calls.save, 1);
+  assert.deepEqual(calls.edit, [{ email: 'a@x.com', field: 'label' }, { email: 'a@x.com', field: 'colorTag' }]);
+  assert.deepEqual(calls.remove, ['a@x.com']);
+  assert.deepEqual(calls.reauth, ['a@x.com']);
+  assert.deepEqual(calls.exportHistory, ['csv', 'json']);
+  assert.equal(calls.exportAccounts, 1);
+  assert.equal(calls.importAccounts, 1);
+  assert.equal(calls.reconnect, 1);
+  assert.equal(calls.restart, 1);
+  assert.equal(calls.inspect, 1);
+
+  // Search and group filter update the UI state
+  handler({ type: 'accountSearch', value: 'foo' });
+  assert.equal(ctrl.getUiState().accountSearch, 'foo');
+  handler({ type: 'accountGroupFilter', value: 'Team A' });
+  assert.equal(ctrl.getUiState().accountGroupFilter, 'Team A');
+
+  // Accounts tab reachable via switchTab
+  handler({ type: 'switchTab', tab: 'accounts' });
+  assert.equal(ctrl.getUiState().activeTab, 'accounts');
+
+  ctrl.dispose();
+});
+
+test('BottomPanelController: getAccountSnapshots feeds the Quota Matrix and old layouts migrate', () => {
+  let msgListener: ((msg: any) => void) | null = null;
+  const postedMessages: any[] = [];
+  const mockView: WebviewViewLike = {
+    visible: true,
+    webview: {
+      html: '',
+      postMessage: (msg: any) => { postedMessages.push(msg); return true; },
+      onDidReceiveMessage: (cb: (msg: any) => void) => {
+        msgListener = cb;
+        return { dispose() {} };
+      },
+      cspSource: 'vscode-webview:',
+    } as any,
+    onDidChangeVisibility: () => ({ dispose() {} }),
+    onDidDispose: () => ({ dispose() {} }),
+  };
+
+  const saved = createAccount({ email: 'other@example.com', status: 'saved' });
+  const state = createState({ accounts: [saved] });
+  const staleSnapshot = { ...createQuota(), isStale: true };
+
+  // A layout persisted before this release has no 'accounts' tab: it must be merged in.
+  const ctrl = new BottomPanelController({
+    onSelectSession: () => {},
+    onPinSession: () => {},
+    onUnpinSession: () => {},
+    onToggleScope: () => {},
+    onRefresh: () => {},
+    onOpenSettings: () => {},
+    initialLayout: { tabOrder: ['overview', 'details'] } as any,
+    getAccountSnapshots: () => ({ 'other@example.com': staleSnapshot }),
+  });
+  ctrl.setView(mockView);
+  ctrl.update(state);
+  assert.deepEqual(ctrl.getLayout().tabOrder, ['overview', 'details', 'accounts'], 'old layout migrates');
+
+  msgListener!({ type: 'switchTab', tab: 'accounts' });
+  const body = postedMessages[postedMessages.length - 1].bodyHtml as string;
+  assert.match(body, /other@example\.com/, 'matrix renders the snapshot from the provider callback');
+  assert.match(body, /Reset passed · stale/);
+
+  ctrl.dispose();
+});
+
+test('sanitizePanelLayout: migrates a pre-accounts layout by appending the Accounts tab', () => {
+  const migrated = sanitizePanelLayout({
+    tabOrder: ['details', 'overview'],
+    sectionOrder: { overview: ['quota'], details: ['breakdown'] },
+    collapsedTabs: ['details'],
+    collapsedSections: ['quota'],
+  } as any);
+  assert.deepEqual(migrated.tabOrder, ['details', 'overview', 'accounts']);
+  assert.deepEqual(migrated.sectionOrder.details, ['breakdown', 'sessionSummary', 'subagents', 'contextChart']);
+  assert.deepEqual(migrated.collapsedTabs, ['details']);
 });

@@ -1,4 +1,5 @@
 import type {
+  AccountAuthStatus,
   MonitorConfig,
   MonitorState,
   PoolKey,
@@ -141,7 +142,42 @@ function maxSeverity(
   return 'normal';
 }
 
-function buildCompactQuotaPart(state: MonitorState): {
+function clampLowQuotaThreshold(pct: number | undefined): number {
+  // Same clamp as MonitorService.evaluateAndEmitAlerts: 5..50 settings bounds, default 20.
+  return Math.min(50, Math.max(5, pct ?? 20));
+}
+
+export type ActiveAccountView =
+  | { kind: 'none' }
+  | { kind: 'unknown' }
+  | { kind: 'known'; email: string; plan?: string; status: AccountAuthStatus };
+
+/**
+ * Resolves the active Account header/tooltip view.
+ *
+ * The `activeAccount` label can be stale when the latest poll's identity fetch failed and the
+ * snapshot came from the '__anonymous__' bucket (monitorService.ts): a snapshot is only
+ * attributed to the labeled Account when its fetch matches the current quota snapshot.
+ */
+export function resolveActiveAccountView(state: MonitorState): ActiveAccountView {
+  const active = state.activeAccount;
+  if (!active) return { kind: 'none' };
+  const attributed = state.accountSnapshots?.[active.email];
+  if (!attributed || attributed.fetchedAt !== state.quota.fetchedAt) {
+    return { kind: 'unknown' };
+  }
+  return {
+    kind: 'known',
+    email: active.email,
+    ...(active.plan !== undefined ? { plan: active.plan } : {}),
+    status: active.status,
+  };
+}
+
+function buildCompactQuotaPart(
+  state: MonitorState,
+  config: MonitorConfig,
+): {
   text: string;
   color: 'normal' | 'warning' | 'error';
 } {
@@ -170,10 +206,12 @@ function buildCompactQuotaPart(state: MonitorState): {
   }
 
   let color: 'normal' | 'warning' | 'error' = 'normal';
-  if (pcts.length > 0) {
+  // quotaAlertBackground gates the quota-driven tint; context thresholds stay independent.
+  if (config.quotaAlertBackground !== false && pcts.length > 0) {
+    const threshold = clampLowQuotaThreshold(config.lowQuotaThresholdPct);
     const min = Math.min(...pcts);
     if (min <= 0) color = 'error';
-    else if (min <= 20) color = 'warning';
+    else if (min <= threshold) color = 'warning';
   }
 
   // Clock glyph flags a kept-but-old snapshot; the tooltip and panel carry the word "stale".
@@ -181,7 +219,7 @@ function buildCompactQuotaPart(state: MonitorState): {
 }
 
 export function buildStatusBarViewModel(state: MonitorState, config: MonitorConfig): StatusBarViewModel {
-  const quotaPart = buildCompactQuotaPart(state);
+  const quotaPart = buildCompactQuotaPart(state, config);
   let text = '';
   let contextColor: 'normal' | 'warning' | 'error' = 'normal';
 
@@ -259,6 +297,18 @@ export function buildStatusBarViewModel(state: MonitorState, config: MonitorConf
 
   lines.push('');
   lines.push('---');
+
+  // Active Account line: only a verified identity is shown as the Account.
+  const accountView = resolveActiveAccountView(state);
+  if (accountView.kind === 'known') {
+    const planText = accountView.plan ? ` · ${escapeMarkdown(accountView.plan)}` : '';
+    lines.push(`**Account:** ${escapeMarkdown(accountView.email)}${planText}`);
+  } else if (accountView.kind === 'unknown') {
+    lines.push('**Account:** identity unknown — quota shown without Account attribution');
+  } else {
+    lines.push('**Account:** none signed in');
+  }
+  lines.push('');
 
   if (state.quota.status === 'online') {
     if (state.quota.isStale) {

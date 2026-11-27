@@ -4,6 +4,26 @@ All notable changes to GravityWatch for Antigravity will be documented in this f
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Accounts tab** in the bottom panel with four sections: Saved Accounts (search and group filter, label/group/color edit, Switch / Save Current / Re-auth / Remove), a Multi-Account Quota Matrix (5h and weekly remaining percentages per Account with reset times, and an explicit `Reset passed · stale` badge — never an optimistic 100% — for inactive Accounts whose reset time has passed), 30-Day Quota History & Backups (Export CSV/JSON, Export/Import Account metadata), and Runtime & Hub Diagnostics (editor, OS, keyring backend, Hub PID/port/source, Reconnect Hub, Restart Backend, Inspect Bridge).
+- **Active Account header bar** on the Overview tab: email, plan, auth badge, and Switch / Save / Sign In actions. When the identity of the quota snapshot cannot be confirmed, the bar shows an explicit "Identity unknown" state instead of a possibly stale email.
+- **12 new commands**: `switchAccount`, `saveCurrentAccount`, `addAccount`, `editAccountLabel`, `removeSavedAccount`, `exportAccounts`, `importAccounts`, `exportQuotaAnalytics`, `reconnectHub`, `restartBackend`, `inspectBridge`, and `clearTokenVault`.
+- **QuickPick** gains a `Switch / Manage Accounts...` entry alongside Open Monitor Panel, Scope, and the session list.
+- **Status bar** tooltip now shows the active Account email and plan, and the badge background tints warning/error when a quota pool falls to or below `antigravityMonitor.lowQuotaThresholdPct` (or hits 0%) while `antigravityMonitor.quotaAlertBackground` is enabled.
+- Low-quota and exhausted-pool notifications with a one-click Switch Account call-to-action when another saved Account has cached quota remaining, plus optional quota-reset notifications.
+- Five new settings: `enableLowQuotaAlerts`, `lowQuotaThresholdPct`, `notifyQuotaReset`, `quotaAlertBackground`, and `autoCaptureVault`.
+
+### Security & Privacy
+
+- Telemetry stays strictly local and read-only. Account switching is **opt-in** and uses locally captured official credentials from VS Code `SecretStorage` or the official Antigravity sign-in flow over the local loopback hub. There is **no Direct Google OAuth** flow: no OAuth loopback server, no direct Google token exchange.
+
+### Changed
+
+- Panel layouts persisted before this release keep their saved tab order; the new Accounts tab is appended automatically (never hidden).
+
 ## [0.1.9] - 2026-11-26
 
 ### Added

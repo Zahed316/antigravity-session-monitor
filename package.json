@@ -117,6 +117,66 @@
         "command": "antigravityMonitor.resetPanelLayout",
         "title": "Reset Panel Layout",
         "category": "GravityWatch"
+      },
+      {
+        "command": "antigravityMonitor.switchAccount",
+        "title": "Switch / Manage Accounts",
+        "category": "Antigravity Monitor"
+      },
+      {
+        "command": "antigravityMonitor.saveCurrentAccount",
+        "title": "Save Current Account to Vault",
+        "category": "Antigravity Monitor"
+      },
+      {
+        "command": "antigravityMonitor.addAccount",
+        "title": "Add Account (Official Sign-in)",
+        "category": "Antigravity Monitor"
+      },
+      {
+        "command": "antigravityMonitor.editAccountLabel",
+        "title": "Edit Account Label",
+        "category": "Antigravity Monitor"
+      },
+      {
+        "command": "antigravityMonitor.removeSavedAccount",
+        "title": "Remove Saved Account",
+        "category": "Antigravity Monitor"
+      },
+      {
+        "command": "antigravityMonitor.exportAccounts",
+        "title": "Export Accounts (Metadata Backup)",
+        "category": "Antigravity Monitor"
+      },
+      {
+        "command": "antigravityMonitor.importAccounts",
+        "title": "Import Accounts (Metadata Backup)",
+        "category": "Antigravity Monitor"
+      },
+      {
+        "command": "antigravityMonitor.exportQuotaAnalytics",
+        "title": "Export 30-Day Quota Analytics",
+        "category": "Antigravity Monitor"
+      },
+      {
+        "command": "antigravityMonitor.reconnectHub",
+        "title": "Reconnect Hub",
+        "category": "Antigravity Monitor"
+      },
+      {
+        "command": "antigravityMonitor.restartBackend",
+        "title": "Restart Antigravity Backend",
+        "category": "Antigravity Monitor"
+      },
+      {
+        "command": "antigravityMonitor.inspectBridge",
+        "title": "Inspect Bridge",
+        "category": "Antigravity Monitor"
+      },
+      {
+        "command": "antigravityMonitor.clearTokenVault",
+        "title": "Clear Token Vault",
+        "category": "Antigravity Monitor"
       }
     ],
     "configuration": {

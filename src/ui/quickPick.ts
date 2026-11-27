@@ -12,7 +12,7 @@ export interface QuickPickEntry {
   label: string;
   description?: string;
   detail?: string;
-  action?: 'openPanel' | 'unpin' | 'toggleScope' | 'session';
+  action?: 'openPanel' | 'unpin' | 'toggleScope' | 'manageAccounts' | 'session';
   sessionId?: string;
   depth?: number;
   buttons?: QuickPickButtonLike[];
@@ -25,6 +25,7 @@ export interface QuickPickCallbacks {
   onPin: (sessionId: string) => void;
   onUnpin: () => void;
   onToggleScope: () => void;
+  onManageAccounts?: () => void;
 }
 
 export interface QuickPickInstanceLike<T extends QuickPickEntry = QuickPickEntry> {
@@ -87,7 +88,15 @@ export function buildQuickPickItems(state: MonitorState): QuickPickEntry[] {
     alwaysShow: true,
   });
 
-  // 3. Filter root sessions based on scope
+  // 3. Account management entry
+  items.push({
+    label: '$(account) Switch / Manage Accounts...',
+    description: 'Saved Accounts, quota matrix & opt-in switching',
+    action: 'manageAccounts',
+    alwaysShow: true,
+  });
+
+  // 4. Filter root sessions based on scope
   let roots = isCurrent ? state.roots.filter((r) => r.matchesWorkspace) : [...state.roots];
 
   // If a pinned session exists, ensure its root ancestor is included even if scope would filter it
@@ -245,6 +254,8 @@ export async function showSessionQuickPick(
           callbacks.onUnpin();
         } else if (selected.action === 'toggleScope') {
           callbacks.onToggleScope();
+        } else if (selected.action === 'manageAccounts') {
+          callbacks.onManageAccounts?.();
         } else if (selected.sessionId) {
           // Inspect in bottom panel WITHOUT changing status bar auto-tracking
           callbacks.onInspect(selected.sessionId);

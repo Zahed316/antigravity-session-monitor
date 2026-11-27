@@ -1,12 +1,15 @@
 import type {
+  AccountAuthStatus,
   CallUsagePoint,
   DetailsSectionId,
+  ManagedAccount,
   MonitorState,
   OverviewSectionId,
   PanelLayoutState,
   PanelSectionId,
   PanelTabId,
   QuotaPool,
+  QuotaSnapshot,
   QuotaWindow,
   SessionNode,
 } from '../types.ts';
@@ -16,6 +19,7 @@ import {
   formatResetCountdown,
   formatResetDateTime,
   formatStaleSince,
+  resolveActiveAccountView,
 } from './statusBar.ts';
 
 export interface PanelUiState {
@@ -25,6 +29,10 @@ export interface PanelUiState {
   openHelpIds?: ReadonlySet<string> | string[];
   expandedLists?: ReadonlySet<string> | string[];
   layout?: PanelLayoutState;
+  accountSearch?: string;
+  accountGroupFilter?: string;
+  /** Per-Account snapshots (with AccountStore staleness applied) for the Quota Matrix. */
+  matrixSnapshots?: Record<string, QuotaSnapshot | null>;
 }
 
 interface HelpItem {
@@ -222,6 +230,212 @@ export function escapeHtml(str: string): string {
     .replace(/'/g, '&#39;');
 }
 
+const ACCOUNT_AUTH_BADGE: Record<AccountAuthStatus, { label: string; cls: string }> = {
+  active: { label: 'Active', cls: 'active-tag' },
+  saved: { label: 'Saved', cls: 'saved' },
+  needs_reauth: { label: 'Needs re-auth', cls: 'reauth' },
+};
+
+function accountDisplayLabel(account: ManagedAccount): string {
+  return account.label && account.label.trim() !== '' ? account.label : account.email;
+}
+
+function renderActiveAccountBar(state: MonitorState): string {
+  const view = resolveActiveAccountView(state);
+  const switchBtn = '<button class="btn-ghost" data-action="switchAccount" title="Switch Account">Switch</button>';
+  const saveBtn = '<button class="btn-ghost" data-action="saveCurrentAccount" title="Save the active Account credential to the vault">Save</button>';
+  const signInBtn = '<button class="btn-ghost" data-action="addAccount" title="Sign in with the official Antigravity flow">Sign In</button>';
+
+  if (view.kind === 'known') {
+    const badge = ACCOUNT_AUTH_BADGE[view.status];
+    return `
+      <div class="account-bar">
+        <span class="account-email" title="${escapeHtml(view.email)}">${escapeHtml(view.email)}</span>
+        ${view.plan ? `<span class="badge plan">${escapeHtml(view.plan)}</span>` : ''}
+        <span class="badge auth ${badge.cls}">${badge.label}</span>
+        <span class="account-bar-actions">${switchBtn}${saveBtn}${signInBtn}</span>
+      </div>
+    `;
+  }
+  if (view.kind === 'unknown') {
+    // A failed identity fetch buckets the quota under '__anonymous__': never present the
+    // stale label as the Account.
+    return `
+      <div class="account-bar">
+        <span class="account-email muted">Identity unknown</span>
+        <span class="section-hint">Quota shown without Account attribution</span>
+        <span class="account-bar-actions">${switchBtn}${saveBtn}${signInBtn}</span>
+      </div>
+    `;
+  }
+  return `
+    <div class="account-bar">
+      <span class="account-email muted">No Account signed in</span>
+      <span class="account-bar-actions">${signInBtn}</span>
+    </div>
+  `;
+}
+
+function renderMatrixCell(snapshot: QuotaSnapshot | null | undefined, poolKey: 'gemini' | 'nonGoogle', window: 'fiveHour' | 'weekly'): string {
+  const w: QuotaWindow | null = snapshot?.pools?.[poolKey]?.[window] ?? null;
+  if (!snapshot || snapshot.status !== 'online' || !w) {
+    return '<td class="muted">—</td>';
+  }
+  const resetDate = formatResetDateTime(w.resetTime);
+  const resetTitle = resetDate ? ` title="Next reset: ${escapeHtml(resetDate)}"` : '';
+  // An inactive account whose reset time passed is stale: show the badge, never a
+  // percentage (the cached value must not read as a live 100%).
+  if (snapshot.isStale) {
+    return `<td class="stale-cell"${resetTitle}><span class="badge stale-badge">Reset passed · stale</span></td>`;
+  }
+  const sev = pctSeverityClass(w.remainingPct);
+  const pct = formatRemainingPct(w);
+  return `<td class="q-val ${sev}"${resetTitle}>${escapeHtml(pct)}</td>`;
+}
+
+function renderAccountsTabHtml(state: MonitorState, uiState: PanelUiState | undefined): string {
+  const accounts = state.accounts ?? [];
+  const search = (uiState?.accountSearch ?? '').toLowerCase();
+  const groupFilter = uiState?.accountGroupFilter ?? '';
+  const groups = Array.from(new Set(accounts.map((a) => a.group ?? '').filter((g) => g !== ''))).sort();
+  const filtered = accounts.filter((a) => {
+    if (groupFilter !== '' && (a.group ?? '') !== groupFilter) return false;
+    if (search === '') return true;
+    return a.email.includes(search) || (a.label ?? '').toLowerCase().includes(search);
+  });
+  const activeEmail = resolveActiveAccountView(state);
+  const activeAccount = state.activeAccount ?? null;
+  const isActiveEmail = (email: string): boolean =>
+    activeAccount !== null && activeEmail.kind === 'known' && activeEmail.email === email;
+
+  const matrixSnapshots = uiState?.matrixSnapshots ?? state.accountSnapshots ?? {};
+
+  const savedRows = filtered
+    .map((account) => {
+      const badge = ACCOUNT_AUTH_BADGE[account.status];
+      const isActive = isActiveEmail(account.email);
+      const emailAttr = escapeHtml(account.email);
+      return `
+        <tr>
+          <td>
+            <span class="acct-label" title="${escapeHtml(account.email)}">${escapeHtml(accountDisplayLabel(account))}</span>
+            ${isActive ? '<span class="badge active-tag">Active</span>' : ''}
+            <span class="badge auth ${badge.cls}">${badge.label}</span>
+          </td>
+          <td class="muted acct-email">${escapeHtml(account.email)}</td>
+          <td class="muted">${escapeHtml(account.group ?? '')}</td>
+          <td class="acct-actions">
+            ${isActive ? '' : `<button class="btn-sm" data-action="switchAccount" data-email="${emailAttr}">Switch</button>`}
+            <button class="btn-ghost" data-action="editAccount" data-email="${emailAttr}" data-field="label" title="Edit label">Label</button>
+            <button class="btn-ghost" data-action="editAccount" data-email="${emailAttr}" data-field="group" title="Edit group">Group</button>
+            <button class="btn-ghost" data-action="editAccount" data-email="${emailAttr}" data-field="colorTag" title="Edit color tag">Color</button>
+            <button class="btn-ghost" data-action="reauthAccount" data-email="${emailAttr}" title="Official sign-out and sign-in">Re-auth</button>
+            <button class="btn-ghost" data-action="removeAccount" data-email="${emailAttr}" title="Remove saved Account">Remove</button>
+          </td>
+        </tr>
+      `;
+    })
+    .join('');
+
+  const groupOptions = ['', ...groups]
+    .map(
+      (g) =>
+        `<option value="${escapeHtml(g)}" ${g === groupFilter ? 'selected' : ''}>${g === '' ? 'All groups' : escapeHtml(g)}</option>`,
+    )
+    .join('');
+
+  const savedAccountsHtml = `
+    <div class="section-card">
+      <div class="section-header">
+        <div class="section-header-left"><h3>Saved Accounts</h3></div>
+      </div>
+      <div class="acct-controls">
+        <input class="acct-input" type="text" data-action="accountSearch" value="${escapeHtml(uiState?.accountSearch ?? '')}" placeholder="Search email or label..." aria-label="Search saved Accounts">
+        <select class="acct-input" data-action="accountGroupFilter" aria-label="Filter by group">
+          ${groupOptions}
+        </select>
+        <button class="btn-ghost" data-action="saveCurrentAccount" title="Capture the active Account credential into the vault">Save Current</button>
+        <button class="btn-ghost" data-action="addAccount" title="Sign in with the official Antigravity flow">Sign In</button>
+      </div>
+      ${accounts.length === 0
+        ? '<div class="empty-inline">No Accounts observed yet. Sign in to add one.</div>'
+        : filtered.length === 0
+          ? '<div class="empty-inline">No Accounts match the current filters.</div>'
+          : `<div class="table-wrap"><table class="clean-table accounts-table">
+              <thead><tr><th>Account</th><th>Email</th><th>Group</th><th>Actions</th></tr></thead>
+              <tbody>${savedRows}</tbody>
+            </table></div>`}
+    </div>
+  `;
+
+  const matrixRows = accounts
+    .map((account) => {
+      const snap = matrixSnapshots[account.email] ?? null;
+      return `
+        <tr>
+          <td><span>${escapeHtml(accountDisplayLabel(account))}</span>${isActiveEmail(account.email) ? ' <span class="badge active-tag">Active</span>' : ''}<div class="muted acct-email-sm">${escapeHtml(account.email)}</div></td>
+          ${renderMatrixCell(snap, 'gemini', 'fiveHour')}
+          ${renderMatrixCell(snap, 'gemini', 'weekly')}
+          ${renderMatrixCell(snap, 'nonGoogle', 'fiveHour')}
+          ${renderMatrixCell(snap, 'nonGoogle', 'weekly')}
+        </tr>
+      `;
+    })
+    .join('');
+
+  const matrixHtml = `
+    <div class="section-card">
+      <div class="section-header">
+        <div class="section-header-left"><h3>Multi-Account Quota Matrix</h3><span class="section-hint">5h / weekly remaining per Account</span></div>
+      </div>
+      ${accounts.length === 0
+        ? '<div class="empty-inline">No Accounts to compare yet.</div>'
+        : `<div class="table-wrap"><table class="clean-table matrix-table">
+            <thead><tr><th>Account</th><th>Gemini 5h</th><th>Gemini Weekly</th><th>Claude &amp; GPT 5h</th><th>Claude &amp; GPT Weekly</th></tr></thead>
+            <tbody>${matrixRows}</tbody>
+          </table></div>`}
+    </div>
+  `;
+
+  const historyCount = state.accountHistory?.length ?? 0;
+  const historyHtml = `
+    <div class="section-card">
+      <div class="section-header">
+        <div class="section-header-left"><h3>30-Day Quota History &amp; Backups</h3><span class="section-hint">${historyCount} daily record${historyCount === 1 ? '' : 's'} retained</span></div>
+      </div>
+      <div class="acct-controls">
+        <button class="btn-ghost" data-action="exportHistory" data-format="csv">Export CSV</button>
+        <button class="btn-ghost" data-action="exportHistory" data-format="json">Export JSON</button>
+        <button class="btn-ghost" data-action="exportAccounts">Export Accounts</button>
+        <button class="btn-ghost" data-action="importAccounts">Import Accounts</button>
+      </div>
+    </div>
+  `;
+
+  const d = state.diagnostics;
+  const diagnosticsHtml = `
+    <div class="section-card">
+      <div class="section-header">
+        <div class="section-header-left"><h3>Runtime &amp; Hub Diagnostics</h3></div>
+      </div>
+      <div class="diag-grid">
+        <div class="diag-row"><span class="diag-key">Editor</span><span>${escapeHtml(d?.hostEditor ?? 'unknown')}</span></div>
+        <div class="diag-row"><span class="diag-key">OS</span><span>${escapeHtml(d?.platform ?? 'unknown')}</span></div>
+        <div class="diag-row"><span class="diag-key">Keyring backend</span><span>${escapeHtml(d?.osKeyringSupported ? (d?.osKeyringBackend ?? 'none') : 'unsupported')}</span></div>
+        <div class="diag-row"><span class="diag-key">Hub PID</span><span>${d?.hubPid != null ? escapeHtml(String(d.hubPid)) : '—'}</span></div>
+        <div class="diag-row"><span class="diag-key">Hub port</span><span>${d?.hubPort != null ? escapeHtml(String(d.hubPort)) : '—'}${d?.hubSource ? ` <span class="muted">(${escapeHtml(d.hubSource)})</span>` : ''}</span></div>
+      </div>
+      <div class="acct-controls">
+        <button class="btn-ghost" data-action="reconnectHub">Reconnect Hub</button>
+        <button class="btn-ghost" data-action="restartBackend">Restart Backend</button>
+        <button class="btn-ghost" data-action="inspectBridge">Inspect Bridge</button>
+      </div>
+    </div>
+  `;
+
+  return `${savedAccountsHtml}${matrixHtml}${historyHtml}${diagnosticsHtml}`;
+}
+
 function findNodeById(roots: SessionNode[], unattached: SessionNode[], id: string): SessionNode | null {
   function search(nodes: SessionNode[]): SessionNode | null {
     for (const node of nodes) {
@@ -411,7 +625,8 @@ function nodeStatusLabel(node: SessionNode): { text: string; cls: string } {
 }
 
 export function renderBottomPanelBodyHtml(state: MonitorState, uiState?: PanelUiState): string {
-  const activeTab: 'overview' | 'details' = uiState?.activeTab === 'details' ? 'details' : 'overview';
+  const activeTab: PanelTabId =
+    uiState?.activeTab === 'details' || uiState?.activeTab === 'accounts' ? uiState.activeTab : 'overview';
   const expandedSet =
     uiState?.expandedIds instanceof Set
       ? uiState.expandedIds
@@ -836,7 +1051,9 @@ export function renderBottomPanelBodyHtml(state: MonitorState, uiState?: PanelUi
       const label =
         tabId === 'overview'
           ? 'Overview'
-          : `Details${selected ? ` · ${escapeHtml((selected.title || 'Session').slice(0, 22))}` : ''}`;
+          : tabId === 'accounts'
+            ? 'Accounts'
+            : `Details${selected ? ` · ${escapeHtml((selected.title || 'Session').slice(0, 22))}` : ''}`;
       return `
         <div class="tab-item ${activeTab === tabId ? 'active' : ''} ${isTabCollapsed ? 'is-collapsed' : ''}" data-tab-id="${tabId}" data-drag-type="tab" draggable="true">
           <button class="tab-collapse-btn" data-action="toggleTabCollapse" data-tab-id="${tabId}" aria-expanded="${!isTabCollapsed}" title="${isTabCollapsed ? 'Expand tab' : 'Collapse tab'}">${isTabCollapsed ? '▸' : '▾'}</button>
@@ -848,6 +1065,8 @@ export function renderBottomPanelBodyHtml(state: MonitorState, uiState?: PanelUi
 
   const overviewCollapsed = collapsedTabs.has('overview');
   const detailsCollapsed = collapsedTabs.has('details');
+  const accountsCollapsed = collapsedTabs.has('accounts');
+  const accountsBodyHtml = renderAccountsTabHtml(state, uiState);
 
   return `
   <div class="top-bar">
@@ -867,11 +1086,16 @@ export function renderBottomPanelBodyHtml(state: MonitorState, uiState?: PanelUi
   ${pinMissingBanner}
 
   <div class="tab-view ${activeTab === 'overview' && !overviewCollapsed ? '' : 'hidden'}" data-tab-view="overview" data-drag-container="overview">
+    ${renderActiveAccountBar(state)}
     ${overviewBodyHtml}
   </div>
 
   <div class="tab-view ${activeTab === 'details' && !detailsCollapsed ? '' : 'hidden'}" data-tab-view="details" data-drag-container="details">
     ${detailsHtml}
+  </div>
+
+  <div class="tab-view ${activeTab === 'accounts' && !accountsCollapsed ? '' : 'hidden'}" data-tab-view="accounts">
+    ${accountsBodyHtml}
   </div>
 `;
 }
@@ -1473,6 +1697,64 @@ export function renderBottomPanelHtml(
     .drag-grip:hover { opacity: 1; }
     .dragging { opacity: 0.45; }
     .drag-over { outline: 1px dashed var(--vscode-focusBorder, #007fd4); outline-offset: 2px; }
+
+    .account-bar {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      padding: 6px 10px;
+      margin-bottom: 10px;
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+    }
+    .account-email {
+      font-weight: 600;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      max-width: 260px;
+    }
+    .account-bar-actions {
+      margin-left: auto;
+      display: inline-flex;
+      gap: 6px;
+    }
+    .badge.plan { background: rgba(55, 148, 255, 0.2); color: var(--accent); }
+    .badge.auth.saved { background: rgba(255, 255, 255, 0.1); }
+    .badge.auth.reauth { background: rgba(204, 167, 0, 0.2); color: var(--warn); }
+    .acct-controls {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-bottom: 8px;
+    }
+    .acct-input {
+      background: var(--bg);
+      color: var(--fg);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 3px 7px;
+      font-family: inherit;
+      font-size: 0.92em;
+    }
+    .accounts-table .acct-email { font-size: 0.9em; }
+    .acct-actions {
+      display: flex;
+      gap: 5px;
+      flex-wrap: wrap;
+    }
+    .badge.stale-badge {
+      background: rgba(204, 167, 0, 0.18);
+      color: var(--warn);
+    }
+    .stale-cell { white-space: nowrap; }
+    .acct-email-sm { font-size: 0.86em; }
+    .diag-grid { display: flex; flex-direction: column; gap: 4px; margin-bottom: 8px; }
+    .diag-row { display: flex; gap: 12px; }
+    .diag-key { color: var(--muted-fg); min-width: 130px; }
   </style>
 </head>
 <body>
@@ -1640,6 +1922,54 @@ export function renderBottomPanelHtml(
         vscode.postMessage({ type: 'toggleScope' });
       } else if (action === 'refresh') {
         vscode.postMessage({ type: 'refresh' });
+      } else if (action === 'switchAccount') {
+        vscode.postMessage({ type: 'switchAccount', email: target.getAttribute('data-email') || undefined });
+      } else if (action === 'addAccount') {
+        vscode.postMessage({ type: 'addAccount' });
+      } else if (action === 'saveCurrentAccount') {
+        vscode.postMessage({ type: 'saveCurrentAccount' });
+      } else if (action === 'editAccount') {
+        const email = target.getAttribute('data-email');
+        const field = target.getAttribute('data-field');
+        if (email && field) {
+          vscode.postMessage({ type: 'editAccount', email, field });
+        }
+      } else if (action === 'removeAccount') {
+        const email = target.getAttribute('data-email');
+        if (email) {
+          vscode.postMessage({ type: 'removeAccount', email });
+        }
+      } else if (action === 'reauthAccount') {
+        const email = target.getAttribute('data-email');
+        if (email) {
+          vscode.postMessage({ type: 'reauthAccount', email });
+        }
+      } else if (action === 'exportHistory') {
+        const format = target.getAttribute('data-format');
+        if (format === 'csv' || format === 'json') {
+          vscode.postMessage({ type: 'exportHistory', format });
+        }
+      } else if (action === 'exportAccounts') {
+        vscode.postMessage({ type: 'exportAccounts' });
+      } else if (action === 'importAccounts') {
+        vscode.postMessage({ type: 'importAccounts' });
+      } else if (action === 'reconnectHub') {
+        vscode.postMessage({ type: 'reconnectHub' });
+      } else if (action === 'restartBackend') {
+        vscode.postMessage({ type: 'restartBackend' });
+      } else if (action === 'inspectBridge') {
+        vscode.postMessage({ type: 'inspectBridge' });
+      }
+    });
+
+    document.addEventListener('change', (event) => {
+      const origin = event.target instanceof Element ? event.target : null;
+      if (!origin) return;
+      const action = origin.getAttribute('data-action');
+      if (action === 'accountSearch') {
+        vscode.postMessage({ type: 'accountSearch', value: origin.value });
+      } else if (action === 'accountGroupFilter') {
+        vscode.postMessage({ type: 'accountGroupFilter', value: origin.value });
       }
     });
 

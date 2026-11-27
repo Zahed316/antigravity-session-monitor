@@ -42,7 +42,7 @@ export const DEFAULT_CONFIG: MonitorConfig = {
 
 export type PoolKey = 'gemini' | 'nonGoogle';
 
-export type PanelTabId = 'overview' | 'details';
+export type PanelTabId = 'overview' | 'details' | 'accounts';
 export type OverviewSectionId = 'quota' | 'sessions' | 'unattached';
 export type DetailsSectionId = 'sessionSummary' | 'breakdown' | 'subagents' | 'contextChart';
 export type PanelSectionId = OverviewSectionId | DetailsSectionId;

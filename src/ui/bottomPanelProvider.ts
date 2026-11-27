@@ -5,10 +5,11 @@ import type {
   PanelLayoutState,
   PanelSectionId,
   PanelTabId,
+  QuotaSnapshot,
 } from '../types.ts';
 import { renderBottomPanelBodyHtml, renderBottomPanelHtml, type PanelUiState } from './bottomPanelHtml.ts';
 
-const DEFAULT_TAB_ORDER: PanelTabId[] = ['overview', 'details'];
+const DEFAULT_TAB_ORDER: PanelTabId[] = ['overview', 'details', 'accounts'];
 const DEFAULT_OVERVIEW_SECTIONS: OverviewSectionId[] = ['quota', 'sessions', 'unattached'];
 const DEFAULT_DETAILS_SECTIONS: DetailsSectionId[] = ['sessionSummary', 'breakdown', 'subagents', 'contextChart'];
 const ALL_SECTIONS: PanelSectionId[] = [...DEFAULT_OVERVIEW_SECTIONS, ...DEFAULT_DETAILS_SECTIONS];
@@ -80,6 +81,8 @@ export interface WebviewViewLike {
   onDidDispose(listener: () => void): { dispose(): void };
 }
 
+export type AccountEditField = 'label' | 'group' | 'colorTag';
+
 export interface BottomPanelCallbacks {
   onSelectSession: (sessionId: string) => void;
   onPinSession: (sessionId: string) => void;
@@ -91,6 +94,21 @@ export interface BottomPanelCallbacks {
   onViewVisible?: () => void;
   initialLayout?: Partial<PanelLayoutState>;
   onLayoutChange?: (layout: PanelLayoutState) => void;
+  // Account tab actions (Task 9). All optional: hosts without multi-account wiring degrade.
+  onSwitchAccount?: (email?: string) => void;
+  onAddAccount?: () => void;
+  onSaveCurrentAccount?: () => void;
+  onEditAccount?: (email: string, field: AccountEditField) => void;
+  onRemoveAccount?: (email: string) => void;
+  onReauthAccount?: (email: string) => void;
+  onExportHistory?: (format: 'csv' | 'json') => void;
+  onExportAccounts?: () => void;
+  onImportAccounts?: () => void;
+  onReconnectHub?: () => void;
+  onRestartBackend?: () => void;
+  onInspectBridge?: () => void;
+  /** Per-Account snapshots (with AccountStore staleness applied) for the Quota Matrix. */
+  getAccountSnapshots?: () => Record<string, QuotaSnapshot | null>;
 }
 
 function generateNonce(): string {
@@ -115,6 +133,8 @@ export class BottomPanelController {
   private expandedLists = new Set<string>();
   private layout: PanelLayoutState;
   private lastPushedBodyHtml: string | null = null;
+  private accountSearch = '';
+  private accountGroupFilter = '';
 
   constructor(callbacks: BottomPanelCallbacks) {
     this.callbacks = callbacks;
@@ -143,6 +163,9 @@ export class BottomPanelController {
       openHelpIds: this.openHelpIds,
       expandedLists: this.expandedLists,
       layout: this.layout,
+      accountSearch: this.accountSearch,
+      accountGroupFilter: this.accountGroupFilter,
+      matrixSnapshots: this.callbacks.getAccountSnapshots?.(),
     };
   }
 
@@ -237,7 +260,7 @@ export class BottomPanelController {
       this.callbacks.onSelectSession(message.sessionId);
       this.pushCurrentBody();
     } else if (message.type === 'switchTab') {
-      this.activeTab = message.tab === 'details' ? 'details' : 'overview';
+      this.activeTab = message.tab === 'details' || message.tab === 'accounts' ? message.tab : 'overview';
       this.pushCurrentBody();
     } else if (message.type === 'toggleExpand' && typeof message.sessionId === 'string') {
       if (this.expandedIds.has(message.sessionId)) {
@@ -265,7 +288,7 @@ export class BottomPanelController {
         this.openHelpIds.delete(message.helpId);
       }
       this.pushCurrentBody();
-    } else if (message.type === 'toggleTabCollapse' && (message.tab === 'overview' || message.tab === 'details')) {
+    } else if (message.type === 'toggleTabCollapse' && DEFAULT_TAB_ORDER.includes(message.tab)) {
       const tab = message.tab as PanelTabId;
       const collapsed = new Set(this.layout.collapsedTabs);
       if (collapsed.has(tab)) {
@@ -314,6 +337,43 @@ export class BottomPanelController {
       this.callbacks.onToggleScope();
     } else if (message.type === 'openSettings') {
       this.callbacks.onOpenSettings();
+    } else if (message.type === 'switchAccount') {
+      this.callbacks.onSwitchAccount?.(typeof message.email === 'string' ? message.email : undefined);
+    } else if (message.type === 'addAccount') {
+      this.callbacks.onAddAccount?.();
+    } else if (message.type === 'saveCurrentAccount') {
+      this.callbacks.onSaveCurrentAccount?.();
+    } else if (
+      message.type === 'editAccount' &&
+      typeof message.email === 'string' &&
+      (message.field === 'label' || message.field === 'group' || message.field === 'colorTag')
+    ) {
+      this.callbacks.onEditAccount?.(message.email, message.field);
+    } else if (message.type === 'removeAccount' && typeof message.email === 'string') {
+      this.callbacks.onRemoveAccount?.(message.email);
+    } else if (message.type === 'reauthAccount' && typeof message.email === 'string') {
+      this.callbacks.onReauthAccount?.(message.email);
+    } else if (
+      message.type === 'exportHistory' &&
+      (message.format === 'csv' || message.format === 'json')
+    ) {
+      this.callbacks.onExportHistory?.(message.format);
+    } else if (message.type === 'exportAccounts') {
+      this.callbacks.onExportAccounts?.();
+    } else if (message.type === 'importAccounts') {
+      this.callbacks.onImportAccounts?.();
+    } else if (message.type === 'reconnectHub') {
+      this.callbacks.onReconnectHub?.();
+    } else if (message.type === 'restartBackend') {
+      this.callbacks.onRestartBackend?.();
+    } else if (message.type === 'inspectBridge') {
+      this.callbacks.onInspectBridge?.();
+    } else if (message.type === 'accountSearch' && typeof message.value === 'string') {
+      this.accountSearch = message.value;
+      this.pushCurrentBody();
+    } else if (message.type === 'accountGroupFilter' && typeof message.value === 'string') {
+      this.accountGroupFilter = message.value;
+      this.pushCurrentBody();
     } else if (message.type === 'refresh') {
       this.callbacks.onRefresh();
     }
