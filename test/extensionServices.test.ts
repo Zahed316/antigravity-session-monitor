@@ -45,9 +45,20 @@ describe('createCoreServices', () => {
     assert.deepEqual(result, { captured: false, reason: 'ide_state_unavailable' });
   });
 
-  it('wires a keyring verifier that fails closed when no target is pending', async () => {
-    const services = await createCoreServices({ ...baseDeps(), getPendingKeyringTarget: () => null });
-    assert.equal(await services.verifyKeyringSync(), false);
+  it('reads the pending keyring target lazily, at verify time', async () => {
+    // A target set only after construction must be visible: catches the factory
+    // freezing the value at null instead of holding the closure.
+    let target: string | null = null;
+    let reads = 0;
+    const services = await createCoreServices({
+      ...baseDeps(),
+      getPendingKeyringTarget: () => { reads++; return target; },
+    });
+    assert.equal(await services.verifyKeyringSync(), false, 'no pending target: fails closed');
+    assert.equal(reads, 1, 'the target is read on each verify, not captured at construction');
+    target = 'a@example.com';
+    assert.equal(await services.verifyKeyringSync(), false, 'target pending but nothing stored: still closed');
+    assert.equal(reads, 2, 'a target set after construction is still consulted');
   });
 
   it('returns every service the extension needs (no undefined members)', async () => {
@@ -60,10 +71,12 @@ describe('createCoreServices', () => {
   it('activate() constructs no services in its own body (the C1 seam must stay the only construction site)', () => {
     // npm test always runs from the repo root; import.meta is banned by the CJS tsconfig.
     const src = readFileSync(path.resolve('src', 'extension.ts'), 'utf8');
-    const body = src.slice(src.indexOf('export async function activate'));
+    // Scan the whole file, not the tail: a constructor moved into a helper defined
+    // above activate() would otherwise escape this guard.
     for (const ctor of ['new TokenVaultService', 'new AccountSwitcher', 'new AccountStore', 'new QuotaHistoryStore']) {
-      assert.equal(body.includes(ctor), false, `${ctor} belongs in extensionServices.ts`);
+      assert.equal(src.includes(ctor), false, `${ctor} belongs in extensionServices.ts`);
     }
+    const body = src.slice(src.indexOf('export async function activate'));
     assert.ok(body.includes('createCoreServices('), 'activate() must delegate construction to the factory');
   });
 });
