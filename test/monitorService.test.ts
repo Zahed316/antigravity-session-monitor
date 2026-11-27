@@ -1231,6 +1231,101 @@ describe('MonitorService Orchestrator', () => {
     service.dispose();
   });
 
+  it('18. failed auto-capture is retried on later polls; only a confirmed capture is latched', async () => {
+    const email = 'a@example.com';
+    let shouldThrow = false;
+    let captureResult: { captured: boolean; reason?: string } = { captured: false, reason: 'email_mismatch' };
+    const captures: string[] = [];
+    const mockLocalReader: any = {
+      read: async () => ({ summaries: [], callsById: new Map(), lastConversationId: null }),
+      flushCache: async () => {},
+      clearMemoryCache: () => {},
+    };
+    const mockHubClient: any = {
+      fetchQuota: async () => createMockQuota('online'),
+      fetchUserIdentity: async () => ({ email }),
+      fetchTrajectories: async () => new Map(),
+      fetchGeneratorMetadata: async () => [],
+    };
+    const vaultService: any = {
+      captureActiveCredential: async (e: string) => {
+        captures.push(e);
+        if (shouldThrow) {
+          throw new Error('vault unavailable');
+        }
+        return captureResult;
+      },
+    };
+
+    const service = new MonitorService({
+      localReader: mockLocalReader,
+      hubClient: mockHubClient,
+      discoverEndpoints: async () => [{ port: 1, csrfToken: 't', host: '127.0.0.1', source: 'process' }],
+      workspacePaths: ['/w'],
+      config: { ...DEFAULT_CONFIG, autoCaptureVault: true },
+      vaultService,
+    });
+
+    // (a) A throwing capture is retried on the next poll with the same email.
+    shouldThrow = true;
+    await service.refreshQuotaNow();
+    await service.refreshQuotaNow();
+    assert.deepStrictEqual(captures, ['a@example.com', 'a@example.com'], 'throwing capture is retried');
+
+    // (b) A soft `{ captured: false, reason: 'email_mismatch' }` is retried and succeeds
+    // once the vault reports a real capture (e.g. the IDE signed into the hub's account).
+    shouldThrow = false;
+    await service.refreshQuotaNow();
+    assert.strictEqual(captures.length, 3, 'soft email_mismatch failure is retried');
+    captureResult = { captured: true };
+    await service.refreshQuotaNow();
+    assert.strictEqual(captures.length, 4, 'capture retried after soft failure and succeeded');
+
+    // (c) A confirmed capture is not repeated on an unchanged email.
+    await service.refreshQuotaNow();
+    assert.strictEqual(captures.length, 4, 'no repeat after a confirmed capture');
+
+    service.dispose();
+  });
+
+  it('19. lowQuotaThresholdPct is clamped to the 5-50 range at runtime', async () => {
+    let geminiPct = 4;
+    const emitted: QuotaAlertEvent[][] = [];
+    const mockLocalReader: any = {
+      read: async () => ({ summaries: [], callsById: new Map(), lastConversationId: null }),
+      flushCache: async () => {},
+      clearMemoryCache: () => {},
+    };
+    const mockHubClient: any = {
+      fetchQuota: async () => {
+        const q = createMockQuota('online');
+        q.pools.gemini.fiveHour!.remainingPct = geminiPct;
+        q.pools.gemini.fiveHour!.remainingFraction = geminiPct / 100;
+        return q;
+      },
+      fetchUserIdentity: async () => ({ email: 'a@example.com' }),
+      fetchTrajectories: async () => new Map(),
+      fetchGeneratorMetadata: async () => [],
+    };
+
+    // An out-of-bounds settings.json value of 0 must behave as 5: a 4% pool fires low.
+    const service = new MonitorService({
+      localReader: mockLocalReader,
+      hubClient: mockHubClient,
+      discoverEndpoints: async () => [{ port: 1, csrfToken: 't', host: '127.0.0.1', source: 'process' }],
+      workspacePaths: ['/w'],
+      config: { ...DEFAULT_CONFIG, lowQuotaThresholdPct: 0 },
+      alertService: new QuotaAlertService(),
+      onQuotaAlerts: (events) => emitted.push(events),
+    });
+
+    await service.refreshQuotaNow();
+    const lows = (emitted[0] ?? []).filter((e) => e.kind === 'low');
+    assert.strictEqual(lows.length, 1, '4% fires low with an out-of-bounds threshold of 0 clamped to 5');
+
+    service.dispose();
+  });
+
   it('12. telemetry ignores a quota endpoint the latest discovery no longer lists', async () => {
     const first: HubEndpoint = { port: 41001, csrfToken: 'a', host: '127.0.0.1', source: 'exports' };
     const second: HubEndpoint = { port: 41002, csrfToken: 'b', host: '127.0.0.1', source: 'process' };

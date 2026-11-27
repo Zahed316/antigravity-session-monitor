@@ -243,6 +243,7 @@ export class MonitorService {
           this.diagnostics.osKeyringSupported = caps.osKeyringSupported;
           this.diagnostics.osKeyringBackend = caps.osKeyringBackend;
           this.state.diagnostics = { ...this.diagnostics };
+          this.onDidUpdateState?.(this.state);
         })
         .catch(() => {
           // Capabilities probe failure degrades to the defaults; nothing sensitive to log.
@@ -481,6 +482,11 @@ export class MonitorService {
       }
     }
     const email = identity?.email ? normalizeEmail(identity.email) : null;
+    // A failed/absent identity fetch buckets the poll under '__anonymous__': a later
+    // offline poll can then show those anonymous numbers under a stale `activeAccount`
+    // label. The bucket is overwritten (never merged) so there is no cross-account bleed,
+    // and it self-heals on the next successful identity fetch — Task 9's UI must not
+    // treat that label as authoritative.
     this.activeAccountKey = email ?? ANONYMOUS_ACCOUNT_KEY;
     this.lastGoodQuotaByAccount.set(this.activeAccountKey, snapshot);
     if (email) {
@@ -508,12 +514,21 @@ export class MonitorService {
         };
       }
 
-      // Auto-capture only on an email transition, and never without a vault.
-      const autoCapture = this.config.autoCaptureVault ?? DEFAULT_CONFIG.autoCaptureVault!;
+      // Auto-capture only on an email transition, and never without a vault. The email is
+      // latched ONLY on a confirmed capture (`captured: true`): a throw or a soft
+      // `{ captured: false }` must be retried on a later poll. Soft reasons are all
+      // transient against TokenVaultService.captureActiveCredential — `email_mismatch`
+      // (hub account ≠ IDE's active sign-in; the IDE may sign into the hub's account
+      // later), `no_active_credential` (not signed in yet), `ide_state_unavailable`,
+      // and `unverifiable_credential` (credential state may arrive later). Only
+      // `invalid_email` is permanent, and a normalized email never hits it.
+      const autoCapture = this.config.autoCaptureVault!;
       if (this.vaultService && autoCapture && this.lastCapturedEmail !== email) {
-        this.lastCapturedEmail = email;
         try {
-          await this.vaultService.captureActiveCredential(email);
+          const result = await this.vaultService.captureActiveCredential(email);
+          if (result.captured) {
+            this.lastCapturedEmail = email;
+          }
         } catch {
           // Capture failures are non-fatal and never logged with credential material.
         }
@@ -550,9 +565,10 @@ export class MonitorService {
               : (this.accountStore?.getSnapshot(account.email, false, this.now()) ?? null),
         })),
         config: {
-          enableLowQuotaAlerts: this.config.enableLowQuotaAlerts ?? DEFAULT_CONFIG.enableLowQuotaAlerts!,
-          lowQuotaThresholdPct: this.config.lowQuotaThresholdPct ?? DEFAULT_CONFIG.lowQuotaThresholdPct!,
-          notifyQuotaReset: this.config.notifyQuotaReset ?? DEFAULT_CONFIG.notifyQuotaReset!,
+          enableLowQuotaAlerts: this.config.enableLowQuotaAlerts!,
+          // Clamp at runtime: the 5/50 settings bounds are UI-only validation.
+          lowQuotaThresholdPct: Math.min(50, Math.max(5, this.config.lowQuotaThresholdPct!)),
+          notifyQuotaReset: this.config.notifyQuotaReset!,
         },
         nowMs: this.now(),
       });
