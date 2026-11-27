@@ -4,7 +4,7 @@
   "description": "GravityWatch \u2014 read-only live status bar and bottom panel for Antigravity session context windows, subagent token rollups, and 5h/weekly quota pools.",
   "icon": "logo.png",
   "publisher": "Zahed-r",
-  "version": "0.1.9",
+  "version": "0.2.0",
   "license": "MIT",
   "engines": {
     "vscode": "^1.99.0"
