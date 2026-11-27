@@ -6,19 +6,13 @@ import { execFile as execFileCb } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createSqliteClient, type SqliteClient } from './data/sqliteClient.ts';
 import { LocalTelemetryReader } from './data/localTelemetry.ts';
-import { HubClient } from './rpc/hubClient.ts';
-import { HubAuthClient } from './rpc/hubAuth.ts';
 import { discoverHubEndpoints, type HubEndpoint } from './rpc/hubDiscovery.ts';
 import { extractArtifactCascadeId } from './core/sessionResolver.ts';
 import { createStatusBarController, resolveActiveAccountView, type StatusBarController } from './ui/statusBar.ts';
 import { showSessionQuickPick } from './ui/quickPick.ts';
 import { createBottomPanelProvider, type AccountEditField } from './ui/bottomPanelProvider.ts';
 import { MonitorService } from './monitorService.ts';
-import { AccountStore } from './accounts/accountStore.ts';
-import { QuotaHistoryStore } from './accounts/quotaHistoryStore.ts';
-import { TokenVaultService } from './accounts/tokenVaultService.ts';
-import { QuotaAlertService, type QuotaAlertEvent } from './accounts/quotaAlertService.ts';
-import { AccountSwitcher } from './accounts/accountSwitcher.ts';
+import type { QuotaAlertEvent } from './accounts/quotaAlertService.ts';
 import {
   isAntigravityStandaloneIde,
   resolveStandaloneIdeInfo,
@@ -26,7 +20,7 @@ import {
 } from './accounts/ideStateService.ts';
 import { purgeRemovedAccountCredential } from './accounts/vaultPurge.ts';
 import { resolveReauthTarget } from './accounts/reauthTarget.ts';
-import { createKeyringVerifier, createTokenVaultDeps } from './accounts/vaultWiring.ts';
+import { createCoreServices } from './extensionServices.ts';
 import { DEFAULT_CONFIG, type MonitorConfig, type QuotaSnapshot, type ScopeMode } from './types.ts';
 
 const execFileAsync = promisify(execFileCb);
@@ -127,8 +121,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     workspaceStateDbPath,
   });
 
-  const hubClient = new HubClient();
-
   // --- Multi-account services (telemetry stays read-only; switching is strictly opt-in) ---
   // vscode Memento/SecretStorage return Thenable, not Promise: thin adapters bridge that.
   const globalStateAdapter = {
@@ -140,32 +132,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     store: (key: string, value: string) => Promise.resolve(context.secrets.store(key, value)),
     delete: (key: string) => Promise.resolve(context.secrets.delete(key)),
   };
-  const accountStore = new AccountStore({
-    globalState: globalStateAdapter,
-    globalStorageUri: context.globalStorageUri.fsPath,
-  });
-  const historyStore = new QuotaHistoryStore(context.globalStorageUri.fsPath);
   const isStandaloneIde = isAntigravityStandaloneIde(vscode.env.appName, process.execPath);
   const standaloneIdeInfo = isStandaloneIde
     ? resolveStandaloneIdeInfo({ executablePath: process.execPath })
     : null;
-  // Full vault deps via the tested factory (accounts/vaultWiring.ts): a real
-  // PATH-aware which, execFileAsync, and readIdeState only when the standalone
-  // IDE's state.vscdb exists. Plain VS Code hosts stay a clean
-  // `ide_state_unavailable` (no VS Code credential reader exists).
-  const vaultService = new TokenVaultService(
-    createTokenVaultDeps({
-      secrets: secretsAdapter,
-      platform: process.platform,
-      execFileAsync,
-      isStandaloneIde,
-      standaloneStateDbPath: standaloneIdeInfo?.stateDbPath ?? null,
-    }),
-  );
-  await accountStore.load();
-  await historyStore.load();
-
-  const hubAuthClient = new HubAuthClient();
+  const workspacePaths = (vscode.workspace.workspaceFolders ?? []).map((f) => f.uri.fsPath);
 
   // Last known hub endpoint for the auth RPCs (re-discovered on connect/reconnect).
   let cachedEndpoint: HubEndpoint | null = null;
@@ -184,19 +155,28 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   // Target of the in-flight switch, so the keyring verifier knows which entry to re-read.
   let pendingKeyringTarget: string | null = null;
-  const switcher = new AccountSwitcher({
-    vault: vaultService,
-    accounts: accountStore,
-    hubAuth: hubAuthClient,
-    getEndpoint: () => cachedEndpoint,
-    vscodeApi: {
-      commands: {
-        executeCommand: async (cmd: string, ...args: unknown[]) => {
-          await vscode.commands.executeCommand(cmd, ...args);
-        },
-      },
-    },
+
+  // Production services are constructed in the one testable factory
+  // (extensionServices.ts); only the vscode-closed closures stay here.
+  const {
+    accountStore,
+    historyStore,
+    vaultService,
+    switcher,
+    alertService,
+    hubClient,
+    hubAuthClient,
+  } = await createCoreServices({
+    secrets: secretsAdapter,
+    globalState: globalStateAdapter,
+    globalStorageDir: context.globalStorageUri.fsPath,
+    platform: process.platform,
+    execFileAsync,
     isStandaloneIde,
+    standaloneIdeInfo,
+    workspacePaths,
+    env: process.env,
+    getActiveEmail: () => monitorService?.getState().activeAccount?.email ?? null,
     confirmSwitch: async (email) =>
       (await vscode.window.showWarningMessage(
         `Switch the active Antigravity Account to ${email}?`,
@@ -206,22 +186,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     quitIde: async () => {
       await vscode.commands.executeCommand('workbench.action.quit');
     },
-    env: process.env,
-    globalStorageDir: context.globalStorageUri.fsPath,
-    ...(standaloneIdeInfo ? { ideInfo: standaloneIdeInfo } : {}),
-    getActiveEmail: () => monitorService?.getState().activeAccount?.email ?? null,
-    // Byte-compares the re-read keyring secret against the exact written
-    // payload; any stale/different entry fails and the official-login
-    // self-heal runs (fail closed).
-    verifyKeyringSync: createKeyringVerifier({
-      platform: process.platform,
-      execFileAsync,
-      getCredential: (email) => vaultService.getCredential(email),
-      getTargetEmail: () => pendingKeyringTarget,
-    }),
+    getPendingKeyringTarget: () => pendingKeyringTarget,
+    getEndpoint: () => cachedEndpoint,
+    vscodeApi: {
+      commands: {
+        executeCommand: async (cmd: string, ...args: unknown[]) => {
+          await vscode.commands.executeCommand(cmd, ...args);
+        },
+      },
+    },
   });
-
-  const alertService = new QuotaAlertService();
 
   const initialPinnedId = context.workspaceState.get<string | null>(
     'antigravityMonitor.pinnedSessionId',
@@ -231,8 +205,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     'antigravityMonitor.scope',
     config.defaultScope,
   );
-
-  const workspacePaths = (vscode.workspace.workspaceFolders ?? []).map((f) => f.uri.fsPath);
 
   // Status Bar UI (single consolidated item)
   const statusBar: StatusBarController = createStatusBarController(
