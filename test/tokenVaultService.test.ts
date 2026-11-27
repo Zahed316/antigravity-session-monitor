@@ -6,6 +6,7 @@ import {
   extractEmailFromCredentialBlob,
   extractEmailFromIdeState,
   extractEmailFromJwt,
+  keyringPayloadFor,
   TOKEN_VAULT_INDEX_KEY,
   tokenKeyFor,
   type SecretStorageAdapter,
@@ -324,12 +325,12 @@ test('win32 apply passes the secret via env/stdin, never via argv', async () => 
   const joinedArgs = call.args.join(' ');
   assert.ok(!joinedArgs.includes('SECRET-TOKEN-123'), 'secret never in argv');
   assert.ok(!joinedArgs.includes('a@example.com'), 'username kept out of argv too');
-  assert.equal(call.options?.env?.GW_VAULT_SECRET, record.blobBase64, 'secret passed via env');
-  assert.ok(!JSON.stringify(call).includes('SECRET-TOKEN-123'), 'plaintext token never passed around');
+  assert.equal(call.options?.env?.GW_VAULT_SECRET, secretJson, 'canonical raw payload passed via env, not the base64 blob');
 });
 
 test('darwin apply uses security add-generic-password with stdin secret', async () => {
   const h = makeService({ platform: 'darwin', readIdeState: null });
+  const secretJson = JSON.stringify({ email: A_EMAIL, access_token: 'SECRET-TOKEN-456' });
   const record: VaultCredentialRecord = {
     userName: A_EMAIL,
     blobBase64: base64Json({ email: A_EMAIL, access_token: 'SECRET-TOKEN-456' }),
@@ -345,11 +346,12 @@ test('darwin apply uses security add-generic-password with stdin secret', async 
   assert.equal(call.file, 'security');
   assert.equal(call.args[0], 'add-generic-password');
   assert.ok(!call.args.some((a) => a.includes('SECRET-TOKEN-456')), 'secret never in argv');
-  assert.equal(call.options?.input, record.blobBase64, 'secret passed via stdin');
+  assert.equal(call.options?.input, secretJson, 'canonical raw payload via stdin, not the base64 blob');
 });
 
 test('linux apply uses secret-tool store with stdin secret', async () => {
   const h = makeService({ platform: 'linux', which: { 'secret-tool': '/usr/bin/secret-tool' }, readIdeState: null });
+  const secretJson = JSON.stringify({ email: A_EMAIL, access_token: 'SECRET-TOKEN-789' });
   const record: VaultCredentialRecord = {
     userName: A_EMAIL,
     blobBase64: base64Json({ email: A_EMAIL, access_token: 'SECRET-TOKEN-789' }),
@@ -366,7 +368,7 @@ test('linux apply uses secret-tool store with stdin secret', async () => {
   assert.equal(call.args[0], 'store');
   assert.ok(call.args.includes('gemini:antigravity'));
   assert.ok(!call.args.some((a) => a.includes('SECRET-TOKEN-789')), 'secret never in argv');
-  assert.equal(call.options?.input, record.blobBase64, 'secret passed via stdin');
+  assert.equal(call.options?.input, secretJson, 'canonical raw payload via stdin, not the base64 blob');
 });
 
 test('applyToOsKeyring refuses when the vault credential is missing', async () => {
@@ -389,6 +391,28 @@ test('applyToOsKeyring refuses when the stored credential is corrupt', async () 
   const result = await h.service.applyToOsKeyring(A_EMAIL);
   assert.deepEqual(result, { applied: false, reason: 'no_vaulted_credential' });
   assert.equal(h.execCalls.length, 0);
+});
+
+// ---------- canonical keyring payload (I3) ----------
+
+test('keyringPayloadFor returns one canonical raw payload for blobBase64 and ideState records', () => {
+  const token = 'raw-credential-token-abc123';
+  const fromBlob = keyringPayloadFor({
+    userName: A_EMAIL,
+    blobBase64: Buffer.from(token, 'utf8').toString('base64'),
+    persist: 1,
+    updatedAt: 1,
+  });
+  const fromIdeState = keyringPayloadFor({
+    userName: A_EMAIL,
+    persist: 1,
+    updatedAt: 1,
+    ideState: { oauthToken: token },
+  });
+  assert.equal(fromBlob, token, 'blobBase64 is decoded, never written as base64-of-token');
+  assert.equal(fromIdeState, token, 'ideState token used verbatim');
+  assert.equal(fromBlob, fromIdeState, 'both record shapes yield the SAME payload class (no double wrapping)');
+  assert.equal(keyringPayloadFor({ userName: A_EMAIL, persist: 1, updatedAt: 1 }), '', 'empty record yields empty payload');
 });
 
 // ---------- delete / clearAll ----------

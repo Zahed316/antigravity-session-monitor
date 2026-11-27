@@ -49,7 +49,7 @@ export const TOKEN_VAULT_INDEX_KEY = 'gravitywatch.vault.index';
 export const TOKEN_KEY_PREFIX = 'gravitywatch.vault.token.';
 
 /** OS keyring target used by Antigravity in VS Code / Cursor hosts. */
-const KEYRING_SERVICE = 'gemini:antigravity';
+export const KEYRING_SERVICE = 'gemini:antigravity';
 
 export function tokenKeyFor(email: string): string {
   return `${TOKEN_KEY_PREFIX}${normalizeEmail(email)}`;
@@ -267,8 +267,22 @@ const WIN32_CREDMAN_SCRIPT = [
   '}',
 ].join('\n');
 
-function keyringPayloadFor(record: VaultCredentialRecord): string {
-  return record.blobBase64 ?? record.ideState?.oauthToken ?? '';
+/**
+ * Canonical OS keyring payload: the raw credential token (UTF-8 string).
+ * `blobBase64` is base64(oauthToken), so it is decoded here — the keyring
+ * never receives base64-of-token while other paths see the raw token (I3).
+ */
+export function keyringPayloadFor(record: VaultCredentialRecord): string {
+  if (record.ideState?.oauthToken) {
+    return record.ideState.oauthToken;
+  }
+  if (record.blobBase64) {
+    const token = Buffer.from(record.blobBase64, 'base64').toString('utf8');
+    if (token) {
+      return token;
+    }
+  }
+  return '';
 }
 
 export class TokenVaultService {
@@ -417,9 +431,11 @@ export class TokenVaultService {
       return { applied: false, reason: 'exec_unavailable' };
     }
     const secret = keyringPayloadFor(record);
-    // Keyring byte-encoding contract for the Task 7 writer (same logical
-    // string, per-platform storage): Windows CredMan stores UTF-16LE bytes;
-    // macOS `security` and Linux `secret-tool` store UTF-8/ASCII.
+    // Keyring byte-encoding contract for the Task 7 writer: the payload is
+    // the raw credential token (canonical form above). Windows CredMan
+    // stores its UTF-16LE bytes; macOS `security` and Linux `secret-tool`
+    // store the UTF-8 bytes verbatim. The verifier (vaultWiring.readKeyringEntry)
+    // re-reads and byte-compares against this same payload.
     if (!secret) {
       return { applied: false, reason: 'empty_credential' };
     }

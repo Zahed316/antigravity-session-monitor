@@ -728,7 +728,10 @@ function makeSwitcherHarness(overrides: {
   syncOk?: boolean;
   endpoint?: HubEndpoint | null;
   isStandaloneIde?: boolean;
+  /** Explicit confirmation callback; undefined = default consent. */
   confirmSwitch?: (email: string) => Promise<boolean> | boolean;
+  /** Simulates the production absence of confirmSwitch (fail-closed check). */
+  noConfirmSwitch?: boolean;
   verifyKeyringSync?: () => Promise<boolean> | boolean;
   performStandaloneIdeSwitch?: (params: StandaloneSwitchParams) => Promise<{ launched: boolean; reason?: string; backupPath?: string }>;
   activeEmail?: string | null;
@@ -788,7 +791,9 @@ function makeSwitcherHarness(overrides: {
       getEndpoint: () => endpoint,
       vscodeApi: { commands: { executeCommand: async () => true } },
       isStandaloneIde: overrides.isStandaloneIde ?? false,
-      confirmSwitch: overrides.confirmSwitch,
+      confirmSwitch: overrides.noConfirmSwitch
+        ? undefined
+        : overrides.confirmSwitch ?? (async () => true),
       performStandaloneIdeSwitch:
         overrides.performStandaloneIdeSwitch ??
         (async (params: StandaloneSwitchParams) => {
@@ -984,4 +989,77 @@ test('reauthAccount marks needs_reauth and runs the official logout + login cycl
   assert.deepEqual(res, { ok: true });
   assert.deepEqual(h.storeCalls, [`setStatus:${A_EMAIL}:needs_reauth`]);
   assert.deepEqual(h.hubCalls, ['logout', 'login']);
+});
+
+// ---------- confirmation on every credential-mutating path (I1) ----------
+
+function confirmRecorder(value: boolean): { calls: string[]; confirmSwitch: (email: string) => Promise<boolean> } {
+  const calls: string[] = [];
+  return {
+    calls,
+    confirmSwitch: async (email) => {
+      calls.push(email);
+      return value;
+    },
+  };
+}
+
+test('I1: keyring path refuses to mutate credentials when confirmation is refused', async () => {
+  const confirm = confirmRecorder(false);
+  const h = makeSwitcherHarness({
+    record: validRecordFor(B_EMAIL),
+    keyringSupported: true,
+    verifyKeyringSync: async () => true,
+    confirmSwitch: confirm.confirmSwitch,
+  });
+  const res = await h.switcher.switchToAccount(B_EMAIL);
+  assert.deepEqual(res, { ok: false, mode: 'cancelled', message: 'switch_cancelled' });
+  assert.deepEqual(confirm.calls, [B_EMAIL], 'confirmation consulted with the normalized target email');
+  assert.equal(h.vaultCalls.includes('capture:a@example.com'), false, 'no keyring-preserve capture');
+  assert.equal(h.vaultCalls.includes('apply:b@example.com'), false, 'no keyring write');
+  assert.deepEqual(h.hubCalls, [], 'no official logout/login either');
+  assert.deepEqual(h.storeCalls, [], 'no status mutation');
+});
+
+test('I1: absent confirmSwitch fails closed on the keyring path', async () => {
+  const h = makeSwitcherHarness({
+    record: validRecordFor(B_EMAIL),
+    keyringSupported: true,
+    verifyKeyringSync: async () => true,
+    noConfirmSwitch: true,
+  });
+  const res = await h.switcher.switchToAccount(B_EMAIL);
+  assert.deepEqual(res, { ok: false, mode: 'cancelled', message: 'switch_cancelled' });
+  assert.equal(h.vaultCalls.includes('apply:b@example.com'), false);
+  assert.deepEqual(h.hubCalls, []);
+});
+
+test('I1: absent confirmSwitch fails closed on the standalone path too', async () => {
+  const h = makeSwitcherHarness({
+    isStandaloneIde: true,
+    record: validRecordFor(B_EMAIL),
+    noConfirmSwitch: true,
+  });
+  const res = await h.switcher.switchToAccount(B_EMAIL);
+  assert.deepEqual(res, { ok: false, mode: 'cancelled', message: 'switch_cancelled' });
+  assert.equal(h.performCalls.length, 0, 'no standalone switch worker launched');
+  assert.deepEqual(h.hubCalls, [], 'no official login fallback either');
+});
+
+test('I1: reauthAccount refuses without mutating when confirmation is refused', async () => {
+  const confirm = confirmRecorder(false);
+  const h = makeSwitcherHarness({ confirmSwitch: confirm.confirmSwitch });
+  const res = await h.switcher.reauthAccount(A_EMAIL);
+  assert.deepEqual(res, { ok: false, message: 'switch_cancelled' });
+  assert.deepEqual(confirm.calls, [A_EMAIL]);
+  assert.deepEqual(h.storeCalls, [], 'no needs_reauth status written');
+  assert.deepEqual(h.hubCalls, [], 'no AuthLogout/Login executed');
+});
+
+test('I1: reauthAccount fails closed when confirmSwitch is absent', async () => {
+  const h = makeSwitcherHarness({ noConfirmSwitch: true });
+  const res = await h.switcher.reauthAccount(A_EMAIL);
+  assert.deepEqual(res, { ok: false, message: 'switch_cancelled' });
+  assert.deepEqual(h.storeCalls, []);
+  assert.deepEqual(h.hubCalls, []);
 });

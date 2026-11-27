@@ -54,7 +54,7 @@ export interface AccountSwitcherDeps {
   vscodeApi?: HubAuthVscodeApi;
   /** True on the Antigravity standalone IDE (see isAntigravityStandaloneIde). */
   isStandaloneIde?: boolean;
-  /** Confirmation prompt; when absent the switch proceeds (caller owns prompting). */
+  /** Confirmation prompt for every credential-mutating mode; when absent the mutation is refused (fail closed). */
   confirmSwitch?: (targetEmail: string) => Promise<boolean> | boolean;
   performStandaloneIdeSwitch?: PerformStandaloneIdeSwitchFn;
   /** Asks the standalone IDE to quit after the worker is launched (e.g. the `workbench.action.quit` command). */
@@ -125,6 +125,13 @@ export class AccountSwitcher {
     if (!email) {
       return { ok: false, mode: 'failed', message: 'invalid_email' };
     }
+    // Every credential-mutating mode below (standalone worker, keyring write,
+    // official login fallback) requires explicit confirmation; an absent
+    // confirmSwitch is a refusal (fail closed), never consent (I1).
+    const confirmed = this.confirmSwitch !== null ? await this.confirmSwitch(email) : false;
+    if (!confirmed) {
+      return { ok: false, mode: 'cancelled', message: 'switch_cancelled' };
+    }
     const { record, corruptPurged } = await this.vault.getCredential(email);
     if (!record || corruptPurged) {
       // Fail-closed (task-7 rule 3): a missing or email-mismatched vault
@@ -134,10 +141,6 @@ export class AccountSwitcher {
     }
 
     if (this.isStandaloneIde) {
-      const confirmed = this.confirmSwitch !== null ? await this.confirmSwitch(email) : true;
-      if (!confirmed) {
-        return { ok: false, mode: 'cancelled', message: 'switch_cancelled' };
-      }
       const ideState = this.ideStateFromRecord(record);
       if (!ideState?.oauthToken) {
         await this.accounts.setStatus(email, 'needs_reauth');
@@ -223,7 +226,17 @@ export class AccountSwitcher {
 
   /** Marks the account for re-auth and runs the official logout + login cycle. */
   async reauthAccount(email: string): Promise<{ ok: boolean; message?: string }> {
-    await this.accounts.setStatus(normalizeEmail(email), 'needs_reauth');
+    const normalized = normalizeEmail(email);
+    if (!normalized) {
+      return { ok: false, message: 'invalid_email' };
+    }
+    // AuthLogout + Login mutates the official sign-in state: confirm first,
+    // and treat an absent confirmSwitch as a refusal (fail closed, I1).
+    const confirmed = this.confirmSwitch !== null ? await this.confirmSwitch(normalized) : false;
+    if (!confirmed) {
+      return { ok: false, message: 'switch_cancelled' };
+    }
+    await this.accounts.setStatus(normalized, 'needs_reauth');
     const endpoint = this.getEndpoint();
     if (!endpoint) {
       return { ok: false, message: 'hub_unreachable' };

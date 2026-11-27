@@ -19,7 +19,11 @@ import { QuotaHistoryStore } from './accounts/quotaHistoryStore.ts';
 import { TokenVaultService } from './accounts/tokenVaultService.ts';
 import { QuotaAlertService, type QuotaAlertEvent } from './accounts/quotaAlertService.ts';
 import { AccountSwitcher } from './accounts/accountSwitcher.ts';
-import { isAntigravityStandaloneIde, resolveStandaloneIdeInfo } from './accounts/ideStateService.ts';
+import {
+  isAntigravityStandaloneIde,
+  resolveStandaloneIdeInfo,
+} from './accounts/ideStateService.ts';
+import { createKeyringVerifier, createTokenVaultDeps } from './accounts/vaultWiring.ts';
 import { DEFAULT_CONFIG, type MonitorConfig, type QuotaSnapshot, type ScopeMode } from './types.ts';
 
 const execFileAsync = promisify(execFileCb);
@@ -138,11 +142,26 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     globalStorageUri: context.globalStorageUri.fsPath,
   });
   const historyStore = new QuotaHistoryStore(context.globalStorageUri.fsPath);
-  const vaultService = new TokenVaultService({ secrets: secretsAdapter, platform: process.platform });
+  const isStandaloneIde = isAntigravityStandaloneIde(vscode.env.appName, process.execPath);
+  const standaloneIdeInfo = isStandaloneIde
+    ? resolveStandaloneIdeInfo({ executablePath: process.execPath })
+    : null;
+  // Full vault deps via the tested factory (accounts/vaultWiring.ts): a real
+  // PATH-aware which, execFileAsync, and readIdeState only when the standalone
+  // IDE's state.vscdb exists. Plain VS Code hosts stay a clean
+  // `ide_state_unavailable` (no VS Code credential reader exists).
+  const vaultService = new TokenVaultService(
+    createTokenVaultDeps({
+      secrets: secretsAdapter,
+      platform: process.platform,
+      execFileAsync,
+      isStandaloneIde,
+      standaloneStateDbPath: standaloneIdeInfo?.stateDbPath ?? null,
+    }),
+  );
   await accountStore.load();
   await historyStore.load();
 
-  const isStandaloneIde = isAntigravityStandaloneIde(vscode.env.appName, process.execPath);
   const hubAuthClient = new HubAuthClient();
 
   // Last known hub endpoint for the auth RPCs (re-discovered on connect/reconnect).
@@ -186,33 +205,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     },
     env: process.env,
     globalStorageDir: context.globalStorageUri.fsPath,
-    ...(isStandaloneIde ? { ideInfo: resolveStandaloneIdeInfo({ executablePath: process.execPath }) } : {}),
+    ...(standaloneIdeInfo ? { ideInfo: standaloneIdeInfo } : {}),
     getActiveEmail: () => monitorService?.getState().activeAccount?.email ?? null,
-    verifyKeyringSync: async () => {
-      const target = pendingKeyringTarget;
-      if (!target) return false;
-      const { record } = await vaultService.getCredential(target);
-      if (!record) return false;
-      try {
-        if (process.platform === 'darwin') {
-          const { stdout } = await execFileAsync('security', [
-            'find-generic-password', '-s', 'gemini:antigravity', '-a', record.userName, '-w',
-          ]);
-          return stdout.trim().length > 0;
-        }
-        if (process.platform === 'linux') {
-          const { stdout } = await execFileAsync('secret-tool', [
-            'lookup', 'service', 'gemini:antigravity', 'account', record.userName,
-          ]);
-          return stdout.trim().length > 0;
-        }
-      } catch {
-        return false;
-      }
-      // Windows CredMan read needs a dedicated PowerShell reader: fall back to the
-      // official login flow there instead of trusting an unverified write.
-      return false;
-    },
+    // Byte-compares the re-read keyring secret against the exact written
+    // payload; any stale/different entry fails and the official-login
+    // self-heal runs (fail closed).
+    verifyKeyringSync: createKeyringVerifier({
+      platform: process.platform,
+      execFileAsync,
+      getCredential: (email) => vaultService.getCredential(email),
+      getTargetEmail: () => pendingKeyringTarget,
+    }),
   });
 
   const alertService = new QuotaAlertService();
