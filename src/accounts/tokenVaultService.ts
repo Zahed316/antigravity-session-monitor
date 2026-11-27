@@ -307,6 +307,8 @@ export class TokenVaultService {
   }
 
   async listVaultedEmails(): Promise<string[]> {
+    // The index is the sole source of truth for vaulted accounts: an orphaned
+    // token key without an index entry is benign and never listed here.
     const raw = await this.secrets.get(TOKEN_VAULT_INDEX_KEY);
     if (!raw) {
       return [];
@@ -415,6 +417,9 @@ export class TokenVaultService {
       return { applied: false, reason: 'exec_unavailable' };
     }
     const secret = keyringPayloadFor(record);
+    // Keyring byte-encoding contract for the Task 7 writer (same logical
+    // string, per-platform storage): Windows CredMan stores UTF-16LE bytes;
+    // macOS `security` and Linux `secret-tool` store UTF-8/ASCII.
     if (!secret) {
       return { applied: false, reason: 'empty_credential' };
     }
@@ -454,6 +459,10 @@ export class TokenVaultService {
   }
 
   async clearAll(): Promise<void> {
+    // Only index-listed entries are cleared: SecretStorage has no key scan,
+    // so an orphaned token key from a failed capture-index write survives
+    // clearAll. That orphan is benign per the listVaultedEmails contract and
+    // is re-purged by email via deleteCredential/getCredential.
     const emails = await this.listVaultedEmails();
     for (const email of emails) {
       await this.secrets.delete(tokenKeyFor(email));
@@ -461,14 +470,23 @@ export class TokenVaultService {
     await this.secrets.delete(TOKEN_VAULT_INDEX_KEY);
   }
 
-  /** Removes a token key and its index entry (guard + explicit deletes). */
+  /**
+   * Removes a token key and its index entry (guard + explicit deletes).
+   * The index is rewritten BEFORE the token key delete, unconditionally, so a
+   * failed index write leaves a consistent retryable state (index + token both
+   * intact) and a failure after it only orphans a benign token key — a ghost
+   * index entry (email listed, record gone) can never be created.
+   */
   private async purge(normalizedEmail: string): Promise<void> {
-    await this.secrets.delete(tokenKeyFor(normalizedEmail));
     const index = await this.listVaultedEmails();
     const next = index.filter((e) => e !== normalizedEmail);
-    if (next.length !== index.length) {
+    try {
+      await this.secrets.store(TOKEN_VAULT_INDEX_KEY, JSON.stringify(next));
+    } catch {
+      // Transient SecretStorage failures must not leave a ghost index entry.
       await this.secrets.store(TOKEN_VAULT_INDEX_KEY, JSON.stringify(next));
     }
+    await this.secrets.delete(tokenKeyFor(normalizedEmail));
   }
 
   private async resolveWhich(cmd: string): Promise<string | null> {

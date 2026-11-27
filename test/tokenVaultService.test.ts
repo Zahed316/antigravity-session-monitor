@@ -401,6 +401,54 @@ test('deleteCredential removes the token key and index entry', async () => {
   assert.deepEqual(await h.service.listVaultedEmails(), []);
 });
 
+test('purge survives a transient throwing index write without a ghost entry', async () => {
+  const h = makeService({ readIdeState: null });
+  for (const email of [A_EMAIL, B_EMAIL]) {
+    h.secrets.seed(
+      tokenKeyFor(email),
+      JSON.stringify({ userName: email, blobBase64: base64Json({ email }), persist: 1, updatedAt: 1 }),
+    );
+  }
+  h.secrets.seed(TOKEN_VAULT_INDEX_KEY, JSON.stringify([A_EMAIL, B_EMAIL]));
+  // Flaky SecretStorage: the first index write during purge throws.
+  let indexStoreCalls = 0;
+  const originalStore = h.secrets.store.bind(h.secrets);
+  h.secrets.store = async (key, value) => {
+    if (key === TOKEN_VAULT_INDEX_KEY) {
+      indexStoreCalls += 1;
+      if (indexStoreCalls === 1) {
+        throw new Error('transient SecretStorage failure');
+      }
+    }
+    await originalStore(key, value);
+  };
+
+  await h.service.deleteCredential(A_EMAIL);
+  assert.equal(indexStoreCalls, 2, 'index write retried once');
+  assert.deepEqual(await h.service.listVaultedEmails(), [B_EMAIL], 'no ghost index entry for the purged email');
+  assert.equal(h.secrets.map.has(tokenKeyFor(A_EMAIL)), false, 'token key deleted');
+  assert.equal(h.secrets.map.has(tokenKeyFor(B_EMAIL)), true, 'other entries intact');
+});
+
+test('purge with a persistently throwing index write fails before deleting the token key', async () => {
+  const h = makeService({ readIdeState: null });
+  h.secrets.seed(
+    tokenKeyFor(A_EMAIL),
+    JSON.stringify({ userName: A_EMAIL, blobBase64: base64Json({ email: A_EMAIL }), persist: 1, updatedAt: 1 }),
+  );
+  h.secrets.seed(TOKEN_VAULT_INDEX_KEY, JSON.stringify([A_EMAIL]));
+  h.secrets.store = async (key) => {
+    if (key === TOKEN_VAULT_INDEX_KEY) {
+      throw new Error('persistent SecretStorage failure');
+    }
+  };
+
+  await assert.rejects(h.service.deleteCredential(A_EMAIL), /persistent SecretStorage failure/);
+  // Index-first ordering: nothing deleted, state stays consistent and retryable.
+  assert.deepEqual(await h.service.listVaultedEmails(), [A_EMAIL]);
+  assert.equal(h.secrets.map.has(tokenKeyFor(A_EMAIL)), true);
+});
+
 test('clearAll removes every vaulted token and the index', async () => {
   const h = makeService({ ideState: ideStateFor(A_EMAIL) });
   await h.service.captureActiveCredential(A_EMAIL);
