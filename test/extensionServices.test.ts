@@ -71,11 +71,13 @@ describe('createCoreServices', () => {
   it('activate() constructs no services in its own body (the C1 seam must stay the only construction site)', () => {
     // npm test always runs from the repo root; import.meta is banned by the CJS tsconfig.
     const src = readFileSync(path.resolve('src', 'extension.ts'), 'utf8');
-    // Scan the whole file, not the tail: a constructor moved into a helper defined
-    // above activate() would otherwise escape this guard.
-    for (const ctor of ['new TokenVaultService', 'new AccountSwitcher', 'new AccountStore', 'new QuotaHistoryStore']) {
-      assert.equal(src.includes(ctor), false, `${ctor} belongs in extensionServices.ts`);
-    }
+    // Allowlist, not a denylist: an unfixed denylist misses every service added
+    // later. Only these two may be constructed in activate() (they need the live
+    // sqlite client / everything the factory already returned).
+    const allowed = new Set(['MonitorService', 'LocalTelemetryReader', 'Map']);
+    const constructors = [...src.matchAll(/new\s+([A-Za-z_$][\w$]*)/g)].map((m) => m[1]);
+    const unsanctioned = constructors.filter((name) => !allowed.has(name));
+    assert.deepEqual(unsanctioned, [], `construct these in extensionServices.ts instead: ${unsanctioned.join(', ')}`);
     const body = src.slice(src.indexOf('export async function activate'));
     assert.ok(body.includes('createCoreServices('), 'activate() must delegate construction to the factory');
   });
